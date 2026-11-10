@@ -1,6 +1,6 @@
 # Architecture
 
-AayushSQL v0.2.0 separates front-end language processing, execution, and persistent storage into focused modules under `src/aaysql/`.
+AayushSQL v0.2.1 separates front-end language processing, schema/execution validation, and persistent storage into focused modules under `src/aaysql/`.
 
 ```text
                AayushSQL CLI (cli.py)
@@ -21,24 +21,25 @@ AayushSQL v0.2.0 separates front-end language processing, execution, and persist
 ## Module Responsibilities
 
 - **`token.py` & `lexer.py`**: Tokenizes raw SQL text into typed tokens (`PREFIX` for `AAYUSH`, identifiers, numbers, strings, operators, punctuation) while stripping whitespace and `--` line comments.
-- **`ast.py` & `parser.py`**: Enforces the mandatory single `AAYUSH` prefix (rejecting missing or duplicate prefixes) and parses statements into immutable AST dataclasses (`CreateTable`, `DropTable`, `Insert`, `Select`, `Update`, `Delete`).
+- **`ast.py` & `parser.py`**: Enforces the mandatory single `AAYUSH` prefix, validates supported column types and explicit `=` in `UPDATE` assignments, and parses statements into immutable AST dataclasses (`CreateTable`, `DropTable`, `Insert`, `Select`, `Update`, `Delete`).
 - **`storage.py`**:
-  - Defines `Table` and `Database` in-memory models and shared `coerce_value` type/nullability checking.
+  - Centralizes data-type and schema validation (`TYPE_MAP`, `SUPPORTED_TYPES`, `validate_type_name`, `validate_column_def`, `validate_table_schema`, `coerce_value`).
+  - Defines `Table` and `Database` in-memory models.
   - Defines `JsonFileStorage`, which serializes and deserializes versioned `.aaydb` JSON files (`format="aaysql"`, `format_version=1`).
-  - Validates loaded metadata, column definitions, row schemas, cell types, and `PRIMARY KEY` / `UNIQUE` / `NOT NULL` constraints on startup, raising `StorageError` on corruption.
+  - Applies the same schema, default, cell-type, and constraint (`PRIMARY KEY` / `UNIQUE` / `NOT NULL`) validation during startup loading, raising `StorageError` on corruption.
   - Writes atomically using a temporary file in the target directory, `flush()` + `os.fsync()`, and `os.replace()`.
-- **`executor.py`**: Executes AST statements against `Database`. Multi-row `INSERT` and `UPDATE` statements validate constraints atomically against the full candidate state before mutating in-memory rows. Expression evaluation avoids `eval()` completely.
+- **`executor.py`**: Executes AST statements against `Database`. Multi-row `INSERT` and `UPDATE` statements validate constraints atomically before mutating in-memory rows. Incompatible runtime comparisons or sorts are caught at the comparison boundary and raised as `ExecutionError` chained from `TypeError`; unexpected internal errors are not swallowed.
 - **`engine.py`**: Coordinates lexing, parsing, execution, and persistence. Supports both in-memory (`Engine()` / `Engine(":memory:")`) and persistent (`Engine(db_path)`) modes. Saves only on successful mutating statements, skips disk writes on `SELECT`, and restores a pre-mutation snapshot if `save()` fails.
-- **`cli.py` & `formatting.py`**: Provides `argparse`-based CLI (`--db`, `--memory`, optional script file, `--version`), quote/comment-aware statement splitting, ASCII table formatting, and clean startup/shutdown error handling.
-- **`errors.py`**: Explicit exception hierarchy rooted at `AayushSQLError` (`LexerError`, `ParserError`, `ExecutionError`, `ConstraintError`, `StorageError`).
+- **`cli.py` & `formatting.py`**: Provides `argparse`-based CLI (`--db`, `--memory`, `--version`, optional script file), quote/comment-aware statement splitting, ASCII table formatting, fail-fast script execution (`stop_on_error=True`, returning exit code `1` on failure), and error-resilient interactive REPL execution.
+- **`errors.py`**: Explicit exception hierarchy rooted at `AayushSQLError`:
+  - `LexerError`
+  - `ParserError`
+  - `ExecutionError` (`ConstraintError` subclass)
+  - `StorageError`
 
-## Persistence Lifecycle (v0.2.0)
+## CI Pipeline
 
-1. **Startup**: `Engine(db_path)` instantiates `JsonFileStorage(db_path)` and calls `load()`. Missing files initialize an empty `Database`; malformed or schema-invalid files raise `StorageError`.
-2. **Execution**:
-   - **Read-only (`SELECT`)**: Executed directly against `self.db`; no disk write occurs.
-   - **Mutating (`CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`)**: Snapshot taken -> `Executor` validates and applies mutation -> `JsonFileStorage.save()` atomically writes the updated state. If execution or `save()` fails, persisted data on disk and in-memory state remain uncorrupted.
-3. **Shutdown**: `Engine.close()` marks the engine closed; CLI ensures `close()` runs in a `finally` block.
+`.github/workflows/tests.yml` runs `python -m pytest -v` on pushes and pull requests to `main` across Python `3.10`, `3.11`, `3.12`, and `3.13` with read-only `contents` permissions.
 
 ## Evolution Path
 

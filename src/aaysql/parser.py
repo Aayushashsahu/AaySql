@@ -1,5 +1,6 @@
 from .ast import *
 from .errors import ParserError
+from .storage import SUPPORTED_TYPES, TYPE_MAP, validate_column_def
 from .token import Token, TokenType
 
 
@@ -9,7 +10,7 @@ class Parser:
         self.i = 0
 
     def current(self) -> Token:
-        return self.t[self.i]
+        return self.t[min(self.i, len(self.t) - 1)]
 
     def peek(self, n=1) -> Token:
         return self.t[min(self.i + n, len(self.t) - 1)]
@@ -78,11 +79,18 @@ class Parser:
         cols = []
         while True:
             col_name = self.ident()
-            type_name = self.ident().upper()
+            type_tok = self.expect(TokenType.IDENT)
+            type_name = str(type_tok.value).upper()
+            if type_name not in TYPE_MAP:
+                raise ParserError(
+                    f"Unsupported data type '{type_tok.value}' at position {type_tok.position}. "
+                    f"Supported types: {', '.join(SUPPORTED_TYPES)}"
+                )
             primary = not_null = unique = has_default = False
             default = None
             while self.current().type == TokenType.IDENT:
-                kw = str(self.current().value).upper()
+                kw_tok = self.current()
+                kw = str(kw_tok.value).upper()
                 if kw == "PRIMARY":
                     self.advance(); self.expect_kw("KEY"); primary = True
                 elif kw == "NOT":
@@ -90,10 +98,17 @@ class Parser:
                 elif kw == "UNIQUE":
                     self.advance(); unique = True
                 elif kw == "DEFAULT":
+                    if has_default:
+                        raise ParserError(
+                            f"Duplicate DEFAULT constraint for column '{col_name}' at position {kw_tok.position}"
+                        )
                     self.advance(); default = self.parse_literal().value; has_default = True
                 else:
                     break
-            cols.append(ColumnDef(col_name, type_name, primary, not_null, unique, default, has_default))
+            col_def = validate_column_def(
+                ColumnDef(col_name, type_name, primary, not_null, unique, default, has_default)
+            )
+            cols.append(col_def)
             if not self.match(TokenType.COMMA):
                 break
             self.advance()
@@ -170,20 +185,32 @@ class Parser:
 
     def parse_update(self):
         self.expect_kw("UPDATE"); table = self.ident(); self.expect_kw("SET")
-        assignments = [(self.ident(), self.parse_assignment_value())]
+        assignments = [self.parse_assignment()]
         while self.match(TokenType.COMMA):
-            self.advance(); assignments.append((self.ident(), self.parse_assignment_value()))
+            self.advance()
+            assignments.append(self.parse_assignment())
         where = None
         if self.keyword("WHERE"):
             self.advance(); where = self.parse_expr()
         return Update(table, assignments, where)
 
+    def parse_assignment(self):
+        col = self.ident()
+        self.expect(TokenType.EQ, "=")
+        return col, self.parse_assignment_value()
+
     def parse_assignment_value(self):
+        tok = self.current()
         if self.match(TokenType.EQ):
-            self.advance()
-        if self.current().type in {TokenType.STRING, TokenType.NUMBER} or self.keyword("NULL"):
+            raise ParserError(f"Unexpected '=' at position {tok.position}")
+        if self.keyword("WHERE"):
+            raise ParserError(f"Expected assignment value, got 'WHERE' at position {tok.position}")
+        if tok.type in {TokenType.STRING, TokenType.NUMBER} or self.keyword("NULL"):
             return self.parse_literal().value
-        return self.parse_primary()
+        if tok.type == TokenType.IDENT or self.match(TokenType.LPAREN):
+            return self.parse_primary()
+        got = tok.value if tok.value is not None else tok.type.name
+        raise ParserError(f"Expected assignment value, got {got!r} at position {tok.position}")
 
     def parse_delete(self):
         self.expect_kw("DELETE"); self.expect_kw("FROM"); table = self.ident()
@@ -232,4 +259,5 @@ class Parser:
             self.advance(); return Literal(tok.value)
         if self.keyword("NULL"):
             self.advance(); return Literal(None)
-        raise ParserError(f"Expected literal, got {tok.value!r}")
+        got = tok.value if tok.value is not None else tok.type.name
+        raise ParserError(f"Expected literal, got {got!r} at position {tok.position}")

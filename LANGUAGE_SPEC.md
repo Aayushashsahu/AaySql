@@ -1,4 +1,4 @@
-# AayushSQL Language Specification (v0.2.0)
+# AayushSQL Language Specification (v0.2.1)
 
 ## 1. Overview
 
@@ -19,7 +19,9 @@ AayushSQL preserves conventional SQL syntax and semantics with one mandatory rul
 
 ## 3. Data Types
 
-| SQL Type | Aliases | Python / JSON Representation |
+Only the following column types (case-insensitive) are accepted by `CREATE TABLE` and database loading; unsupported type names are rejected with `ParserError` / `ExecutionError` / `StorageError`.
+
+| Canonical Type | Accepted Aliases | Python / JSON Representation |
 |---|---|---|
 | `INT` | `INTEGER` | `int` (booleans rejected) |
 | `TEXT` | `VARCHAR` | `str` |
@@ -34,14 +36,16 @@ AAYUSH CREATE TABLE table_name (
     col1 INT PRIMARY KEY,
     col2 TEXT NOT NULL UNIQUE,
     col3 FLOAT DEFAULT 0.0,
-    col4 TEXT DEFAULT 'Pune'
+    col4 TEXT DEFAULT 'Pune',
+    col5 TEXT DEFAULT NULL
 );
 ```
-Column constraints:
-- `PRIMARY KEY` (at most one column per table; implies `NOT NULL` and uniqueness)
-- `NOT NULL`
-- `UNIQUE` (multiple `NULL` values are permitted)
-- `DEFAULT <literal>`
+Column rules and constraints:
+- At least one column; duplicate column names (case-insensitive) are rejected.
+- `PRIMARY KEY` (at most one column per table; unique and non-null).
+- `NOT NULL`.
+- `UNIQUE` (multiple `NULL` values are permitted).
+- `DEFAULT <literal>`: checked against the column's data type and nullability (`DEFAULT NULL` is rejected if `NOT NULL` or `PRIMARY KEY` is set; duplicate `DEFAULT` clauses on one column are rejected).
 
 ### `DROP TABLE`
 ```sql
@@ -69,8 +73,8 @@ ORDER BY col1 DESC, col2 ASC
 LIMIT 5;
 ```
 Supported expression operators in `WHERE`:
-- Comparisons: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=` (comparisons against `NULL` evaluate to false)
-- Boolean operators: `NOT`, `AND`, `OR` (with parenthesized grouping)
+- Comparisons: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=` (comparisons against `NULL` evaluate to false; incompatible ordering comparisons such as `INT > TEXT` raise `ExecutionError`).
+- Boolean operators: `NOT`, `AND`, `OR` (with parenthesized grouping).
 
 ### `UPDATE`
 ```sql
@@ -78,7 +82,7 @@ AAYUSH UPDATE table_name
 SET col1 = 20, col2 = 'Updated'
 WHERE id = 1;
 ```
-Constraint violations across the updated rows are checked atomically before applying changes.
+Every assignment in `SET` **must** use an explicit `=` (`col = value`). Missing, duplicate, or misplaced `=` operators raise `ParserError`. Constraint violations across updated rows are checked atomically before applying changes.
 
 ### `DELETE`
 ```sql
@@ -88,7 +92,7 @@ AAYUSH DELETE FROM table_name;
 
 ## 5. Unsupported / Planned Syntax
 
-The following standard SQL features are **not yet implemented** in v0.2.0:
+The following standard SQL features are **not yet implemented** in v0.2.1:
 - `JOIN` (`INNER JOIN`, `LEFT JOIN`, etc.)
 - `GROUP BY`, `HAVING`, aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`)
 - `CREATE INDEX`, `EXPLAIN`
