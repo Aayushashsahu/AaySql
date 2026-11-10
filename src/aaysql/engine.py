@@ -79,6 +79,11 @@ class Engine:
                 "Database durability state is ambiguous after a WAL fsync failure; "
                 "reopen the database to recover"
             )
+        if self.storage is not None and self.storage.wal.poisoned:
+            raise StorageError(
+                "WAL is in a damaged state after a failed append; "
+                "reopen the database to recover"
+            )
 
     def _install(self, db: Database) -> None:
         """Replace in-memory state and rebind the executor to the new database."""
@@ -110,6 +115,8 @@ class Engine:
                 raise
             except Exception:
                 self._install(snapshot)
+                if self.storage is not None and self.storage.wal.poisoned:
+                    self._recovery_required = True
                 raise
             return result
         return self.executor.execute(stmt)
@@ -144,8 +151,11 @@ class Engine:
             raise
         except Exception:
             # The commit never became durable before WAL COMMIT fsync, so memory
-            # must match the previously durable state captured at BEGIN.
+            # must match the previously durable state captured at BEGIN. If the
+            # failed append may have left torn bytes, only a reopen can continue.
             self._install(transaction.snapshot)
+            if self.storage is not None and self.storage.wal.poisoned:
+                self._recovery_required = True
             raise
         return {"status": "ok", "message": "Transaction committed"}
 
