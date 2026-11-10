@@ -1,0 +1,16 @@
+AAYUSH CREATE TABLE users (
+  id INT PRIMARY KEY,
+  name TEXT NOT NULL,
+  age INT,
+  city TEXT DEFAULT 'Pune'
+);
+
+AAYUSH INSERT INTO users (id, name, age, city) VALUES
+  (1, 'Aayush', 19, 'Pune'),
+  (2, 'Mika', 21, 'Tokyo');
+
+AAYUSH SELECT * FROM users ORDER BY age DESC;
+AAYUSH SELECT name, city FROM users WHERE age >= 20;
+AAYUSH UPDATE users SET age = 20 WHERE id = 1;
+AAYUSH DELETE FROM users WHERE id = 2;
+AAYUSH SELECT * FROM users;

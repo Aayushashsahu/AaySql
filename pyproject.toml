@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aaysql"
+version = "0.2.0"
+description = "A custom SQL-compatible relational database requiring the AAYUSH prefix"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+aaysql = "aaysql.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
