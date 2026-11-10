@@ -20,7 +20,13 @@ All notable changes to AayushSQL are documented in this file.
   - Separated relational query resolution and execution stages (`FROM` -> `JOIN` -> `WHERE` -> `GROUP BY` -> Aggregates -> `HAVING` -> Projection -> `ORDER BY` -> `LIMIT`) and shared expression evaluation with `Executor` DML operations.
 - **Tests & Documentation**:
   - Added `tests/test_relational_queries.py` covering JOINs, table aliases, qualified/ambiguous columns, aggregates, `GROUP BY`, `HAVING`, combined queries, and persistence compatibility.
+  - Added `tests/test_null_semantics.py` covering complete `AND`/`OR`/`NOT` truth tables, `NULL` comparisons in `WHERE`, `JOIN ON`, `HAVING`, `UPDATE`, and `DELETE`, and duplicate output label rejection.
   - Updated `README.md`, `ARCHITECTURE.md`, `LANGUAGE_SPEC.md`, and version metadata (`0.3.0`) while keeping `.aaydb` format version `1` compatible.
+
+### Fixed
+- **Three-valued `NULL` logic (`src/aaysql/query.py`, `src/aaysql/executor.py`)**: Comparisons against `NULL` previously returned ordinary `FALSE`, which made `NOT` invert an unknown into a match. They now evaluate to `UNKNOWN`, which propagates through `AND` / `OR` / `NOT` per SQL truth tables, and `WHERE`, `JOIN ON`, `HAVING`, `UPDATE`, and `DELETE` predicates admit a row only on `TRUE`.
+- **Duplicate `SELECT` output labels (`src/aaysql/query.py`)**: Two selected expressions sharing an output label (for example `u.id AS identifier, o.id AS identifier`, or `u.id, u.id`) previously overwrote one value in the label-keyed result row. The query is now rejected with `ExecutionError` before any rows are scanned, so no data is silently discarded.
+- **Single expression evaluator (`src/aaysql/query.py`)**: Row-level and group-level evaluation (`eval_row_expr` and `_eval_group_expr`) were duplicated logic trees; both now delegate to one `eval_expr()`, so aggregate and non-aggregate paths cannot diverge on logic semantics.
 
 ## [0.2.1] — 2026-11-10
 

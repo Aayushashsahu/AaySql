@@ -40,6 +40,7 @@ Everything behind the parser — relational joins, column resolution, grouping, 
   - `GROUP BY` across one or more columns (including `NULL` grouping keys) with SQL grouping correctness validation.
   - `HAVING` group-level filtering after aggregation.
 - Query clauses: column selection, `SELECT *`, `AS` aliases, `WHERE`, comparison operators (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), boolean logic (`AND`, `OR`, `NOT`), parentheses, `ORDER BY ... [ASC|DESC]` (columns, aliases, or aggregates), `LIMIT`.
+- SQL `NULL` semantics with full three-valued logic: comparisons against `NULL` yield `UNKNOWN`, `UNKNOWN` propagates through `AND`/`OR`/`NOT`, and `WHERE` / `JOIN ON` / `HAVING` / `UPDATE` / `DELETE` predicates accept a row only on `TRUE`.
 - Data types & constraints: `INT`/`INTEGER`, `TEXT`/`VARCHAR`, `FLOAT`/`DOUBLE`, `BOOL`/`BOOLEAN`; `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`.
 - Persistent storage:
   - Versioned JSON database files (`.aaydb`, format version `1`) with atomic replacement (`os.replace`) and startup corruption/schema validation.
@@ -138,6 +139,7 @@ GitHub Actions CI (`.github/workflows/tests.yml`) runs `python -m pytest -v` on 
 ## Known Limitations
 
 - Nested-loop join execution only (no B-tree indexes or hash joins yet).
+- Duplicate output labels in one `SELECT` list are rejected with `ExecutionError` (result rows are keyed by label), so distinct aliases are required.
 - `RIGHT JOIN`, `FULL JOIN`, `CROSS JOIN`, and qualified wildcards (`u.*`) are not supported.
 - `GROUP BY` supports simple column references (qualified or unqualified), not arbitrary expressions; nested aggregate functions (`SUM(COUNT(*))`) are not supported.
 - No subqueries, `UNION`, `IS NULL` syntax, arithmetic expressions, `ALTER TABLE`, or multi-statement transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) yet.

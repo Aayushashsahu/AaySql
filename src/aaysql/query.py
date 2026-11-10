@@ -36,20 +36,73 @@ class SourceBinding:
         )
 
 
-def compare_values(op: str, left: Any, right: Any) -> bool:
-    """Compare two runtime values using SQL comparison semantics."""
-    if op == "=":
+# --- SQL three-valued logic (TRUE / FALSE / UNKNOWN) ---
+#
+# UNKNOWN is represented by ``None``. Comparisons against NULL yield UNKNOWN,
+# and UNKNOWN propagates through AND / OR / NOT instead of collapsing to FALSE.
+# Only TRUE admits a row in WHERE, JOIN ON, and HAVING.
+
+
+def to_logic(value: Any) -> bool | None:
+    """Normalize a runtime value to a SQL logical state (``None`` means UNKNOWN)."""
+    if value is None:
+        return None
+    return True if bool(value) else False
+
+
+def sql_not(value: Any) -> bool | None:
+    state = to_logic(value)
+    return None if state is None else not state
+
+
+def sql_and(left: Any, right: Any) -> bool | None:
+    left_state = to_logic(left)
+    right_state = to_logic(right)
+    if left_state is False or right_state is False:
+        return False
+    if left_state is None or right_state is None:
+        return None
+    return True
+
+
+def sql_or(left: Any, right: Any) -> bool | None:
+    left_state = to_logic(left)
+    right_state = to_logic(right)
+    if left_state is True or right_state is True:
+        return True
+    if left_state is None or right_state is None:
+        return None
+    return False
+
+
+def is_sql_true(value: Any) -> bool:
+    """Row filters (WHERE, JOIN ON, HAVING) admit a row only when the result is TRUE."""
+    return value is not None and bool(value)
+
+
+def compare_values(op: str, left: Any, right: Any) -> bool | None:
+    """Compare two runtime values using SQL comparison semantics.
+
+    Returns ``None`` (UNKNOWN) when either operand is NULL, because a NULL
+    comparison is neither TRUE nor FALSE in SQL.
+    """
+    normalized = op.upper()
+    if normalized not in {"=", "!=", "<>", "<", "<=", ">", ">="}:
+        raise ExecutionError(f"Unsupported operator '{op}'")
+    if left is None or right is None:
+        return None
+    if normalized == "=":
         return left == right
-    if op in {"!=", "<>"}:
+    if normalized in {"!=", "<>"}:
         return left != right
     try:
-        if op == "<":
+        if normalized == "<":
             return left < right
-        if op == "<=":
+        if normalized == "<=":
             return left <= right
-        if op == ">":
+        if normalized == ">":
             return left > right
-        if op == ">=":
+        if normalized == ">=":
             return left >= right
     except TypeError as exc:
         raise ExecutionError(
@@ -175,32 +228,45 @@ def _validate_grouped_expr(
     raise ExecutionError(f"Cannot evaluate expression {expr}")
 
 
-def eval_row_expr(expr: Any, row_ctx: dict[str, dict[str, Any]], sources: list[SourceBinding]) -> Any:
-    """Evaluate a non-aggregate expression against a single joined/table row context."""
+def eval_expr(
+    expr: Any,
+    row_ctx: dict[str, dict[str, Any]] | None,
+    sources: list[SourceBinding],
+    aggregate_eval: Any | None = None,
+) -> Any:
+    """Evaluate an expression against a row context, optionally resolving aggregates."""
     if isinstance(expr, Literal):
         return expr.value
     if expr is None or isinstance(expr, (str, int, float, bool)):
         return expr
+    if isinstance(expr, AggregateCall):
+        if aggregate_eval is None:
+            raise ExecutionError(f"Aggregate function '{expr.func}' is not allowed in this context")
+        return aggregate_eval(expr)
     if isinstance(expr, Identifier):
+        if row_ctx is None:
+            return None
         ref, col_def = resolve_identifier(expr, sources)
         return row_ctx[ref][col_def.name]
     if isinstance(expr, UnaryExpr):
-        value = eval_row_expr(expr.expr, row_ctx, sources)
-        if expr.op == "NOT":
-            return not bool(value)
-        raise ExecutionError(f"Unsupported unary operator '{expr.op}'")
+        if expr.op.upper() != "NOT":
+            raise ExecutionError(f"Unsupported unary operator '{expr.op}'")
+        return sql_not(eval_expr(expr.expr, row_ctx, sources, aggregate_eval))
     if isinstance(expr, BinaryExpr):
-        left = eval_row_expr(expr.left, row_ctx, sources)
-        right = eval_row_expr(expr.right, row_ctx, sources)
         op = expr.op.upper()
+        left = eval_expr(expr.left, row_ctx, sources, aggregate_eval)
+        right = eval_expr(expr.right, row_ctx, sources, aggregate_eval)
         if op == "AND":
-            return bool(left) and bool(right)
+            return sql_and(left, right)
         if op == "OR":
-            return bool(left) or bool(right)
-        if left is None or right is None:
-            return False
+            return sql_or(left, right)
         return compare_values(op, left, right)
     raise ExecutionError(f"Cannot evaluate expression {expr}")
+
+
+def eval_row_expr(expr: Any, row_ctx: dict[str, dict[str, Any]], sources: list[SourceBinding]) -> Any:
+    """Evaluate a non-aggregate expression against a single joined/table row context."""
+    return eval_expr(expr, row_ctx, sources)
 
 
 def _eval_aggregate(
@@ -248,34 +314,13 @@ def _eval_group_expr(
     group_rows: list[dict[str, dict[str, Any]]],
     sources: list[SourceBinding],
 ) -> Any:
-    if isinstance(expr, Literal):
-        return expr.value
-    if expr is None or isinstance(expr, (str, int, float, bool)):
-        return expr
-    if isinstance(expr, AggregateCall):
-        return _eval_aggregate(expr, group_rows, sources)
-    if isinstance(expr, Identifier):
-        if sample_ctx is None:
-            return None
-        ref, col_def = resolve_identifier(expr, sources)
-        return sample_ctx[ref][col_def.name]
-    if isinstance(expr, UnaryExpr):
-        value = _eval_group_expr(expr.expr, sample_ctx, group_rows, sources)
-        if expr.op == "NOT":
-            return not bool(value)
-        raise ExecutionError(f"Unsupported unary operator '{expr.op}'")
-    if isinstance(expr, BinaryExpr):
-        left = _eval_group_expr(expr.left, sample_ctx, group_rows, sources)
-        right = _eval_group_expr(expr.right, sample_ctx, group_rows, sources)
-        op = expr.op.upper()
-        if op == "AND":
-            return bool(left) and bool(right)
-        if op == "OR":
-            return bool(left) or bool(right)
-        if left is None or right is None:
-            return False
-        return compare_values(op, left, right)
-    raise ExecutionError(f"Cannot evaluate expression {expr}")
+    """Evaluate a group-level expression, resolving aggregate calls against the group."""
+    return eval_expr(
+        expr,
+        sample_ctx,
+        sources,
+        aggregate_eval=lambda agg: _eval_aggregate(agg, group_rows, sources),
+    )
 
 
 def _default_expr_label(expr: Any, index: int) -> str:
@@ -299,6 +344,27 @@ def _normalize_order_expr(expr: Any) -> Any:
     if isinstance(expr, str):
         return Identifier(expr)
     return expr
+
+
+def _validate_output_labels(columns: list[str]) -> None:
+    """Reject duplicate output labels instead of silently overwriting a value.
+
+    Result rows are keyed by output label, so two selected expressions sharing a
+    label (``u.id AS identifier, o.id AS identifier`` or ``u.id, u.id``) would
+    collide. Distinct aliases are required until positional results are added.
+    """
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for name in columns:
+        if name in seen and name not in duplicates:
+            duplicates.append(name)
+        seen.add(name)
+    if duplicates:
+        listed = ", ".join(f"'{name}'" for name in duplicates)
+        raise ExecutionError(
+            f"Duplicate output column name {listed} in SELECT list; "
+            f"use a distinct alias for each selected expression"
+        )
 
 
 def execute_select(db: Database, stmt: Select) -> dict[str, Any]:
@@ -375,6 +441,18 @@ def execute_select(db: Database, stmt: Select) -> dict[str, Any]:
             else:
                 validate_expr_columns(order_expr, sources, allow_aggregates=False, context_name="ORDER BY clause")
 
+    if is_wildcard:
+        if not stmt.joins:
+            cols = list(sources[0].table.column_names)
+        else:
+            cols = [f"{src.ref}.{col}" for src in sources for col in src.table.column_names]
+    else:
+        cols = [
+            item.alias or _default_expr_label(item.expr, i)
+            for i, item in enumerate(stmt.columns)
+        ]
+    _validate_output_labels(cols)
+
     active_sources = [sources[0]]
     working_rows: list[dict[str, dict[str, Any]]] = [
         {sources[0].ref: row} for row in sources[0].table.rows
@@ -389,7 +467,7 @@ def execute_select(db: Database, stmt: Select) -> dict[str, Any]:
             matched = False
             for right_row in right_source.table.rows:
                 candidate = {**left_ctx, right_source.ref: right_row}
-                if eval_row_expr(join.condition, candidate, active_sources):
+                if is_sql_true(eval_row_expr(join.condition, candidate, active_sources)):
                     next_rows.append(candidate)
                     matched = True
             if join.join_type == "LEFT" and not matched:
@@ -397,17 +475,8 @@ def execute_select(db: Database, stmt: Select) -> dict[str, Any]:
         working_rows = next_rows
 
     if stmt.where is not None:
-        working_rows = [ctx for ctx in working_rows if eval_row_expr(stmt.where, ctx, sources)]
-
-    if is_wildcard:
-        if not stmt.joins:
-            cols = list(sources[0].table.column_names)
-        else:
-            cols = [f"{src.ref}.{col}" for src in sources for col in src.table.column_names]
-    else:
-        cols = [
-            item.alias or _default_expr_label(item.expr, i)
-            for i, item in enumerate(stmt.columns)
+        working_rows = [
+            ctx for ctx in working_rows if is_sql_true(eval_row_expr(stmt.where, ctx, sources))
         ]
 
     records: list[tuple[dict[str, Any], dict[str, dict[str, Any]] | None, list[dict[str, dict[str, Any]]] | None]] = []
@@ -434,7 +503,7 @@ def execute_select(db: Database, stmt: Select) -> dict[str, Any]:
             groups = [
                 (sample_ctx, group_rows)
                 for sample_ctx, group_rows in groups
-                if _eval_group_expr(stmt.having, sample_ctx, group_rows, sources)
+                if is_sql_true(_eval_group_expr(stmt.having, sample_ctx, group_rows, sources))
             ]
 
         for sample_ctx, group_rows in groups:

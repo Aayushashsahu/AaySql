@@ -1,6 +1,12 @@
 from .ast import *
 from .errors import ConstraintError, ExecutionError
-from .query import SourceBinding, eval_row_expr, execute_select, validate_expr_columns
+from .query import (
+    SourceBinding,
+    eval_row_expr,
+    execute_select,
+    is_sql_true,
+    validate_expr_columns,
+)
 from .storage import Database, coerce_value
 
 
@@ -99,7 +105,9 @@ class Executor:
             return list(table.rows)
         sources = [SourceBinding.from_table(table.name, table)]
         validate_expr_columns(where, sources, allow_aggregates=False, context_name="WHERE clause")
-        return [row for row in table.rows if eval_row_expr(where, {table.name: row}, sources)]
+        return [
+            row for row in table.rows if is_sql_true(eval_row_expr(where, {table.name: row}, sources))
+        ]
 
     def select(self, s):
         return execute_select(self.db, s)

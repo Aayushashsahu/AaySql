@@ -66,6 +66,25 @@ ORDER BY total_spent DESC, u.name ASC
 LIMIT 10;
 ```
 
+#### Output Labels
+
+Every `SELECT` expression must produce a distinct output label (its `AS` alias, otherwise the column or aggregate name). Two expressions sharing one label — `SELECT u.id AS identifier, o.id AS identifier` or `SELECT u.id, u.id` — are rejected with `ExecutionError`, because result rows are keyed by output label and a duplicate would overwrite a selected value. Use a distinct alias per expression.
+
+#### NULL Semantics (Three-Valued Logic)
+
+`NULL` means *unknown*, not *false*. Comparisons involving `NULL` evaluate to `UNKNOWN`, and `UNKNOWN` propagates through logical operators:
+
+| Expression | Result |
+|---|---|
+| `5 = NULL`, `5 <> NULL`, `5 > NULL` | `UNKNOWN` |
+| `NOT (5 = NULL)` | `UNKNOWN` |
+| `TRUE AND UNKNOWN` | `UNKNOWN` |
+| `FALSE AND UNKNOWN` | `FALSE` |
+| `TRUE OR UNKNOWN` | `TRUE` |
+| `FALSE OR UNKNOWN` | `UNKNOWN` |
+
+`WHERE`, `JOIN ON`, `HAVING`, and the `WHERE` clause of `UPDATE` / `DELETE` admit a row only when the predicate is `TRUE`. `UNKNOWN` never qualifies a row, so `NOT (salary = NULL)` matches nothing and `department <> 'Sales'` excludes rows whose `department` is `NULL`. To test for `NULL` you currently need `IS NULL` / `IS NOT NULL`, which are not implemented yet (see §5).
+
 #### Table Sources & Joins
 - Table aliases: `FROM users AS u` or `FROM users u` (likewise on joined tables).
 - Supported joins: `INNER JOIN ... ON <expr>`, `LEFT JOIN ... ON <expr>`, and `JOIN ... ON <expr>` (synonym for `INNER JOIN`). `RIGHT`, `FULL`, and `CROSS` joins are rejected with `ParserError`.
@@ -106,3 +125,4 @@ The following SQL features are **not yet implemented** in v0.3.0:
 - Subqueries, `UNION`, `DISTINCT`, `CASE`, `IS NULL` / `IS NOT NULL`, `LIKE`, `IN`, `BETWEEN`, arithmetic expressions
 - Nested aggregate functions (`SUM(COUNT(*))`) or arbitrary expressions in `GROUP BY`
 - `CREATE INDEX`, `EXPLAIN`, `ALTER TABLE`, `BEGIN`, `COMMIT`, `ROLLBACK`
+- Duplicate output labels within one `SELECT` list (rejected with `ExecutionError` rather than silently merged)
