@@ -112,3 +112,21 @@ class Update:
 class Delete:
     table: str
     where: Any | None = None
+
+
+@dataclass(frozen=True)
+class CreateIndex:
+    name: str
+    table: str
+    column: str
+
+
+@dataclass(frozen=True)
+class DropIndex:
+    name: str
+
+
+@dataclass(frozen=True)
+class Explain:
+    statement: Any
+    analyze: bool = False

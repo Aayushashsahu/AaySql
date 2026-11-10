@@ -12,7 +12,7 @@ Every top-level SQL statement must begin with `AAYUSH`. Ordinary SQL without the
 
 ## Current Version
 
-**v0.3.0** — Relational Query Engine adding `INNER JOIN`, `LEFT JOIN`, table aliases, qualified column references, aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `GROUP BY`, and `HAVING` on top of the hardened v0.2.1 persistent engine.
+**v0.4.0** — Indexing and Query Performance: a from-scratch B+ tree, single-column secondary indexes (`CREATE INDEX` / `DROP INDEX`), an index-aware query planner for single-table equality and range predicates, `EXPLAIN` / `EXPLAIN ANALYZE` plan inspection, and `.aaydb` format version 2 with automatic v1 migration — on top of the v0.3.0 relational engine.
 
 ## Why the `AAYUSH` Prefix Exists
 
@@ -35,6 +35,14 @@ Everything behind the parser — relational joins, column resolution, grouping, 
   - `INNER JOIN ... ON ...` and `LEFT JOIN ... ON ...` across two or more tables.
   - Table aliases (`FROM users AS u` and `FROM users u`).
   - Qualified column references (`users.id`, `u.id`, `orders.product`) with ambiguity detection for unqualified shared column names.
+- Indexing & query planning (v0.4.0):
+  - From-scratch B+ tree (`src/aaysql/btree.py`): ordered linked leaves with range traversal, internal separator nodes, node splitting, borrowing/merging on delete, duplicate keys, and structural invariant validation.
+  - `CREATE INDEX idx ON table (column)` / `DROP INDEX idx` for single-column, non-unique indexes. Definitions persist in `.aaydb`; trees are rebuilt from table rows on open.
+  - Indexes stay synchronized with `INSERT`, `UPDATE`, and `DELETE`, are removed by `DROP TABLE`, and never replace table rows as the source of truth.
+  - Query planner reuses an index for single-table `=`, `>`, `>=`, `<`, `<=` predicates and falls back to a table scan otherwise. The full `WHERE` clause is always re-applied and candidate rows keep table order, so indexed and unindexed results are identical.
+  - `EXPLAIN SELECT ...` reports the real access path (`INDEX SCAN` / `TABLE SCAN`); `EXPLAIN ANALYZE` adds measured rows scanned, rows filtered, rows returned, index used, and execution time.
+  - `.aaydb` format version 2 stores index definitions; version 1 files load unchanged and upgrade on the next write.
+  - Reproducible benchmarks in `benchmarks/benchmark_index.py`, with recorded measurements in `BENCHMARKS.md`.
 - Aggregation & grouping:
   - `COUNT(*)`, `COUNT(column)`, `SUM(column)`, `AVG(column)`, `MIN(column)`, `MAX(column)`.
   - `GROUP BY` across one or more columns (including `NULL` grouping keys) with SQL grouping correctness validation.
@@ -50,10 +58,11 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 - Automated GitHub Actions CI across Python 3.10–3.13.
 
 ### Planned (Future Roadmap)
-- **v0.4** — Indexing: B-tree / B+ tree indexes, index-assisted execution, `EXPLAIN`, query plan inspection.
-- **v0.5** — Transactions: `BEGIN`, `COMMIT`, `ROLLBACK`, multi-statement atomicity.
-- **v0.6** — Reliability: write-ahead logging (WAL), crash recovery, page-based storage.
-- **v0.7** — Server capabilities: client/server network protocol and concurrent connections.
+- **v0.5** — Transactions: `BEGIN`, `COMMIT`, `ROLLBACK`, multi-statement atomicity and rollback.
+- **v0.6** — Reliability: write-ahead logging (WAL), checkpoints, crash recovery.
+- **v0.7** — Query optimizer: hash joins, cardinality statistics, filter pushdown, profiling.
+- **v0.8** — Client/server: network protocol, server binary, authentication, localhost-by-default binding.
+- **v0.9** — SQL language expansion: `IS NULL`, `LIKE`, `IN`, `BETWEEN`, `DISTINCT`, arithmetic expressions, `OFFSET`, `CASE`.
 
 ## Example Relational Queries
 
@@ -138,7 +147,9 @@ GitHub Actions CI (`.github/workflows/tests.yml`) runs `python -m pytest -v` on 
 
 ## Known Limitations
 
-- Nested-loop join execution only (no B-tree indexes or hash joins yet).
+- Nested-loop join execution only; index plans cover single-table predicates, not joins or hash joins.
+- Single-column, non-unique indexes only; no optimizer statistics, and `EXPLAIN` executes the query it explains.
+- `EXPLAIN` supports `SELECT` statements only and reports metrics for the driving access path; nested-loop inner scans are not counted in `ROWS SCANNED`.
 - Duplicate output labels in one `SELECT` list are rejected with `ExecutionError` (result rows are keyed by label), so distinct aliases are required.
 - `RIGHT JOIN`, `FULL JOIN`, `CROSS JOIN`, and qualified wildcards (`u.*`) are not supported.
 - `GROUP BY` supports simple column references (qualified or unqualified), not arbitrary expressions; nested aggregate functions (`SUM(COUNT(*))`) are not supported.

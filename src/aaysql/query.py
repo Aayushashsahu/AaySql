@@ -14,6 +14,7 @@ from .ast import (
     UnaryExpr,
 )
 from .errors import ExecutionError
+from .planner import fetch_plan_rows
 from .storage import Database, Table
 
 _NUMERIC_TYPES = {"INT", "INTEGER", "FLOAT", "DOUBLE"}
@@ -367,8 +368,18 @@ def _validate_output_labels(columns: list[str]) -> None:
         )
 
 
-def execute_select(db: Database, stmt: Select) -> dict[str, Any]:
-    """Execute a SELECT statement through source binding, JOIN, WHERE, GROUP BY, HAVING, projection, ORDER BY, and LIMIT."""
+def execute_select(
+    db: Database,
+    stmt: Select,
+    plan: Any | None = None,
+    collect_metrics: bool = False,
+) -> dict[str, Any]:
+    """Execute a SELECT through source binding, JOIN, WHERE, GROUP BY, HAVING, projection, ORDER BY, and LIMIT.
+
+    When ``plan`` selects an index scan, candidate rows come from that index. The
+    complete WHERE clause is always re-applied afterwards, so indexed and unindexed
+    execution return identical rows.
+    """
     base_ref = stmt.table_alias or stmt.table
     sources: list[SourceBinding] = [SourceBinding.from_table(base_ref, db.table(stmt.table))]
     seen_refs = {base_ref}
@@ -453,9 +464,15 @@ def execute_select(db: Database, stmt: Select) -> dict[str, Any]:
         ]
     _validate_output_labels(cols)
 
+    if plan is not None and plan.index_name is not None and not stmt.joins:
+        base_rows = fetch_plan_rows(db, plan)
+    else:
+        base_rows = list(sources[0].table.rows)
+    rows_scanned = len(base_rows)
+
     active_sources = [sources[0]]
     working_rows: list[dict[str, dict[str, Any]]] = [
-        {sources[0].ref: row} for row in sources[0].table.rows
+        {sources[0].ref: row} for row in base_rows
     ]
 
     for idx, join in enumerate(stmt.joins):
@@ -569,4 +586,18 @@ def execute_select(db: Database, stmt: Select) -> dict[str, Any]:
         records = records[: stmt.limit]
 
     data = [out_row for out_row, _, _ in records]
-    return {"status": "ok", "columns": cols, "rows": data, "row_count": len(data)}
+    result: dict[str, Any] = {
+        "status": "ok",
+        "columns": cols,
+        "rows": data,
+        "row_count": len(data),
+    }
+    if collect_metrics:
+        result["metrics"] = {
+            "rows_scanned": rows_scanned,
+            "rows_filtered": max(rows_scanned - len(working_rows), 0),
+            "rows_produced": len(data),
+            "index": plan.index_name if plan is not None else None,
+            "join_algorithm": "NESTED LOOP" if stmt.joins else None,
+        }
+    return result

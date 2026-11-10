@@ -1,4 +1,4 @@
-# AayushSQL Language Specification (v0.3.0)
+# AayushSQL Language Specification (v0.4.0)
 
 ## 1. Overview
 
@@ -43,6 +43,48 @@ AAYUSH CREATE TABLE table_name (
 AAYUSH DROP TABLE table_name;
 ```
 Column constraints: `PRIMARY KEY` (at most one per table, unique and non-null), `NOT NULL`, `UNIQUE`, `DEFAULT <literal>` (validated against column type and nullability).
+
+### `CREATE INDEX` / `DROP INDEX`
+```sql
+AAYUSH CREATE INDEX idx_users_age ON users (age);
+AAYUSH DROP INDEX idx_users_age;
+```
+- Single-column, non-unique indexes only. Multi-column and unique indexes are rejected.
+- Index names must be unique in the database and match `[A-Za-z_][A-Za-z0-9_]*`.
+- The indexed table and column must already exist.
+- Index definitions are stored in the `.aaydb` file (format version 2); the B+ tree is rebuilt from table rows when the database is opened.
+- Indexes are maintained by `INSERT`, `UPDATE`, and `DELETE`, and are removed with their table via `DROP TABLE`.
+- `NULL` column values are not indexed. Because comparisons against `NULL` never evaluate to `TRUE`, indexed and unindexed results stay identical.
+
+### `EXPLAIN` / `EXPLAIN ANALYZE`
+```sql
+AAYUSH EXPLAIN SELECT * FROM users WHERE age = 19;
+AAYUSH EXPLAIN ANALYZE SELECT * FROM users WHERE age = 19;
+```
+
+`EXPLAIN` prints the plan the executor actually uses:
+
+```text
+QUERY PLAN
+
+INDEX SCAN: idx_users_age
+  TABLE: users
+  CONDITION: age = 19
+```
+
+Without an applicable index:
+
+```text
+QUERY PLAN
+
+TABLE SCAN: users
+  FILTER: age > 18
+```
+
+- Index-assisted filtering applies to single-table predicates of the form `column <op> literal` or `literal <op> column` with `<op>` in `=`, `>`, `>=`, `<`, `<=` against an existing single-column index. `OR`, `NOT`, `!=` / `<>`, `NULL` literals, type-mismatched literals, and joined queries use a table scan.
+- The full original `WHERE` clause is always re-applied after index retrieval, and candidate rows are returned in table order, so results (including unordered `LIMIT`) are identical with or without an index.
+- `EXPLAIN ANALYZE` appends measured counters: rows scanned from the access path, rows filtered, rows returned, index used, and execution time. Estimates are never fabricated.
+- `EXPLAIN` currently supports `SELECT` statements only. It executes the statement to produce real plans and metrics, so it is not a zero-cost command.
 
 ### `INSERT INTO`
 ```sql
@@ -119,10 +161,11 @@ Every assignment in `UPDATE ... SET` requires an explicit `=`.
 
 ## 5. Unsupported / Planned Syntax
 
-The following SQL features are **not yet implemented** in v0.3.0:
+The following SQL features are **not yet implemented** in v0.4.0:
 - `RIGHT JOIN`, `FULL JOIN`, `CROSS JOIN`, natural joins, or comma joins
 - Qualified wildcards (`u.*`)
 - Subqueries, `UNION`, `DISTINCT`, `CASE`, `IS NULL` / `IS NOT NULL`, `LIKE`, `IN`, `BETWEEN`, arithmetic expressions
 - Nested aggregate functions (`SUM(COUNT(*))`) or arbitrary expressions in `GROUP BY`
-- `CREATE INDEX`, `EXPLAIN`, `ALTER TABLE`, `BEGIN`, `COMMIT`, `ROLLBACK`
+- `ALTER TABLE`, `BEGIN`, `COMMIT`, `ROLLBACK`
+- Unique, partial, expression, or multi-column indexes; index plans for joins
 - Duplicate output labels within one `SELECT` list (rejected with `ExecutionError` rather than silently merged)

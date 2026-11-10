@@ -73,7 +73,19 @@ class Parser:
     def ident(self) -> str:
         return str(self.expect(TokenType.IDENT).value)
 
+    def parse_explain(self):
+        self.expect_kw("EXPLAIN")
+        analyze = False
+        if self.keyword("ANALYZE"):
+            self.advance()
+            analyze = True
+        if self.match(TokenType.EOF):
+            raise ParserError("EXPLAIN requires a statement to explain")
+        return Explain(statement=self.parse_statement(), analyze=analyze)
+
     def parse_statement(self):
+        if self.keyword("EXPLAIN"):
+            return self.parse_explain()
         if self.keyword("CREATE"):
             return self.parse_create()
         if self.keyword("DROP"):
@@ -90,6 +102,8 @@ class Parser:
 
     def parse_create(self):
         self.expect_kw("CREATE")
+        if self.keyword("INDEX"):
+            return self.parse_create_index()
         self.expect_kw("TABLE")
         name = self.ident()
         self.expect(TokenType.LPAREN)
@@ -132,8 +146,28 @@ class Parser:
         self.expect(TokenType.RPAREN)
         return CreateTable(name, cols)
 
+    def parse_create_index(self):
+        self.expect_kw("INDEX")
+        name = self.ident()
+        self.expect_kw("ON")
+        table = self.ident()
+        self.expect(TokenType.LPAREN)
+        column = self.ident()
+        if self.match(TokenType.COMMA):
+            tok = self.current()
+            raise ParserError(
+                f"Multi-column indexes are not supported at position {tok.position}; "
+                f"create one index per column"
+            )
+        self.expect(TokenType.RPAREN)
+        return CreateIndex(name=name, table=table, column=column)
+
     def parse_drop(self):
-        self.expect_kw("DROP"); self.expect_kw("TABLE")
+        self.expect_kw("DROP")
+        if self.keyword("INDEX"):
+            self.advance()
+            return DropIndex(self.ident())
+        self.expect_kw("TABLE")
         return DropTable(self.ident())
 
     def parse_insert(self):
