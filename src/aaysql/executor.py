@@ -1,5 +1,6 @@
 from .ast import *
 from .errors import ConstraintError, ExecutionError
+from .query import SourceBinding, eval_row_expr, execute_select, validate_expr_columns
 from .storage import Database, coerce_value
 
 
@@ -79,100 +80,43 @@ class Executor:
         table.rows.extend(new_rows)
         return {"status": "ok", "rows_affected": len(new_rows)}
 
-    def _value(self, expr, row):
-        if isinstance(expr, Literal):
-            return expr.value
-        if expr is None or isinstance(expr, (str, int, float, bool)):
-            return expr
-        if isinstance(expr, Identifier):
-            if expr.name == "*":
-                return row
-            if expr.name not in row:
-                raise ExecutionError(f"Unknown column '{expr.name}'")
-            return row[expr.name]
-        if isinstance(expr, UnaryExpr):
-            value = self._value(expr.expr, row)
-            if expr.op == "NOT":
-                return not bool(value)
-        if isinstance(expr, BinaryExpr):
-            left = self._value(expr.left, row)
-            right = self._value(expr.right, row)
-            op = expr.op.upper()
-            if op == "AND":
-                return bool(left) and bool(right)
-            if op == "OR":
-                return bool(left) or bool(right)
-            if left is None or right is None:
-                return False
-            return self._compare(op, left, right)
-        raise ExecutionError(f"Cannot evaluate expression {expr}")
-
-    def _compare(self, op: str, left, right) -> bool:
-        if op == "=":
-            return left == right
-        if op in {"!=", "<>"}:
-            return left != right
-        try:
-            if op == "<":
-                return left < right
-            if op == "<=":
-                return left <= right
-            if op == ">":
-                return left > right
-            if op == ">=":
-                return left >= right
-        except TypeError as exc:
-            raise ExecutionError(
-                f"Cannot compare {type(left).__name__} and {type(right).__name__} with operator '{op}'"
-            ) from exc
-        raise ExecutionError(f"Unsupported operator '{op}'")
+    def _value(self, expr, row, table=None):
+        if table is None:
+            if isinstance(expr, Literal):
+                return expr.value
+            if expr is None or isinstance(expr, (str, int, float, bool)):
+                return expr
+            if isinstance(expr, Identifier):
+                if expr.name not in row:
+                    raise ExecutionError(f"Unknown column '{expr.label}'")
+                return row[expr.name]
+            raise ExecutionError(f"Cannot evaluate expression {expr}")
+        sources = [SourceBinding.from_table(table.name, table)]
+        return eval_row_expr(expr, {table.name: row}, sources)
 
     def _filtered(self, table, where):
         if where is None:
             return list(table.rows)
-        return [row for row in table.rows if self._value(where, row)]
+        sources = [SourceBinding.from_table(table.name, table)]
+        validate_expr_columns(where, sources, allow_aggregates=False, context_name="WHERE clause")
+        return [row for row in table.rows if eval_row_expr(where, {table.name: row}, sources)]
 
     def select(self, s):
-        table = self.db.table(s.table)
-        rows = self._filtered(table, s.where)
-        if s.order_by:
-            for col, desc in reversed(s.order_by):
-                table.ensure_column(col)
-                try:
-                    rows.sort(key=lambda r: (r[col] is None, "" if r[col] is None else r[col]), reverse=desc)
-                except TypeError as exc:
-                    raise ExecutionError(f"Cannot sort column '{col}' due to incompatible values") from exc
-        if s.limit is not None:
-            rows = rows[: s.limit]
-        if len(s.columns) == 1 and isinstance(s.columns[0].expr, Identifier) and s.columns[0].expr.name == "*":
-            cols = table.column_names
-        else:
-            cols = [
-                item.alias or (item.expr.name if isinstance(item.expr, Identifier) else f"expr_{i+1}")
-                for i, item in enumerate(s.columns)
-            ]
-        data = []
-        for row in rows:
-            out = {}
-            for i, item in enumerate(s.columns):
-                value = self._value(item.expr, row)
-                if len(s.columns) == 1 and isinstance(item.expr, Identifier) and item.expr.name == "*":
-                    out = row.copy()
-                    break
-                out[cols[i]] = value
-            data.append(out)
-        return {"status": "ok", "columns": cols, "rows": data, "row_count": len(data)}
+        return execute_select(self.db, s)
 
     def update(self, s):
         table = self.db.table(s.table)
+        sources = [SourceBinding.from_table(table.name, table)]
         targets = self._filtered(table, s.where)
         staged = []
+        for col, expr in s.assignments:
+            table.ensure_column(col)
+            validate_expr_columns(expr, sources, allow_aggregates=False, context_name="UPDATE assignment")
         for old in targets:
             new = old.copy()
             for col, expr in s.assignments:
-                table.ensure_column(col)
                 col_def = next(c for c in table.columns if c.name == col)
-                new[col] = self._coerce(self._value(expr, old), col_def)
+                new[col] = self._coerce(eval_row_expr(expr, {table.name: old}, sources), col_def)
             staged.append((old, new))
         target_map = {id(old): new for old, new in staged}
         post_rows = [target_map.get(id(row), row) for row in table.rows]
