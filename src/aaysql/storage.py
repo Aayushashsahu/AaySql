@@ -12,7 +12,7 @@ from .errors import ConstraintError, ExecutionError, StorageError
 
 FORMAT_NAME = "aaysql"
 FORMAT_VERSION = 1
-ENGINE_VERSION = "0.2.1"
+ENGINE_VERSION = "0.3.0"
 
 TYPE_MAP: dict[str, type] = {
     "INT": int,

@@ -100,7 +100,7 @@ def test_cli_demo_script_in_memory(tmp_path: Path):
 def test_cli_version_flag(tmp_path: Path):
     p = _run_cli(["--version"], cwd=tmp_path)
     assert p.returncode == 0
-    assert "aaysql 0.2.1" in p.stdout
+    assert "aaysql 0.3.0" in p.stdout
 
 
 def test_cli_script_success_returns_zero(tmp_path: Path):

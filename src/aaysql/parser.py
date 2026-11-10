@@ -3,6 +3,23 @@ from .errors import ParserError
 from .storage import SUPPORTED_TYPES, TYPE_MAP, validate_column_def
 from .token import Token, TokenType
 
+_AGGREGATE_FUNCTIONS = {"COUNT", "SUM", "AVG", "MIN", "MAX"}
+_CLAUSE_KEYWORDS = {
+    "INNER",
+    "LEFT",
+    "RIGHT",
+    "FULL",
+    "CROSS",
+    "OUTER",
+    "JOIN",
+    "ON",
+    "WHERE",
+    "GROUP",
+    "HAVING",
+    "ORDER",
+    "LIMIT",
+}
+
 
 class Parser:
     def __init__(self, tokens: list[Token]):
@@ -142,6 +159,34 @@ class Parser:
             self.advance()
         return Insert(table, columns, values)
 
+    def _parse_table_alias(self) -> str | None:
+        if self.keyword("AS"):
+            self.advance()
+            return self.ident()
+        tok = self.current()
+        if tok.type == TokenType.IDENT and str(tok.value).upper() not in _CLAUSE_KEYWORDS:
+            return self.ident()
+        return None
+
+    def parse_order_item(self):
+        tok = self.current()
+        if tok.type == TokenType.IDENT and self.peek(1).type == TokenType.LPAREN:
+            expr = self.parse_aggregate()
+        elif tok.type == TokenType.IDENT and not self.keyword("NULL"):
+            expr = self.parse_qualified_ident()
+        else:
+            got = tok.value if tok.value is not None else tok.type.name
+            raise ParserError(
+                f"Expected column or aggregate in ORDER BY, got {got!r} at position {tok.position}"
+            )
+        desc = False
+        if self.keyword("ASC"):
+            self.advance()
+        elif self.keyword("DESC"):
+            self.advance()
+            desc = True
+        return expr, desc
+
     def parse_select(self):
         self.expect_kw("SELECT")
         items = []
@@ -153,28 +198,66 @@ class Parser:
                 self.advance(); items.append(self.parse_select_item())
         self.expect_kw("FROM")
         table = self.ident()
+        table_alias = self._parse_table_alias()
+        joins: list[JoinClause] = []
+        while self.keyword("INNER") or self.keyword("LEFT") or self.keyword("JOIN"):
+            if self.keyword("INNER"):
+                self.advance()
+                self.expect_kw("JOIN")
+                join_type = "INNER"
+            elif self.keyword("LEFT"):
+                self.advance()
+                self.expect_kw("JOIN")
+                join_type = "LEFT"
+            else:
+                self.advance()
+                join_type = "INNER"
+            join_table = self.ident()
+            join_alias = self._parse_table_alias()
+            self.expect_kw("ON")
+            condition = self.parse_expr()
+            joins.append(JoinClause(join_type=join_type, table=join_table, alias=join_alias, condition=condition))
+        if self.keyword("RIGHT") or self.keyword("FULL") or self.keyword("CROSS") or self.keyword("OUTER"):
+            tok = self.current()
+            raise ParserError(f"Unsupported JOIN type '{tok.value}' at position {tok.position}")
         where = None
         if self.keyword("WHERE"):
             self.advance(); where = self.parse_expr()
+        group_by = None
+        if self.keyword("GROUP"):
+            self.advance()
+            self.expect_kw("BY")
+            group_by = [self.parse_qualified_ident()]
+            while self.match(TokenType.COMMA):
+                self.advance()
+                group_by.append(self.parse_qualified_ident())
+        having = None
+        if self.keyword("HAVING"):
+            self.advance()
+            having = self.parse_expr()
         order_by = None
         if self.keyword("ORDER"):
             self.advance(); self.expect_kw("BY")
-            order_by = [(self.ident(), False)]
-            if self.keyword("ASC"):
-                self.advance()
-            elif self.keyword("DESC"):
-                self.advance(); order_by = [(order_by[0][0], True)]
+            order_by = [self.parse_order_item()]
             while self.match(TokenType.COMMA):
-                self.advance(); col = self.ident(); desc = False
-                if self.keyword("ASC"): self.advance()
-                elif self.keyword("DESC"): self.advance(); desc = True
-                order_by.append((col, desc))
+                self.advance()
+                order_by.append(self.parse_order_item())
         limit = None
         if self.keyword("LIMIT"):
             self.advance(); tok = self.expect(TokenType.NUMBER)
             if not isinstance(tok.value, int) or tok.value < 0: raise ParserError("LIMIT must be a non-negative integer")
             limit = tok.value
-        return Select(items, table, where, order_by, limit)
+        return Select(
+            columns=items,
+            table=table,
+            where=where,
+            order_by=order_by,
+            limit=limit,
+            table_alias=table_alias,
+            joins=joins,
+            group_by=group_by,
+            having=having,
+        )
 
     def parse_select_item(self):
         expr = self.parse_primary()
@@ -249,9 +332,44 @@ class Parser:
     def parse_primary(self):
         if self.match(TokenType.LPAREN):
             self.advance(); expr = self.parse_expr(); self.expect(TokenType.RPAREN); return expr
-        if self.current().type == TokenType.IDENT:
-            return Identifier(self.advance().value)
+        tok = self.current()
+        if tok.type == TokenType.IDENT:
+            if self.peek(1).type == TokenType.LPAREN:
+                return self.parse_aggregate()
+            if self.keyword("NULL"):
+                return self.parse_literal()
+            return self.parse_qualified_ident()
         return self.parse_literal()
+
+    def parse_qualified_ident(self) -> Identifier:
+        first = self.ident()
+        if self.match(TokenType.DOT):
+            self.advance()
+            if self.match(TokenType.STAR):
+                raise ParserError(
+                    f"Qualified wildcard '{first}.*' is not supported at position {self.current().position}"
+                )
+            second = self.ident()
+            return Identifier(name=second, qualifier=first)
+        return Identifier(name=first)
+
+    def parse_aggregate(self) -> AggregateCall:
+        func_tok = self.expect(TokenType.IDENT)
+        func_name = str(func_tok.value).upper()
+        if func_name not in _AGGREGATE_FUNCTIONS:
+            raise ParserError(f"Unsupported function '{func_tok.value}' at position {func_tok.position}")
+        self.expect(TokenType.LPAREN)
+        if func_name == "COUNT" and self.match(TokenType.STAR):
+            self.advance()
+            arg = Identifier("*")
+        elif self.match(TokenType.STAR):
+            raise ParserError(
+                f"{func_name}(*) is not supported at position {self.current().position}; only COUNT(*) accepts '*'"
+            )
+        else:
+            arg = self.parse_expr()
+        self.expect(TokenType.RPAREN)
+        return AggregateCall(func=func_name, arg=arg)
 
     def parse_literal(self):
         tok = self.current()
