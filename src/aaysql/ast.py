@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -21,6 +21,26 @@ class Literal:
 @dataclass(frozen=True)
 class Identifier:
     name: str
+    qualifier: str | None = None
+
+    @property
+    def label(self) -> str:
+        return f"{self.qualifier}.{self.name}" if self.qualifier else self.name
+
+
+@dataclass(frozen=True)
+class AggregateCall:
+    func: str
+    arg: Any
+
+    @property
+    def label(self) -> str:
+        if isinstance(self.arg, Identifier):
+            return f"{self.func}({self.arg.label})"
+        if isinstance(self.arg, Literal):
+            val = "NULL" if self.arg.value is None else repr(self.arg.value)
+            return f"{self.func}({val})"
+        return f"{self.func}(...)"
 
 
 @dataclass(frozen=True)
@@ -40,6 +60,14 @@ class BinaryExpr:
 class SelectItem:
     expr: Any
     alias: str | None = None
+
+
+@dataclass(frozen=True)
+class JoinClause:
+    join_type: str
+    table: str
+    alias: str | None = None
+    condition: Any = None
 
 
 @dataclass(frozen=True)
@@ -65,8 +93,12 @@ class Select:
     columns: list[SelectItem]
     table: str
     where: Any | None = None
-    order_by: list[tuple[str, bool]] | None = None
+    order_by: list[tuple[Any, bool]] | None = None
     limit: int | None = None
+    table_alias: str | None = None
+    joins: list[JoinClause] = field(default_factory=list)
+    group_by: list[Identifier] | None = None
+    having: Any | None = None
 
 
 @dataclass(frozen=True)
