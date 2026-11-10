@@ -17,7 +17,7 @@ FORMAT_VERSION = 2
 # Format version 1 predates index definitions; it is still readable and upgrades
 # to version 2 on the next write.
 READABLE_FORMAT_VERSIONS = (1, 2)
-ENGINE_VERSION = "0.4.0"
+ENGINE_VERSION = "0.5.0"
 
 TYPE_MAP: dict[str, type] = {
     "INT": int,

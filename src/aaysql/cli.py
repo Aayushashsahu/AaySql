@@ -227,6 +227,11 @@ def main(argv: list[str] | None = None) -> int:
                 run_buffer(engine, joined)
         return 0
     finally:
+        if engine.in_transaction:
+            print(
+                "WARNING: rolling back uncommitted transaction on exit",
+                file=sys.stderr,
+            )
         engine.close()
 
 
