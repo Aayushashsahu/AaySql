@@ -12,7 +12,7 @@ Every top-level SQL statement must begin with `AAYUSH`. Ordinary SQL without the
 
 ## Current Version
 
-**v0.2.0** — Persistent JSON disk storage, atomic file replacement, startup schema/data validation, and CLI storage modes, built on top of the v0.1.0 relational engine.
+**v0.2.1** — Engine hardening, strict parser/schema validation, fail-fast script exit codes, normalized runtime errors, and GitHub Actions CI, built on top of v0.2.0 persistent storage.
 
 ## Why the `AAYUSH` Prefix Exists
 
@@ -28,12 +28,13 @@ Everything behind the parser — constraints, validation, atomic mutations, and 
 
 ## Implemented vs. Planned Features
 
-### Implemented (v0.2.0)
+### Implemented (v0.2.1)
 - Mandatory `AAYUSH` top-level statement prefix (rejects missing or duplicate `AAYUSH`).
 - DDL & DML: `CREATE TABLE`, `DROP TABLE`, `INSERT INTO ... VALUES ...`, `SELECT ... FROM ...`, `UPDATE ... SET ...`, `DELETE FROM ...`.
+- Strict `UPDATE` assignment grammar requiring `=` in every `SET col = value` assignment.
 - Query clauses: column selection, `SELECT *`, `AS` aliases, `WHERE`, comparison operators (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), boolean logic (`AND`, `OR`, `NOT`), parentheses, `ORDER BY ... [ASC|DESC]`, `LIMIT`.
-- Data types: `INT` / `INTEGER`, `TEXT` / `VARCHAR`, `FLOAT` / `DOUBLE`, `BOOL` / `BOOLEAN`.
-- Constraints: `PRIMARY KEY` (single-column), `NOT NULL`, `UNIQUE`, `DEFAULT`.
+- Data types (strictly validated on `CREATE TABLE` and database load): `INT` / `INTEGER`, `TEXT` / `VARCHAR`, `FLOAT` / `DOUBLE`, `BOOL` / `BOOLEAN`.
+- Constraints: `PRIMARY KEY` (single-column, unique and non-null), `NOT NULL`, `UNIQUE`, `DEFAULT` (validated against column type and nullability).
 - Persistent storage:
   - Versioned JSON database files (`.aaydb`) with schemas, constraints, and rows.
   - Automatic persistence after every successful mutation.
@@ -41,7 +42,9 @@ Everything behind the parser — constraints, validation, atomic mutations, and 
   - No disk writes for read-only `SELECT` queries or failed statements.
   - Corruption/malformed-file detection raising explicit `StorageError`s.
   - Configurable database file path (`--db`) and temporary in-memory mode (`--memory` / `--db :memory:`).
-- Interactive REPL and script execution CLI with zero external runtime dependencies.
+- Interactive REPL (resilient to query errors) and fail-fast script runner (returns non-zero exit code on failure).
+- Normalized runtime error hierarchy (`AayushSQLError`) with exception chaining for invalid runtime comparisons.
+- Automated GitHub Actions CI across Python 3.10–3.13.
 
 ### Planned (Future Roadmap)
 - **v0.3** — Relational capabilities: `INNER JOIN`, `LEFT JOIN`, `GROUP BY`, `HAVING`, aggregate functions.
@@ -52,11 +55,11 @@ Everything behind the parser — constraints, validation, atomic mutations, and 
 
 ## Installation and Execution
 
-Requires **Python 3.10+** with no external runtime dependencies (`pytest` is used for running tests).
+Requires **Python 3.10+** with no external runtime dependencies (`pytest` is declared under `[project.optional-dependencies] dev`).
 
 ### Option 1: Editable install
 ```bash
-pip install -e .
+pip install -e ".[dev]"
 aaysql --help
 ```
 
@@ -76,7 +79,7 @@ PYTHONPATH=src python -m aaysql.cli
 ## CLI Usage
 
 ```text
-python -m aaysql.cli [--db PATH | --memory] [script]
+python -m aaysql.cli [--db PATH | --memory] [--version] [script]
 ```
 
 - **Default persistent mode** (uses `./aaysql.aaydb` in the current working directory):
@@ -98,6 +101,13 @@ python -m aaysql.cli [--db PATH | --memory] [script]
   python -m aaysql.cli --memory examples/demo.aay
   python -m aaysql.cli --db university.aaydb examples/demo.aay
   ```
+
+### Script Fail-Fast & Exit-Code Behavior
+
+- When executing a script file, statements run sequentially in auto-persist mode.
+- If all statements succeed, the CLI exits with status `0`.
+- On the first `AayushSQLError` (lexer, parser, execution, constraint, or storage error), the CLI prints `ERROR: ...` to `stderr`, halts before subsequent statements, preserves any earlier persisted mutations, and exits with status `1`.
+- In interactive REPL mode, query errors print `ERROR: ...` and keep the session open for further commands.
 
 ### Multi-session Persistence Example
 
@@ -142,13 +152,15 @@ AAYUSH SELECT * FROM users;
 - Writes are serialized to a temporary file in the same directory, flushed and `fsync`ed, and swapped in via `os.replace`.
 - If an existing database file is empty, unreadable, invalid JSON, or fails schema/type/constraint validation, AayushSQL refuses to load it with a `StorageError` rather than silently overwriting user data.
 
-## Testing
+## Testing & Continuous Integration
 
 Run the full test suite from the project root:
 
 ```bash
 python -m pytest -v
 ```
+
+GitHub Actions CI (`.github/workflows/tests.yml`) runs `python -m pytest -v` on pushes and pull requests targeting `main` across Python `3.10`, `3.11`, `3.12`, and `3.13`.
 
 ## Known Limitations
 

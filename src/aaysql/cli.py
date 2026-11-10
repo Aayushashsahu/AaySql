@@ -135,12 +135,17 @@ def _has_complete_statement(text: str) -> bool:
     return saw_semicolon and quote is None
 
 
-def run_buffer(engine: Engine, text: str) -> None:
+def run_buffer(engine: Engine, text: str, *, stop_on_error: bool = False) -> bool:
+    """Execute statements in text. Returns True if all statements succeeded."""
     for stmt in split_statements(text):
         try:
             print(format_result(engine.execute(stmt)))
         except AayushSQLError as exc:
-            print(f"ERROR: {exc}")
+            err_stream = sys.stderr if stop_on_error else sys.stdout
+            print(f"ERROR: {exc}", file=err_stream)
+            if stop_on_error:
+                return False
+    return True
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -200,11 +205,10 @@ def main(argv: list[str] | None = None) -> int:
             path = Path(args.script)
             try:
                 text = path.read_text(encoding="utf-8")
-            except OSError as exc:
+            except (OSError, UnicodeDecodeError) as exc:
                 print(f"ERROR: Cannot read script '{path}': {exc}", file=sys.stderr)
                 return 1
-            run_buffer(engine, text)
-            return 0
+            return 0 if run_buffer(engine, text, stop_on_error=True) else 1
 
         buffer: list[str] = []
         while True:

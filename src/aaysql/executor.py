@@ -104,16 +104,28 @@ class Executor:
                 return bool(left) or bool(right)
             if left is None or right is None:
                 return False
-            return {
-                "=": left == right,
-                "!=": left != right,
-                "<>": left != right,
-                "<": left < right,
-                "<=": left <= right,
-                ">": left > right,
-                ">=": left >= right,
-            }[op]
+            return self._compare(op, left, right)
         raise ExecutionError(f"Cannot evaluate expression {expr}")
+
+    def _compare(self, op: str, left, right) -> bool:
+        if op == "=":
+            return left == right
+        if op in {"!=", "<>"}:
+            return left != right
+        try:
+            if op == "<":
+                return left < right
+            if op == "<=":
+                return left <= right
+            if op == ">":
+                return left > right
+            if op == ">=":
+                return left >= right
+        except TypeError as exc:
+            raise ExecutionError(
+                f"Cannot compare {type(left).__name__} and {type(right).__name__} with operator '{op}'"
+            ) from exc
+        raise ExecutionError(f"Unsupported operator '{op}'")
 
     def _filtered(self, table, where):
         if where is None:
@@ -126,7 +138,10 @@ class Executor:
         if s.order_by:
             for col, desc in reversed(s.order_by):
                 table.ensure_column(col)
-                rows.sort(key=lambda r: (r[col] is None, "" if r[col] is None else r[col]), reverse=desc)
+                try:
+                    rows.sort(key=lambda r: (r[col] is None, "" if r[col] is None else r[col]), reverse=desc)
+                except TypeError as exc:
+                    raise ExecutionError(f"Cannot sort column '{col}' due to incompatible values") from exc
         if s.limit is not None:
             rows = rows[: s.limit]
         if len(s.columns) == 1 and isinstance(s.columns[0].expr, Identifier) and s.columns[0].expr.name == "*":

@@ -12,7 +12,7 @@ from .errors import ConstraintError, ExecutionError, StorageError
 
 FORMAT_NAME = "aaysql"
 FORMAT_VERSION = 1
-ENGINE_VERSION = "0.2.0"
+ENGINE_VERSION = "0.2.1"
 
 TYPE_MAP: dict[str, type] = {
     "INT": int,
@@ -25,7 +25,21 @@ TYPE_MAP: dict[str, type] = {
     "BOOLEAN": bool,
 }
 
+SUPPORTED_TYPES: tuple[str, ...] = tuple(TYPE_MAP.keys())
+
 _SCALAR_TYPES = (type(None), bool, int, float, str)
+
+
+def validate_type_name(type_name: str) -> str:
+    """Validate and normalize a SQL column data type name."""
+    if not isinstance(type_name, str) or not type_name.strip():
+        raise ExecutionError("Column data type must be a non-empty string")
+    normalized = type_name.strip().upper()
+    if normalized not in TYPE_MAP:
+        raise ExecutionError(
+            f"Unsupported data type '{type_name}'. Supported types: {', '.join(SUPPORTED_TYPES)}"
+        )
+    return normalized
 
 
 def coerce_value(value: Any, col: ColumnDef) -> Any:
@@ -34,11 +48,11 @@ def coerce_value(value: Any, col: ColumnDef) -> Any:
         if col.not_null or col.primary_key:
             raise ConstraintError(f"Column '{col.name}' cannot be NULL")
         return None
-    typ = TYPE_MAP.get(col.type_name)
+    typ = TYPE_MAP.get(col.type_name.upper())
     if typ is None:
-        if not isinstance(value, _SCALAR_TYPES):
-            raise ConstraintError(f"Invalid value type for column '{col.name}'")
-        return value
+        raise ExecutionError(
+            f"Unsupported data type '{col.type_name}' for column '{col.name}'"
+        )
     if typ is bool:
         if isinstance(value, bool):
             return value
@@ -56,6 +70,50 @@ def coerce_value(value: Any, col: ColumnDef) -> Any:
         if not isinstance(value, str):
             raise ConstraintError(f"Column '{col.name}' expects TEXT")
     return value
+
+
+def validate_column_def(col: ColumnDef) -> ColumnDef:
+    """Validate column type, constraints, and default value compatibility."""
+    if not isinstance(col.name, str) or not col.name:
+        raise ExecutionError("Column name must be a non-empty string")
+    normalized_type = validate_type_name(col.type_name)
+    normalized_col = ColumnDef(
+        name=col.name,
+        type_name=normalized_type,
+        primary_key=col.primary_key,
+        not_null=col.not_null,
+        unique=col.unique,
+        default=col.default,
+        has_default=col.has_default,
+    )
+    if col.has_default:
+        if not isinstance(col.default, _SCALAR_TYPES):
+            raise ConstraintError(f"Invalid DEFAULT value for column '{col.name}'")
+        coerced_default = coerce_value(col.default, normalized_col)
+        normalized_col = ColumnDef(
+            name=col.name,
+            type_name=normalized_type,
+            primary_key=col.primary_key,
+            not_null=col.not_null,
+            unique=col.unique,
+            default=coerced_default,
+            has_default=True,
+        )
+    elif col.default is not None:
+        raise ConstraintError(f"Column '{col.name}' has a default value without has_default=True")
+    return normalized_col
+
+
+def validate_table_schema(columns: list[ColumnDef]) -> list[ColumnDef]:
+    """Validate and normalize a full table column schema."""
+    if not columns:
+        raise ExecutionError("A table must have at least one column")
+    names = [c.name for c in columns]
+    if len(set(n.lower() for n in names)) != len(names):
+        raise ExecutionError("Duplicate column name")
+    if sum(c.primary_key for c in columns) > 1:
+        raise ExecutionError("Only one PRIMARY KEY column is supported")
+    return [validate_column_def(col) for col in columns]
 
 
 def _column_to_dict(col: ColumnDef) -> dict[str, Any]:
@@ -137,12 +195,12 @@ class Table:
         raw_columns = data.get("columns")
         if not isinstance(raw_columns, list) or not raw_columns:
             raise StorageError(f"Table '{name}' must have a non-empty column list")
-        columns = [_column_from_dict(c, name) for c in raw_columns]
+        parsed_columns = [_column_from_dict(c, name) for c in raw_columns]
+        try:
+            columns = validate_table_schema(parsed_columns)
+        except (ConstraintError, ExecutionError) as exc:
+            raise StorageError(f"Corrupted schema in table '{name}': {exc}") from exc
         col_names = [c.name for c in columns]
-        if len(set(n.lower() for n in col_names)) != len(col_names):
-            raise StorageError(f"Duplicate column name in table '{name}'")
-        if sum(c.primary_key for c in columns) > 1:
-            raise StorageError(f"Multiple PRIMARY KEY columns in table '{name}'")
 
         raw_rows = data.get("rows")
         if not isinstance(raw_rows, list):
@@ -162,7 +220,7 @@ class Table:
             for col in columns:
                 try:
                     val = coerce_value(raw_row[col.name], col)
-                except ConstraintError as exc:
+                except (ConstraintError, ExecutionError) as exc:
                     raise StorageError(f"Corrupted row {idx} in table '{name}': {exc}") from exc
                 if (col.primary_key or col.unique) and val is not None:
                     key_val = (type(val), val)
@@ -185,15 +243,8 @@ class Database:
     def create_table(self, name: str, columns: list[ColumnDef]) -> None:
         if name in self.tables:
             raise ExecutionError(f"Table '{name}' already exists")
-        if not columns:
-            raise ExecutionError("A table must have at least one column")
-        names = [c.name for c in columns]
-        if len(set(n.lower() for n in names)) != len(names):
-            raise ExecutionError("Duplicate column name")
-        pks = sum(c.primary_key for c in columns)
-        if pks > 1:
-            raise ExecutionError("Only one PRIMARY KEY column is supported")
-        self.tables[name] = Table(name, columns)
+        validated_columns = validate_table_schema(columns)
+        self.tables[name] = Table(name, validated_columns)
 
     def table(self, name: str) -> Table:
         if name not in self.tables:
