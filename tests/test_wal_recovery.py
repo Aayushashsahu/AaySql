@@ -566,7 +566,7 @@ def test_v1_and_v2_migrations_preserve_data_on_write_and_never_overwrite_on_read
         e1_write.execute("AAYUSH INSERT INTO users VALUES (2, 'Alex')")
     migrated_v1 = json.loads(v1_file.read_text(encoding="utf-8"))
     assert migrated_v1["format_version"] == FORMAT_VERSION == 3
-    assert migrated_v1["engine_version"] == ENGINE_VERSION == __version__ == "0.6.0"
+    assert migrated_v1["engine_version"] == ENGINE_VERSION == __version__
     assert migrated_v1["wal_lsn"] > 0
 
     # v2 fixture with index
