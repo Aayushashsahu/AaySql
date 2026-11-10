@@ -1,6 +1,6 @@
 # Architecture
 
-AayushSQL v0.4.0 separates the language front end, query planning, relational execution, index maintenance, DML/constraint execution, and persistent storage into focused modules under `src/aaysql/`.
+AayushSQL v0.5.0 separates the language front end, query planning, relational execution, index maintenance, DML/constraint execution, and persistent storage into focused modules under `src/aaysql/`.
 
 ```text
                   AayushSQL CLI (cli.py)
@@ -48,6 +48,14 @@ Three-valued logic is centralized in `query.py` (`sql_and`, `sql_or`, `sql_not`,
 - Indexes are never pushed across joins; joined queries always report `TABLE SCAN` plus `JOIN: NESTED LOOP`.
 - `EXPLAIN` renders the real plan; `EXPLAIN ANALYZE` appends measured counters (rows scanned from the access path, rows filtered, rows returned, execution time). No estimated or fabricated statistics are reported.
 
+## Transactions (`src/aaysql/transaction.py`, `src/aaysql/engine.py`)
+
+- `TransactionManager` tracks the single optional transaction of an engine instance. `BEGIN` captures a deep snapshot of the database (rows and index trees); statements mutate memory only; `COMMIT` saves once; `ROLLBACK` reinstalls the snapshot.
+- Each mutating statement inside a transaction also snapshots and restores on failure, so a failed statement never leaves partial rows or index entries.
+- `COMMIT` is the only durability point. It reuses the atomic file replacement, and a failed save restores the pre-`BEGIN` snapshot so memory matches the unchanged file, then raises `StorageError`.
+- Closing the engine (or exiting the CLI) with an active transaction rolls it back; the CLI warns on `stderr`, so uncommitted work is never silently persisted or discarded.
+- Deliberately single-process and single-writer: no nested transactions, savepoints, isolation levels, or concurrent writers.
+
 ## Indexing (`src/aaysql/index.py`, `src/aaysql/btree.py`)
 
 - `BPlusTree` is implemented from scratch: internal separator nodes, ordered leaf nodes linked for range scans, node splitting on insert, borrowing/merging on delete, duplicate key support (physical `(key, sequence)` entries), empty-tree handling, and `validate()` invariant checking.
@@ -71,6 +79,6 @@ Three-valued logic is centralized in `query.py` (`sql_and`, `sql_or`, `sql_not`,
 - **`index.py` / `btree.py`**: Secondary index maintenance, lookups, range scans, and B+ tree invariants.
 - **`executor.py`**: Executes DDL/DML and `EXPLAIN`, maintains indexes on mutations, and delegates `SELECT` to the query pipeline.
 - **`storage.py`**: Schema/type/constraint validation, `Table`/`Database` models, index catalog persistence and migration, atomic JSON storage.
-- **`engine.py`**: Coordinates lexing, parsing, execution, and persistence (`save` only on successful mutating statements, rollback on save failure).
+- **`engine.py` & `transaction.py`**: Coordinate lexing, parsing, execution, and persistence. Autocommit saves after each successful mutation and rolls back on save failure; explicit transactions defer the single save to `COMMIT`, snapshot at `BEGIN`, and reject nested or absent transactions.
 - **`cli.py` & `formatting.py`**: `--db`, `--memory`, `--version`, fail-fast scripts, error-resilient REPL, ASCII tables, plan text output.
 - **`errors.py`**: Exception hierarchy rooted at `AayushSQLError` (`LexerError`, `ParserError`, `ExecutionError`, `ConstraintError`, `StorageError`).

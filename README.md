@@ -12,7 +12,7 @@ Every top-level SQL statement must begin with `AAYUSH`. Ordinary SQL without the
 
 ## Current Version
 
-**v0.4.0** — Indexing and Query Performance: a from-scratch B+ tree, single-column secondary indexes (`CREATE INDEX` / `DROP INDEX`), an index-aware query planner for single-table equality and range predicates, `EXPLAIN` / `EXPLAIN ANALYZE` plan inspection, and `.aaydb` format version 2 with automatic v1 migration — on top of the v0.3.0 relational engine.
+**v0.5.0** — Transactions: `AAYUSH BEGIN` / `COMMIT` / `ROLLBACK` with deferred persistence, atomic multi-statement commits, per-statement rollback on failure, index-aware snapshots, automatic rollback on engine/CLI exit, and a CLI warning for uncommitted work — on top of the v0.4.0 indexing engine.
 
 ## Why the `AAYUSH` Prefix Exists
 
@@ -50,6 +50,11 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 - Query clauses: column selection, `SELECT *`, `AS` aliases, `WHERE`, comparison operators (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), boolean logic (`AND`, `OR`, `NOT`), parentheses, `ORDER BY ... [ASC|DESC]` (columns, aliases, or aggregates), `LIMIT`.
 - SQL `NULL` semantics with full three-valued logic: comparisons against `NULL` yield `UNKNOWN`, `UNKNOWN` propagates through `AND`/`OR`/`NOT`, and `WHERE` / `JOIN ON` / `HAVING` / `UPDATE` / `DELETE` predicates accept a row only on `TRUE`.
 - Data types & constraints: `INT`/`INTEGER`, `TEXT`/`VARCHAR`, `FLOAT`/`DOUBLE`, `BOOL`/`BOOLEAN`; `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`.
+- Transactions (v0.5.0):
+  - `AAYUSH BEGIN`, `AAYUSH COMMIT`, `AAYUSH ROLLBACK` for multi-statement transactions.
+  - Mutations inside a transaction are visible to later statements but stay in memory until the single `COMMIT` save; `ROLLBACK` restores the pre-`BEGIN` snapshot, including DDL and index changes.
+  - Each statement stays atomic inside a transaction, and a failed `COMMIT` restores the pre-`BEGIN` state and raises `StorageError` instead of reporting success.
+  - Closing the engine or exiting the CLI with an active transaction rolls it back and prints a warning to `stderr`. Autocommit behavior outside transactions is unchanged.
 - Persistent storage:
   - Versioned JSON database files (`.aaydb`, format version `1`) with atomic replacement (`os.replace`) and startup corruption/schema validation.
   - Read-only `SELECT` queries (including joins and aggregations) never modify persisted files.
@@ -58,7 +63,6 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 - Automated GitHub Actions CI across Python 3.10–3.13.
 
 ### Planned (Future Roadmap)
-- **v0.5** — Transactions: `BEGIN`, `COMMIT`, `ROLLBACK`, multi-statement atomicity and rollback.
 - **v0.6** — Reliability: write-ahead logging (WAL), checkpoints, crash recovery.
 - **v0.7** — Query optimizer: hash joins, cardinality statistics, filter pushdown, profiling.
 - **v0.8** — Client/server: network protocol, server binary, authentication, localhost-by-default binding.
@@ -155,4 +159,5 @@ GitHub Actions CI (`.github/workflows/tests.yml`) runs `python -m pytest -v` on 
 - `GROUP BY` supports simple column references (qualified or unqualified), not arbitrary expressions; nested aggregate functions (`SUM(COUNT(*))`) are not supported.
 - No subqueries, `UNION`, `IS NULL` syntax, arithmetic expressions, `ALTER TABLE`, or multi-statement transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) yet.
 - Single-process, single-writer execution with full-database JSON rewrite on mutations.
+- Transactions are single-process and single-writer: no nested transactions, savepoints, isolation levels, or concurrent connections; `COMMIT` persists by rewriting the whole `.aaydb` file.
 - Table and column names are case-sensitive at execution time.

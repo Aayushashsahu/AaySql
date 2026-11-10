@@ -2,6 +2,25 @@
 
 All notable changes to AayushSQL are documented in this file.
 
+## [0.5.0] — 2026-11-10
+
+### Added
+- **Explicit transactions (`src/aaysql/transaction.py`, `src/aaysql/engine.py`)**: `AAYUSH BEGIN`, `AAYUSH COMMIT`, and `AAYUSH ROLLBACK` for multi-statement transactions.
+  - `BEGIN` captures a deep snapshot of tables and index trees. Mutations inside the transaction are visible to later statements in the same engine but are not written to disk.
+  - `COMMIT` performs the single durable save through the existing atomic file replacement. If the save fails, the pre-`BEGIN` snapshot is restored, `StorageError` is raised, and the transaction is never reported as committed.
+  - `ROLLBACK` reinstalls the `BEGIN` snapshot, discarding DML and DDL, including `CREATE INDEX` and `DROP TABLE`.
+  - Each statement inside a transaction is atomic: a failed statement leaves no partial rows or index entries, and the transaction stays usable.
+  - Nested `BEGIN`, and `COMMIT` / `ROLLBACK` without an active transaction, raise `ExecutionError`.
+  - Closing an engine with an active transaction rolls it back. The CLI prints `WARNING: rolling back uncommitted transaction on exit` to `stderr`, so uncommitted work is never silently persisted.
+  - Autocommit behavior outside explicit transactions is unchanged.
+- **Tests (`tests/test_transactions.py`)**: 14 tests covering commit/rollback persistence, multiple statements, DML and DDL rollback, index changes, constraint failures inside transactions, failed commits, nested/missing transaction errors, in-transaction visibility versus a second reader, engine close, in-memory transactions, and CLI exit/script behavior.
+- **Documentation**: `LANGUAGE_SPEC.md`, `ARCHITECTURE.md`, and `README.md` now describe transaction semantics, the commit durability point, and the single-writer model.
+- **Version metadata** updated to `0.5.0`; the `.aaydb` format stays version 2.
+
+### Notes
+- The model is single-process and single-writer: no savepoints, isolation levels, nested transactions, or concurrent writers.
+- `COMMIT` is the only durability point and rewrites the full database file.
+
 ## [0.4.0] — 2026-11-10
 
 ### Added

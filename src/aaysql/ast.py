@@ -130,3 +130,18 @@ class DropIndex:
 class Explain:
     statement: Any
     analyze: bool = False
+
+
+@dataclass(frozen=True)
+class Begin:
+    pass
+
+
+@dataclass(frozen=True)
+class Commit:
+    pass
+
+
+@dataclass(frozen=True)
+class Rollback:
+    pass

@@ -84,6 +84,15 @@ class Parser:
         return Explain(statement=self.parse_statement(), analyze=analyze)
 
     def parse_statement(self):
+        if self.keyword("BEGIN"):
+            self.advance()
+            return Begin()
+        if self.keyword("COMMIT"):
+            self.advance()
+            return Commit()
+        if self.keyword("ROLLBACK"):
+            self.advance()
+            return Rollback()
         if self.keyword("EXPLAIN"):
             return self.parse_explain()
         if self.keyword("CREATE"):

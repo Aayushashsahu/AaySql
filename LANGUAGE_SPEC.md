@@ -1,4 +1,4 @@
-# AayushSQL Language Specification (v0.4.0)
+# AayushSQL Language Specification (v0.5.0)
 
 ## 1. Overview
 
@@ -152,6 +152,23 @@ Every `SELECT` expression must produce a distinct output label (its `AS` alias, 
 - `ORDER BY` accepts column references (qualified or unqualified), explicit `SELECT` aliases, and aggregate calls (`ORDER BY COUNT(*) DESC`).
 - Multiple sort keys with `ASC` (default) / `DESC` are supported; `NULL` values sort last in `ASC` and first in `DESC`.
 
+### `BEGIN` / `COMMIT` / `ROLLBACK`
+```sql
+AAYUSH BEGIN;
+AAYUSH INSERT INTO accounts VALUES (1, 'Aayush', 1000);
+AAYUSH UPDATE accounts SET balance = 900 WHERE id = 1;
+AAYUSH COMMIT;
+```
+
+- `BEGIN` starts an explicit transaction. Mutations are visible to later statements from the same engine but are **not** written to the `.aaydb` file until `COMMIT`.
+- `ROLLBACK` discards every change since `BEGIN`, including DDL (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`).
+- Each statement inside a transaction is atomic: a statement that fails validation or a constraint leaves no partial changes, and the transaction remains usable.
+- `COMMIT` is the only durability point. It persists all changes together through the existing atomic file replacement. If persistence fails, the transaction is rolled back to its pre-`BEGIN` state and `StorageError` is raised; success is never reported for an unpersisted commit.
+- Nested `BEGIN`, and `COMMIT` / `ROLLBACK` without an active transaction, raise `ExecutionError`.
+- Closing the engine or exiting the CLI with an active transaction rolls it back. The CLI prints `WARNING: rolling back uncommitted transaction on exit` to `stderr`.
+- Autocommit behavior outside explicit transactions is unchanged: each mutating statement persists immediately.
+- The model is single-process and single-writer. There are no savepoints, isolation levels, or concurrent writers.
+
 ### `UPDATE` & `DELETE`
 ```sql
 AAYUSH UPDATE table_name SET col1 = 20, col2 = 'Updated' WHERE id = 1;
@@ -161,11 +178,11 @@ Every assignment in `UPDATE ... SET` requires an explicit `=`.
 
 ## 5. Unsupported / Planned Syntax
 
-The following SQL features are **not yet implemented** in v0.4.0:
+The following SQL features are **not yet implemented** in v0.5.0:
 - `RIGHT JOIN`, `FULL JOIN`, `CROSS JOIN`, natural joins, or comma joins
 - Qualified wildcards (`u.*`)
 - Subqueries, `UNION`, `DISTINCT`, `CASE`, `IS NULL` / `IS NOT NULL`, `LIKE`, `IN`, `BETWEEN`, arithmetic expressions
 - Nested aggregate functions (`SUM(COUNT(*))`) or arbitrary expressions in `GROUP BY`
-- `ALTER TABLE`, `BEGIN`, `COMMIT`, `ROLLBACK`
+- `ALTER TABLE`, savepoints, nested transactions, isolation levels, and concurrent writers
 - Unique, partial, expression, or multi-column indexes; index plans for joins
 - Duplicate output labels within one `SELECT` list (rejected with `ExecutionError` rather than silently merged)
