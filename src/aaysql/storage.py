@@ -11,13 +11,14 @@ from .ast import ColumnDef
 from .btree import BTreeError
 from .errors import ConstraintError, ExecutionError, StorageError
 from .index import INDEX_NAME_PATTERN, Index
+from .wal import _CRASH_ENV_VAR, WalManager, _maybe_crash, fsync_dir, parse_wal
 
 FORMAT_NAME = "aaysql"
-FORMAT_VERSION = 2
-# Format version 1 predates index definitions; it is still readable and upgrades
-# to version 2 on the next write.
-READABLE_FORMAT_VERSIONS = (1, 2)
-ENGINE_VERSION = "0.5.0"
+FORMAT_VERSION = 3
+# Format versions 1 (pre-index) and 2 (pre-WAL) remain readable and upgrade to
+# version 3 on the next write or recovery checkpoint.
+READABLE_FORMAT_VERSIONS = (1, 2, 3)
+ENGINE_VERSION = "0.6.0"
 
 TYPE_MAP: dict[str, type] = {
     "INT": int,
@@ -247,6 +248,7 @@ class Database:
         # Index definitions plus their runtime B+ trees. Trees are rebuilt from
         # table rows whenever a database is loaded.
         self.indexes: dict[str, Index] = {}
+        self.wal_lsn: int = 0
 
     def create_table(self, name: str, columns: list[ColumnDef]) -> None:
         if name in self.tables:
@@ -284,6 +286,7 @@ class Database:
 
     def clone(self) -> Database:
         copy = Database()
+        copy.wal_lsn = self.wal_lsn
         copy.tables = {name: tbl.clone() for name, tbl in self.tables.items()}
         for name, index in self.indexes.items():
             table = copy.tables.get(index.table)
@@ -296,6 +299,7 @@ class Database:
             "format": FORMAT_NAME,
             "format_version": FORMAT_VERSION,
             "engine_version": ENGINE_VERSION,
+            "wal_lsn": self.wal_lsn,
             "tables": {name: tbl.to_dict() for name, tbl in self.tables.items()},
             "indexes": {
                 name: index.describe() for name, index in sorted(self.indexes.items())
@@ -316,10 +320,20 @@ class Database:
                 f"Unsupported database format version: {version} "
                 f"(supported: {', '.join(str(v) for v in READABLE_FORMAT_VERSIONS)})"
             )
+        if version in (1, 2):
+            wal_lsn = data.get("wal_lsn", 0)
+        else:
+            if "wal_lsn" not in data:
+                raise StorageError("Missing 'wal_lsn' in version 3 database file")
+            wal_lsn = data["wal_lsn"]
+        if isinstance(wal_lsn, bool) or not isinstance(wal_lsn, int) or wal_lsn < 0:
+            raise StorageError("Invalid 'wal_lsn' in database file")
+
         raw_tables = data.get("tables")
         if not isinstance(raw_tables, dict):
             raise StorageError("Invalid or missing 'tables' mapping")
         db = cls()
+        db.wal_lsn = wal_lsn
         for key, tbl_data in raw_tables.items():
             if not isinstance(key, str) or not key:
                 raise StorageError("Invalid table key in database file")
@@ -360,12 +374,15 @@ def _index_from_spec(db: Database, name: Any, spec: Any) -> Index:
 
 
 class JsonFileStorage:
-    """Atomic JSON file persistence backend for AayushSQL databases."""
+    """WAL-backed atomic JSON file persistence backend for AayushSQL databases."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        self.wal = WalManager(self.path)
+        self.pending_checkpoint: bool = False
+        self.last_checkpoint_error: Exception | None = None
 
-    def load(self) -> Database:
+    def _load_snapshot(self) -> Database:
         if self.path.exists():
             if self.path.is_dir():
                 raise StorageError(f"Database path '{self.path}' is a directory")
@@ -382,29 +399,106 @@ class JsonFileStorage:
             return Database.from_dict(payload)
         return Database()
 
-    def save(self, db: Database) -> None:
+    def _cleanup_stale_tmp_files(self) -> None:
+        parent = self.path.parent if str(self.path.parent) else Path(".")
+        if not parent.exists() or not parent.is_dir():
+            return
+        prefix = f".{self.path.name}."
+        try:
+            for candidate in parent.iterdir():
+                if (
+                    candidate.is_file()
+                    and candidate.name.startswith(prefix)
+                    and candidate.name.endswith(".tmp")
+                ):
+                    try:
+                        candidate.unlink()
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    def load(self) -> Database:
+        """Load the database snapshot and run WAL crash recovery if a WAL exists."""
         if self.path.exists() and self.path.is_dir():
             raise StorageError(f"Database path '{self.path}' is a directory")
+
+        base_db = self._load_snapshot()
+        self.pending_checkpoint = False
+        self.last_checkpoint_error = None
+
+        if not self.wal.wal_path.exists():
+            self.wal.last_lsn = base_db.wal_lsn
+            return base_db
+
+        analysis = parse_wal(self.wal.wal_path, snapshot_wal_lsn=base_db.wal_lsn)
+        applicable = [txn for txn in analysis.committed if txn.commit_lsn > base_db.wal_lsn]
+
+        if applicable:
+            latest = applicable[-1]
+            recovered_db = Database.from_dict(latest.image)
+            recovered_db.wal_lsn = latest.commit_lsn
+            self.wal.last_lsn = max(latest.commit_lsn, analysis.max_lsn)
+            self._checkpoint(recovered_db, latest.commit_lsn, txn_id=latest.txn)
+            return recovered_db
+
+        self.wal.last_lsn = max(base_db.wal_lsn, analysis.max_lsn)
+        try:
+            if self.wal.wal_path.exists() and self.wal.wal_path.stat().st_size > 0:
+                self.wal.truncate()
+            self._cleanup_stale_tmp_files()
+        except OSError as exc:
+            raise StorageError(f"Failed to clean up WAL '{self.wal.wal_path}': {exc}") from exc
+        return base_db
+
+    def _checkpoint(
+        self,
+        db: Database,
+        commit_lsn: int,
+        *,
+        txn_id: str | None = None,
+    ) -> None:
+        """Atomically write snapshot with ``wal_lsn=commit_lsn``, append CHECKPOINT, and truncate WAL."""
+        if self.path.exists() and self.path.is_dir():
+            raise StorageError(f"Database path '{self.path}' is a directory")
+
+        db.wal_lsn = commit_lsn
         payload = db.to_dict()
         parent = self.path.parent
+        target_dir = parent if str(parent) else Path(".")
         tmp_path: Path | None = None
         try:
             if str(parent):
                 parent.mkdir(parents=True, exist_ok=True)
+            serialized = json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
-                dir=parent if str(parent) else Path("."),
+                dir=target_dir,
                 prefix=f".{self.path.name}.",
                 suffix=".tmp",
                 delete=False,
             ) as tmp:
                 tmp_path = Path(tmp.name)
-                json.dump(payload, tmp, indent=2, ensure_ascii=False, allow_nan=False)
-                tmp.write("\n")
+                if os.environ.get(_CRASH_ENV_VAR) == "during_snapshot_write":
+                    half = max(1, len(serialized) // 2)
+                    tmp.write(serialized[:half])
+                    tmp.flush()
+                    os._exit(99)
+                tmp.write(serialized)
                 tmp.flush()
                 os.fsync(tmp.fileno())
+            _maybe_crash("after_snapshot_fsync_before_replace")
             os.replace(tmp_path, self.path)
+            tmp_path = None
+            fsync_dir(target_dir)
+            _maybe_crash("after_snapshot_replace")
+
+            self.wal.append_checkpoint(commit_lsn, txn_id=txn_id)
+            self.wal.truncate()
+            self._cleanup_stale_tmp_files()
+            self.pending_checkpoint = False
+            self.last_checkpoint_error = None
         except OSError as exc:
             if tmp_path is not None and tmp_path.exists():
                 try:
@@ -421,3 +515,32 @@ class JsonFileStorage:
             if isinstance(exc, StorageError):
                 raise
             raise StorageError(f"Failed to serialize database '{self.path}': {exc}") from exc
+
+    def save(self, db: Database) -> None:
+        """Durably commit ``db`` to the WAL, then checkpoint to the main database file."""
+        if self.path.exists() and self.path.is_dir():
+            raise StorageError(f"Database path '{self.path}' is a directory")
+        try:
+            payload = db.to_dict()
+        except Exception as exc:
+            if isinstance(exc, StorageError):
+                raise
+            raise StorageError(f"Failed to serialize database '{self.path}': {exc}") from exc
+
+        commit_lsn, txn_id = self.wal.append_commit_transaction(payload)
+        db.wal_lsn = commit_lsn
+
+        try:
+            self._checkpoint(db, commit_lsn, txn_id=txn_id)
+        except Exception as exc:
+            # The transaction is already durably committed in the WAL. Keep the WAL
+            # intact so recovery can finish checkpointing later, and do not report
+            # a misleading commit failure.
+            self.pending_checkpoint = True
+            self.last_checkpoint_error = exc
+
+    def cleanup_if_clean(self) -> None:
+        """Remove an empty 0-byte WAL when no checkpoint is pending."""
+        if not self.pending_checkpoint:
+            self.wal.remove_if_empty()
+
