@@ -1,6 +1,6 @@
-# AayushSQL Write-Ahead Log (WAL) & Crash Recovery Design (v0.6.0)
+# AayushSQL Write-Ahead Log (WAL) & Crash Recovery Design (v0.6.1)
 
-This document specifies the Write-Ahead Log (WAL) protocol, durability semantics, checkpoint ordering, format v3 migration, and recovery guarantees implemented in AayushSQL `v0.6.0` (`src/aaysql/wal.py`, `src/aaysql/storage.py`, `src/aaysql/engine.py`).
+This document specifies the Write-Ahead Log (WAL) protocol, durability semantics, checkpoint ordering, format v3 migration, and recovery guarantees implemented in AayushSQL `v0.6.1` (`src/aaysql/wal.py`, `src/aaysql/storage.py`, `src/aaysql/engine.py`). Section 11 describes the v0.6.1 hardening of tail repair, partial appends, and directory fsync error handling.
 
 ---
 
@@ -116,6 +116,9 @@ A commit executes in two distinct phases: WAL commit, followed by checkpointing.
    - Durability is **ambiguous** (the OS may or may not have persisted the flushed `COMMIT` bytes).
    - `AmbiguousCommitError` (a subclass of `StorageError`) is raised.
    - `Engine.needs_recovery` becomes `True`, the WAL is preserved untouched, and further operations in that engine instance are blocked until the database is reopened so recovery can inspect the WAL.
+4. **Directory-entry `fsync()` of a newly created WAL fails:**
+   - The `COMMIT` bytes are fsynced, but the file's directory entry may not be durable, so the outcome is not a definite rollback.
+   - `AmbiguousCommitError` is raised, the WAL is poisoned, and reopening decides the outcome from the actual record.
 
 ---
 
@@ -151,6 +154,8 @@ Recovery runs automatically inside `JsonFileStorage.load()` when `Engine(db_path
    - Run the full atomic checkpoint pipeline (`_checkpoint`) to persist the recovered snapshot with `wal_lsn = latest.commit_lsn`, append `CHECKPOINT`, and truncate the WAL.
 7. Otherwise (only uncommitted transactions or already-checkpointed records `<= base_db.wal_lsn`), truncate any leftover WAL bytes and clean stale `.tmp` files without rewriting `.aaydb`.
 
+Before step 6 appends its recovery `CHECKPOINT`, recovery repairs any invalid trailing bytes: `parse_wal()` reports `valid_bytes_end` (the exact UTF-8 byte offset after the last validated newline-terminated record), recovery truncates only bytes after it, flushes and `fsync()`s the WAL, keeps every earlier valid record and its LSN, and only then appends the `CHECKPOINT`. This guarantees that a repaired torn or checksum-corrupt tail can never end up in the middle of the log if the process crashes before truncation.
+
 Recovery is **idempotent**: running recovery twice or reopening after recovery yields the identical database state and prevents duplicate replay via `commit_lsn > snapshot.wal_lsn`.
 
 ---
@@ -182,18 +187,74 @@ Format version `3` adds top-level field `"wal_lsn"` (`int >= 0`), tracking the h
 - Committed transactions whose `COMMIT` `os.fsync()` returned survive all tested process crashes without loss or duplicate replay.
 
 ### Platform & Hardware Limitations
-- **Directory entry `fsync`:** POSIX systems (Linux, macOS) support `os.open(dir, O_RDONLY)` + `os.fsync(fd)` to flush directory entries when creating `.wal` or atomically replacing `.aaydb`. On Windows, opening a directory via `os.open()` is unsupported (`PermissionError`), so `fsync_dir()` degrades cleanly without failing commits; therefore directory-entry durability on Windows relies on OS/NTFS metadata behavior.
+- **Directory entry `fsync`:** POSIX systems (Linux, macOS) support `os.open(dir, O_RDONLY)` + `os.fsync(fd)` to flush directory entries when creating `.wal` or atomically replacing `.aaydb`. On Windows, opening a directory via `os.open()` is unsupported, so `fsync_dir()` deliberately skips directory fsync; directory-entry durability there relies on NTFS metadata behavior. This fallback is chosen by platform, not by swallowing errors: unsupported operations reported as `EINVAL`/`ENOTSUP`/`EOPNOTSUPP` also fall back, while `EACCES`, `EIO`, `ENOSPC`, and other genuine errors raise `StorageError`.
 - **Scope boundary (process crashes vs. hardware/power loss):** Real subprocess `os._exit()` tests prove survival against abrupt process termination when OS page-cache/file `os.fsync()` semantics behave as documented by the host OS. AayushSQL cannot independently guarantee survival across storage-device firmware write-cache lying, unbuffered hardware/power-loss corruption of in-place file sectors, or filesystem bugs.
 - **Single-process writer:** Multi-process concurrent writers against the same `.aaydb` / `.wal` pair are not supported.
 
 ---
 
-## 10. Running WAL & Crash-Recovery Tests
+## 10. v0.6.1 Recovery Hardening
 
-Run all WAL, migration, error-semantics, and real-subprocess crash tests:
+### 10.1 Trailing-tail repair and byte-boundary tracking
+
+`parse_wal()` returns `WalAnalysis.valid_bytes_end`, the exact byte offset immediately after the last fully validated newline-terminated record. The offset is computed over UTF-8 bytes, not characters, so multi-byte text in a `WRITE` image cannot shift it.
+
+When recovery encounters a torn or checksum-corrupt *trailing* record:
+
+1. Every preceding valid record is preserved, including committed transactions awaiting checkpoint.
+2. `WalManager.repair_trailing(valid_bytes_end)` truncates only the invalid bytes, then flushes and `fsync()`s the WAL file and its directory.
+3. Recovery only then appends its `CHECKPOINT`; the next LSN is greater than every retained valid LSN.
+4. No record is ever appended behind an invalid record and no invalid record is skipped in favour of later data.
+
+Without this repair, recovery could append `CHECKPOINT` behind a corrupt tail and crash before truncation, turning a recoverable trailing fault into mid-log corruption (`StorageError`) on the next open. A regression test reproduces the complete seven-step sequence and fails when the repair is disabled.
+
+### 10.2 Append state machine, short writes, and WAL poisoning
+
+Appends use `os.open(..., O_APPEND)` and an `os.write()` write-all loop. A short write is completed rather than mistaken for a finished record. The manager exposes its last transition:
+
+| State | Meaning |
+|---|---|
+| `idle` | Last append completed durably |
+| `begin_appended` | BEGIN bytes may be on disk; WRITE/COMMIT not durable |
+| `write_appended` | BEGIN + WRITE may be on disk; COMMIT not durable |
+| `commit_attempted` | COMMIT bytes are being written / fsynced |
+| `commit_durable` | COMMIT `fsync()` succeeded |
+| `checkpoint_durable` | CHECKPOINT `fsync()` succeeded |
+| `damaged` | An append failed before COMMIT durability; the log may contain torn bytes |
+| `ambiguous` | COMMIT durability could not be confirmed |
+
+Any `damaged` or `ambiguous` transition poisons the manager (`poisoned = True`): further appends raise `StorageError`, and `Engine` refuses every statement with a reopen-recovery error until a new process opens the database. LSNs advance only after durable success. A new process always parses, validates, and repairs the tail before appending.
+
+### 10.3 Ambiguous commit outcomes
+
+- **Failure before the COMMIT record is durable:** the transaction is not committed. In-memory state is restored to the pre-transaction/pre-statement snapshot, the WAL is preserved, and the engine requires reopen recovery because the log may end in a torn record.
+- **COMMIT bytes written but `fsync()` (or the new WAL's directory fsync) failed:** `AmbiguousCommitError` is raised. The engine never claims a definite commit or rollback, keeps its in-memory state, preserves the WAL, and blocks all further work. Startup recovery decides the outcome from whether a complete, checksum-valid COMMIT exists.
+- **COMMIT `fsync()` succeeded:** the transaction is durably committed. A later checkpoint failure is not reported as a failed commit; the WAL is retained so recovery can finish, and the committed state is never rolled back.
+
+### 10.4 Directory fsync classification
+
+`fsync_dir()` now distinguishes three cases:
+
+| Case | Behaviour |
+|---|---|
+| POSIX with directory fsync support | `os.open(O_RDONLY)` + `os.fsync(fd)` |
+| Unsupported platform or operation (`Windows`, `EINVAL`, `ENOTSUP`, `EOPNOTSUPP`) | Documented fallback; no error |
+| Genuine filesystem failure (`EACCES`, `EIO`, `ENOSPC`, ...) | `StorageError` with path and errno |
+
+Descriptors are closed on every path. A failure after `os.replace()` leaves the WAL untouched, keeps the committed transaction, and surfaces a storage error rather than silently claiming durability.
+
+### 10.5 Coverage and durability scope
+
+v0.6.1 adds `tests/test_wal_hardening.py` (25 tests): byte-boundary parsing, tail repair, the seven-step regression, crash after tail repair, repeated recovery, mid-log corruption, directory fsync classification with mocked `EINVAL`/`EACCES`/`EIO`/`ENOSPC`, post-`os.replace()` failure, short writes, partial-append poisoning, ambiguous COMMIT, poisoned-manager refusal, checkpoint append failure, plus five combined real-subprocess `os._exit()` scenarios (corrupt tail, directory fsync `EIO`, partial COMMIT, multiple commits plus corrupt tail at the checkpoint boundary, and mid-log corruption).
+
+These tests prove recovery from abrupt process termination. They do not claim survival of storage-device firmware write-cache lies, arbitrary power loss that corrupts in-place sectors, or filesystem bugs; see Section 9.
+
+## 11. Running WAL & Crash-Recovery Tests
+
+Run all WAL, migration, error-semantics, hardening, and real-subprocess crash tests:
 
 ```bash
-python -m pytest -v tests/test_wal_recovery.py
+python -m pytest -v tests/test_wal_recovery.py tests/test_wal_hardening.py
 ```
 
 Run the entire test suite (including all regression tests):

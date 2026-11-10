@@ -2,6 +2,31 @@
 
 All notable changes to AayushSQL are documented in this file.
 
+## [0.6.1] — 2026-11-11
+
+### Fixed
+- **Trailing WAL repair before recovery CHECKPOINT (`src/aaysql/wal.py`, `src/aaysql/storage.py`)**:
+  - `parse_wal()` now reports `valid_bytes_end`, the exact byte offset after the last fully validated newline-terminated record (computed from UTF-8 bytes, not characters).
+  - Recovery truncates only the invalid trailing bytes, flushes and `fsync()`s the WAL, keeps every earlier valid record and LSN, and only then appends the recovery `CHECKPOINT`.
+  - Previously, recovery could append `CHECKPOINT` behind a corrupt tail; a crash before truncation turned that tail into mid-log corruption, so the next open raised `StorageError`. A regression test reproduces the full seven-step sequence and fails without the repair.
+- **Directory fsync error classification (`src/aaysql/wal.py`)**:
+  - `fsync_dir()` no longer swallows every `OSError`. Unsupported directory fsync (`EINVAL` / `ENOTSUP` / `EOPNOTSUPP`) and Windows (where the CRT cannot open directories) use the documented fallback; `EACCES`, `EIO`, `ENOSPC`, and other genuine failures raise `StorageError` with the directory path and errno.
+  - File descriptors are closed on every path. A checkpoint that fails after `os.replace()` keeps the committed state and the WAL, and is never reported as a failed commit.
+- **Partial WAL append handling (`src/aaysql/wal.py`, `src/aaysql/engine.py`)**:
+  - Appends now use `os.open(..., O_APPEND)` with an `os.write()` write-all loop, so short writes cannot be mistaken for complete records.
+  - An explicit append state machine (`begin_appended` -> `write_appended` -> `commit_attempted` -> `commit_durable`) distinguishes failures before the COMMIT record from failures while making it durable.
+  - Any append that may have left torn bytes poisons the WAL manager. A poisoned manager refuses further appends and blocks engine statements until the database is reopened and recovery repairs the log; LSNs only advance after durable success.
+  - A failed COMMIT `fsync` (or a failure fsyncing the directory entry of a newly created WAL) raises `AmbiguousCommitError`, preserves the WAL, keeps the in-memory state, and never claims a definite rollback. A new process decides the outcome from the actual COMMIT record.
+
+### Added
+- **Tests (`tests/test_wal_hardening.py`)**: 25 tests covering corrupt-tail byte boundaries, tail repair before checkpoint, the seven-step crash regression, crash after tail repair, repeated recovery, mid-log corruption (in-process and subprocess), directory fsync classification (supported, unsupported platform, `EINVAL`, `EACCES`, `EIO`, `ENOSPC`, post-`os.replace()` failure), short writes, partial-append poisoning, ambiguous COMMIT, poisoned-manager refusal, checkpoint append failure, and five combined real-subprocess `os._exit()` scenarios.
+- **Documentation (`WAL.md`, `README.md`, `ARCHITECTURE.md`)**: Documented trailing-tail repair, valid-byte-boundary tracking, WAL poisoning and recovery-required states, partial append semantics, ambiguous COMMIT behavior, and POSIX/Windows directory fsync guarantees.
+
+### Notes
+- The `.aaydb` format remains **version 3**; no migration is required from v0.6.0.
+- Durability claims remain limited to process-crash recovery under documented OS `fsync` behavior; arbitrary hardware power loss and firmware write-cache failures are outside the tested envelope.
+- Version metadata updated to `0.6.1`.
+
 ## [0.6.0] — 2026-11-10
 
 ### Added

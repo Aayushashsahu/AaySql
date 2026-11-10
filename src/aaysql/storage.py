@@ -18,7 +18,7 @@ FORMAT_VERSION = 3
 # Format versions 1 (pre-index) and 2 (pre-WAL) remain readable and upgrade to
 # version 3 on the next write or recovery checkpoint.
 READABLE_FORMAT_VERSIONS = (1, 2, 3)
-ENGINE_VERSION = "0.6.0"
+ENGINE_VERSION = "0.6.1"
 
 TYPE_MAP: dict[str, type] = {
     "INT": int,
@@ -435,6 +435,13 @@ class JsonFileStorage:
         applicable = [txn for txn in analysis.committed if txn.commit_lsn > base_db.wal_lsn]
 
         if applicable:
+            if analysis.ignored_trailing:
+                # Remove only the torn/corrupt tail before appending CHECKPOINT.
+                # Appending behind it would turn a recoverable trailing fault into
+                # mid-log corruption on the next restart. All valid committed
+                # records stay in place and keep their LSNs.
+                self.wal.repair_trailing(analysis.valid_bytes_end)
+                _maybe_crash("after_tail_repair")
             latest = applicable[-1]
             recovered_db = Database.from_dict(latest.image)
             recovered_db.wal_lsn = latest.commit_lsn

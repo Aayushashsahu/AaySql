@@ -12,7 +12,7 @@ Every top-level SQL statement must begin with `AAYUSH`. Ordinary SQL without the
 
 ## Current Version
 
-**v0.6.0** — Write-Ahead Logging (WAL) & Crash Recovery: newline-delimited JSON WAL (`<db>.wal`) with SHA-256 checksums, `fsync` commit durability, `.aaydb` format v3 (`wal_lsn`) with v1/v2 migration, crash-safe checkpoint ordering, idempotent startup recovery, and real subprocess `os._exit()` crash verification — on top of the v0.5.0 transactional engine.
+**v0.6.1** — WAL recovery hardening: newline-delimited JSON WAL (`<db>.wal`) with SHA-256 checksums, `fsync` commit durability, `.aaydb` format v3 (`wal_lsn`) with v1/v2 migration, crash-safe checkpoint ordering, idempotent startup recovery, and real subprocess `os._exit()` crash verification. v0.6.1 repairs corrupt WAL tails before checkpointing, distinguishes genuine directory `fsync` failures from unsupported platforms, and prevents partial appends from being followed by new records.
 
 ## Why the `AAYUSH` Prefix Exists
 
@@ -28,7 +28,7 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 
 ## Implemented vs. Planned Features
 
-### Implemented (v0.6.0)
+### Implemented (v0.6.1)
 - Mandatory `AAYUSH` top-level statement prefix (rejects missing or duplicate `AAYUSH`).
 - DDL & DML: `CREATE TABLE`, `DROP TABLE`, `INSERT INTO ... VALUES ...`, `SELECT ... FROM ...`, `UPDATE ... SET ...`, `DELETE FROM ...`.
 - Relational joins & source binding:
@@ -54,12 +54,16 @@ Everything behind the parser — relational joins, column resolution, grouping, 
   - Mutations inside a transaction are visible to later statements but stay in memory until the single `COMMIT` save; `ROLLBACK` restores the pre-`BEGIN` snapshot, including DDL and index changes.
   - Each statement stays atomic inside a transaction.
   - Closing the engine or exiting the CLI with an active transaction rolls it back and prints a warning to `stderr`.
-- Write-Ahead Log & Crash Recovery (v0.6.0 — see [`WAL.md`](WAL.md)):
+- Write-Ahead Log & Crash Recovery (v0.6.0, hardened in v0.6.1 — see [`WAL.md`](WAL.md)):
   - Adjacent newline-delimited JSON WAL (`<db>.wal`) with canonical SHA-256 checksums, monotonic LSNs, unique per-transaction IDs, and `BEGIN` / `WRITE` / `COMMIT` / `CHECKPOINT` records.
   - WAL `os.fsync()` commit durability precedes snapshot checkpointing for both explicit transactions and autocommit mutations (`INSERT`, `UPDATE`, `DELETE`, `CREATE/DROP TABLE`, `CREATE/DROP INDEX`).
   - Distinguished error semantics: pre-commit errors roll back cleanly, post-`COMMIT` checkpoint failures preserve the committed state and WAL without misreporting failure, and `COMMIT` `fsync` errors raise `AmbiguousCommitError` and require reopen recovery.
   - Crash-safe checkpoint ordering (`.tmp` write + `fsync` -> `os.replace` -> dir `fsync` -> `CHECKPOINT` record -> WAL truncation) and idempotent startup recovery.
   - Trailing torn/corrupt WAL records are safely ignored; mid-log corruption stops immediately without skipping forward.
+  - Trailing-tail repair (v0.6.1): recovery tracks the exact byte boundary of the last valid record, truncates only the invalid tail, `fsync`s it, and only then appends `CHECKPOINT` — a corrupt tail can never become mid-log corruption after a crash.
+  - Partial append hardening (v0.6.1): unbuffered `O_APPEND` writes with a write-all loop, an explicit append state machine, and WAL poisoning. A WAL that may contain torn bytes refuses further appends, and the engine blocks statements until reopen recovery.
+  - Ambiguous `COMMIT` semantics (v0.6.1): a failed `COMMIT` `fsync` preserves the WAL, keeps memory unchanged, and raises `AmbiguousCommitError` instead of claiming a rollback; recovery decides from the actual record.
+  - Directory `fsync` errors are classified (v0.6.1): unsupported operations (and Windows) fall back deliberately, while `EACCES`/`EIO`/`ENOSPC` propagate as `StorageError` and never silently claim durability.
   - `.aaydb` format version `3` (`wal_lsn`) with safe read-only compatibility and on-write migration for format v1 and v2 databases.
 - Persistent storage:
   - Read-only `SELECT` queries (including joins and aggregations) never modify persisted files.
@@ -163,6 +167,6 @@ GitHub Actions CI (`.github/workflows/tests.yml`) runs `python -m pytest -v` on 
 - `GROUP BY` supports simple column references (qualified or unqualified), not arbitrary expressions; nested aggregate functions (`SUM(COUNT(*))`) are not supported.
 - No subqueries, `UNION`, `IS NULL` syntax, arithmetic expressions, or `ALTER TABLE`.
 - Single-process, single-writer execution: no nested transactions, savepoints, isolation levels, or concurrent connections.
-- WAL durability guarantees target single-process crash recovery; directory `fsync` is executed where supported (POSIX) and is limited on Windows (`os.open` on directories is unsupported). Hardware/firmware write-cache failures or OS filesystem corruption remain outside process-crash guarantees (see [`WAL.md`](WAL.md)).
+- WAL durability guarantees target single-process crash recovery; directory `fsync` is executed where supported (POSIX). Windows cannot open directories through the CRT, so directory-entry durability relies on NTFS metadata behaviour; this fallback is selected by platform, not by swallowing errors. Genuine directory `fsync` failures (`EACCES`, `EIO`, `ENOSPC`, ...) are surfaced as `StorageError`. Hardware/firmware write-cache failures or OS filesystem corruption remain outside process-crash guarantees (see [`WAL.md`](WAL.md)).
 - Table and column names are case-sensitive at execution time.
 

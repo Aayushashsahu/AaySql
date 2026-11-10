@@ -1,6 +1,6 @@
 # Architecture
 
-AayushSQL v0.6.0 separates the language front end, query planning, relational execution, index maintenance, DML/constraint execution, Write-Ahead Logging (WAL), and persistent snapshot storage into focused modules under `src/aaysql/`.
+AayushSQL v0.6.1 separates the language front end, query planning, relational execution, index maintenance, DML/constraint execution, Write-Ahead Logging (WAL), and persistent snapshot storage into focused modules under `src/aaysql/`.
 
 ```text
                   AayushSQL CLI (cli.py)
@@ -66,9 +66,10 @@ Three-valued logic is centralized in `query.py` (`sql_and`, `sql_or`, `sql_not`,
 ## Storage & WAL Recovery (`src/aaysql/storage.py`, `src/aaysql/wal.py`)
 
 - `.aaydb` files are JSON with `format="aaysql"`. Format **version 3** adds `"wal_lsn"` tracking the highest committed WAL LSN applied to the snapshot. Format **versions 1 and 2** remain readable (treated as `wal_lsn = 0`) and upgrade to version 3 on write or recovery checkpoint.
-- Every persistent mutation writes `begin`, `write`, and `commit` records with canonical SHA-256 checksums to `<db_path>.wal` and calls `os.fsync()` before checkpointing.
-- Checkpointing writes a temporary `.aaydb` snapshot, calls `os.fsync()`, atomically swaps via `os.replace()`, calls `fsync_dir()` where supported, appends a `checkpoint` record, and only then truncates the WAL.
-- On startup `load()`, `parse_wal()` validates records, ignores torn/checksum-corrupt trailing records, rejects mid-log corruption without skipping forward, and idempotently replays the newest committed image where `commit_lsn > snapshot.wal_lsn`. See [`WAL.md`](WAL.md) for the complete protocol specification.
+- Every persistent mutation writes `begin`, `write`, and `commit` records with canonical SHA-256 checksums to `<db_path>.wal` and calls `os.fsync()` before checkpointing. Appends are unbuffered `O_APPEND` writes completed by an `os.write()` write-all loop, so a short write is never treated as a complete record.
+- `WalManager` runs an explicit append state machine (`begin_appended` -> `write_appended` -> `commit_attempted` -> `commit_durable`). Any append that may have left torn or uncertain bytes sets `poisoned`, which blocks further appends and engine statements until the database is reopened and recovery repairs the log. LSNs advance only after durable success.
+- Checkpointing writes a temporary `.aaydb` snapshot, calls `os.fsync()`, atomically swaps via `os.replace()`, calls `fsync_dir()` where supported, appends a `checkpoint` record, and only then truncates the WAL. `fsync_dir()` distinguishes unsupported directory fsync (`EINVAL`/`ENOTSUP`/`EOPNOTSUPP`, plus Windows' deliberate platform fallback) from genuine failures (`EACCES`/`EIO`/`ENOSPC`), which raise `StorageError` instead of claiming durability.
+- On startup `load()`, `parse_wal()` validates records, tracks `valid_bytes_end` for the last valid record, ignores torn/checksum-corrupt trailing records, rejects mid-log corruption without skipping forward, and idempotently replays the newest committed image where `commit_lsn > snapshot.wal_lsn`. Before appending a recovery `CHECKPOINT`, it truncates only the invalid trailing bytes and fsyncs, so a repaired tail cannot become mid-log corruption after a crash. See [`WAL.md`](WAL.md) for the complete protocol specification.
 
 ## Module Responsibilities
 
@@ -78,9 +79,9 @@ Three-valued logic is centralized in `query.py` (`sql_and`, `sql_or`, `sql_not`,
 - **`planner.py`**: Chooses and renders the access path; fetches candidate rows for index scans.
 - **`index.py` / `btree.py`**: Secondary index maintenance, lookups, range scans, and B+ tree invariants.
 - **`executor.py`**: Executes DDL/DML and `EXPLAIN`, maintains indexes on mutations, and delegates `SELECT` to the query pipeline.
-- **`wal.py`**: WAL record schema, SHA-256 checksums, strict validation, append-only `fsync` writes, checkpoint/truncation helpers, and internal crash-test hooks.
+- **`wal.py`**: WAL record schema, SHA-256 checksums, strict validation, byte-accurate tail parsing and repair, the append state machine with write-all/poisoning, directory fsync error classification, checkpoint/truncation helpers, and internal crash-test hooks.
 - **`storage.py`**: Schema/type/constraint validation, `Table`/`Database` models, v1/v2->v3 migration, crash-safe checkpointing, and startup WAL recovery.
-- **`engine.py` & `transaction.py`**: Coordinate lexing, parsing, execution, and persistence. Autocommit and explicit `COMMIT` persist through WAL + checkpoint; ambiguous fsync errors enforce reopen recovery.
+- **`engine.py` & `transaction.py`**: Coordinate lexing, parsing, execution, and persistence. Autocommit and explicit `COMMIT` persist through WAL + checkpoint; ambiguous fsync errors and poisoned WALs enforce reopen recovery.
 - **`cli.py` & `formatting.py`**: `--db`, `--memory`, `--version`, fail-fast scripts, error-resilient REPL, ASCII tables, plan text output.
 - **`errors.py`**: Exception hierarchy rooted at `AayushSQLError` (`LexerError`, `ParserError`, `ExecutionError`, `ConstraintError`, `StorageError`, `AmbiguousCommitError`).
 
