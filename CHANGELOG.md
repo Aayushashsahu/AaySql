@@ -2,6 +2,24 @@
 
 All notable changes to AayushSQL are documented in this file.
 
+## [0.4.0] — 2026-11-10
+
+### Added
+- **B+ tree (`src/aaysql/btree.py`)**: A from-scratch ordered tree with internal separator nodes, linked leaf nodes for range traversal, node splitting on insert, redistribution and merging on delete, duplicate key support via physical `(key, sequence)` entries, empty-tree handling, and `validate()` for structural invariants.
+- **Secondary indexes (`src/aaysql/index.py`)**: Single-column, non-unique indexes binding a name and table column to a B+ tree, with lookup, range scan, incremental add/remove, rebuild-from-rows, and index name validation. `NULL` values are not indexed, and index scans return rows in table order.
+- **Index DDL (`src/aaysql/parser.py`, `src/aaysql/executor.py`)**: `CREATE INDEX idx ON table (column)` and `DROP INDEX idx`, with duplicate-name, unknown-table, unknown-column, and multi-column rejection. `DROP TABLE` removes that table's indexes.
+- **Query planner (`src/aaysql/planner.py`)**: Chooses `INDEX SCAN` or `TABLE SCAN` for single-table `SELECT` statements using `=`, `>`, `>=`, `<`, `<=` predicates on indexed columns (either operand order), and falls back to a table scan for `OR`, `NOT`, `!=` / `<>`, `NULL` literals, type-mismatched literals, and joined queries. The complete `WHERE` clause is always re-applied after candidate retrieval.
+- **`EXPLAIN` / `EXPLAIN ANALYZE`**: Renders the plan actually executed (`INDEX SCAN` with index, table, and condition; `TABLE SCAN` with filter) and, with `ANALYZE`, measured rows scanned, rows filtered, rows returned, index used, join algorithm, and execution time.
+- **Storage format version 2 (`src/aaysql/storage.py`)**: Index definitions are persisted in `.aaydb` files and B+ trees are rebuilt and validated on load. Format version 1 files remain readable and upgrade on the next write; unknown versions and corrupt index metadata are rejected without modifying the file.
+- **Benchmarks (`benchmarks/benchmark_index.py`, `BENCHMARKS.md`)**: Reproducible measurements for table scan versus index equality/range access at 1,000, 10,000, and 100,000 rows, index build cost, mutation overhead, and storage overhead, with no timing assertions in CI.
+- **Tests**: `tests/test_btree.py` (ordering, duplicates, splits, merges, ranges, randomized equivalence, invariant checks) and `tests/test_indexing.py` (DDL, maintenance, failed-mutation consistency, indexed/unindexed result equivalence, EXPLAIN, persistence, and v1→v2 migration).
+- **Version metadata** updated to `0.4.0`; `tests/test_cli.py` now asserts the version from the package instead of a hard-coded string.
+
+### Notes
+- Indexes are acceleration structures only: table rows stay authoritative and every index can be rebuilt from them.
+- Index-assisted filtering covers single-table predicates only; joins remain nested-loop scans.
+- `EXPLAIN` executes the statement to report real plans and metrics, so it is not a zero-cost command.
+
 ## [0.3.0] — 2026-11-10
 
 ### Added

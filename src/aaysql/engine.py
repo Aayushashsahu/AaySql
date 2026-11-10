@@ -3,14 +3,22 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .ast import CreateTable, Delete, DropTable, Insert, Update
+from .ast import CreateIndex, CreateTable, Delete, DropIndex, DropTable, Insert, Update
 from .errors import StorageError
 from .executor import Executor
 from .lexer import Lexer
 from .parser import Parser
 from .storage import Database, JsonFileStorage
 
-_MUTATION_STATEMENTS = (CreateTable, DropTable, Insert, Update, Delete)
+_MUTATION_STATEMENTS = (
+    CreateTable,
+    DropTable,
+    Insert,
+    Update,
+    Delete,
+    CreateIndex,
+    DropIndex,
+)
 
 
 class Engine:

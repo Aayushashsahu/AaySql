@@ -1,5 +1,8 @@
+import time
+
 from .ast import *
 from .errors import ConstraintError, ExecutionError
+from .planner import format_metrics, format_plan, plan_select
 from .query import (
     SourceBinding,
     eval_row_expr,
@@ -27,6 +30,12 @@ class Executor:
             return self.update(stmt)
         if isinstance(stmt, Delete):
             return self.delete(stmt)
+        if isinstance(stmt, CreateIndex):
+            return self.create_index(stmt)
+        if isinstance(stmt, DropIndex):
+            return self.drop_index(stmt)
+        if isinstance(stmt, Explain):
+            return self.explain(stmt)
         raise ExecutionError(f"Unsupported statement: {type(stmt).__name__}")
 
     def create_table(self, s):
@@ -36,6 +45,31 @@ class Executor:
     def drop_table(self, s):
         self.db.drop_table(s.name)
         return {"status": "ok", "message": f"Table '{s.name}' dropped"}
+
+    def create_index(self, s):
+        self.db.create_index(s.name, s.table, s.column)
+        return {
+            "status": "ok",
+            "message": f"Index '{s.name}' created on {s.table}({s.column})",
+        }
+
+    def drop_index(self, s):
+        self.db.drop_index(s.name)
+        return {"status": "ok", "message": f"Index '{s.name}' dropped"}
+
+    def explain(self, s):
+        if not isinstance(s.statement, Select):
+            raise ExecutionError("EXPLAIN currently supports SELECT statements only")
+        plan = plan_select(self.db, s.statement)
+        started = time.perf_counter()
+        result = execute_select(self.db, s.statement, plan=plan, collect_metrics=True)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        metrics = dict(result["metrics"])
+        metrics["execution_ms"] = elapsed_ms
+        text = format_plan(plan)
+        if s.analyze:
+            text = f"{text}\n{format_metrics(metrics)}"
+        return {"status": "ok", "message": text}
 
     def _coerce(self, value, col):
         return coerce_value(value, col)
@@ -84,6 +118,9 @@ class Executor:
             self._check_constraints(table, row, rows=staged_pool)
             staged_pool.append(row)
         table.rows.extend(new_rows)
+        for index in self.db.indexes_on(table.name):
+            for row in new_rows:
+                index.add(row)
         return {"status": "ok", "rows_affected": len(new_rows)}
 
     def _value(self, expr, row, table=None):
@@ -110,7 +147,7 @@ class Executor:
         ]
 
     def select(self, s):
-        return execute_select(self.db, s)
+        return execute_select(self.db, s, plan=plan_select(self.db, s))
 
     def update(self, s):
         table = self.db.table(s.table)
@@ -130,13 +167,25 @@ class Executor:
         post_rows = [target_map.get(id(row), row) for row in table.rows]
         for _, new in staged:
             self._check_constraints(table, new, rows=post_rows, ignore_row=new)
+        indexes = self.db.indexes_on(table.name)
+        previous_keys = [
+            {index.name: old[index.column] for index in indexes} for old, _ in staged
+        ]
         for old, new in staged:
             old.update(new)
+        for (old, _), previous in zip(staged, previous_keys):
+            for index in indexes:
+                index.remove(old, key=previous[index.name], forget=False)
+                index.add(old)
         return {"status": "ok", "rows_affected": len(staged)}
 
     def delete(self, s):
         table = self.db.table(s.table)
         targets = set(map(id, self._filtered(table, s.where)))
+        doomed = [row for row in table.rows if id(row) in targets]
+        for index in self.db.indexes_on(table.name):
+            for row in doomed:
+                index.remove(row)
         before = len(table.rows)
         table.rows[:] = [row for row in table.rows if id(row) not in targets]
         return {"status": "ok", "rows_affected": before - len(table.rows)}

@@ -8,11 +8,16 @@ from pathlib import Path
 from typing import Any
 
 from .ast import ColumnDef
+from .btree import BTreeError
 from .errors import ConstraintError, ExecutionError, StorageError
+from .index import INDEX_NAME_PATTERN, Index
 
 FORMAT_NAME = "aaysql"
-FORMAT_VERSION = 1
-ENGINE_VERSION = "0.3.0"
+FORMAT_VERSION = 2
+# Format version 1 predates index definitions; it is still readable and upgrades
+# to version 2 on the next write.
+READABLE_FORMAT_VERSIONS = (1, 2)
+ENGINE_VERSION = "0.4.0"
 
 TYPE_MAP: dict[str, type] = {
     "INT": int,
@@ -239,6 +244,9 @@ class Table:
 class Database:
     def __init__(self):
         self.tables: dict[str, Table] = {}
+        # Index definitions plus their runtime B+ trees. Trees are rebuilt from
+        # table rows whenever a database is loaded.
+        self.indexes: dict[str, Index] = {}
 
     def create_table(self, name: str, columns: list[ColumnDef]) -> None:
         if name in self.tables:
@@ -254,10 +262,33 @@ class Database:
     def drop_table(self, name: str) -> None:
         self.table(name)
         del self.tables[name]
+        for index_name in [n for n, index in self.indexes.items() if index.table == name]:
+            del self.indexes[index_name]
+
+    def create_index(self, name: str, table_name: str, column: str) -> Index:
+        if name in self.indexes:
+            raise ExecutionError(f"Index '{name}' already exists")
+        table = self.table(table_name)
+        table.ensure_column(column)
+        index = Index(name, table_name, column, table.rows)
+        self.indexes[name] = index
+        return index
+
+    def drop_index(self, name: str) -> None:
+        if name not in self.indexes:
+            raise ExecutionError(f"Index '{name}' does not exist")
+        del self.indexes[name]
+
+    def indexes_on(self, table_name: str) -> list[Index]:
+        return [index for index in self.indexes.values() if index.table == table_name]
 
     def clone(self) -> Database:
         copy = Database()
         copy.tables = {name: tbl.clone() for name, tbl in self.tables.items()}
+        for name, index in self.indexes.items():
+            table = copy.tables.get(index.table)
+            rows = table.rows if table is not None else ()
+            copy.indexes[name] = Index(name, index.table, index.column, rows)
         return copy
 
     def to_dict(self) -> dict[str, Any]:
@@ -266,6 +297,9 @@ class Database:
             "format_version": FORMAT_VERSION,
             "engine_version": ENGINE_VERSION,
             "tables": {name: tbl.to_dict() for name, tbl in self.tables.items()},
+            "indexes": {
+                name: index.describe() for name, index in sorted(self.indexes.items())
+            },
         }
 
     @classmethod
@@ -277,8 +311,11 @@ class Database:
         version = data.get("format_version")
         if isinstance(version, bool) or not isinstance(version, int):
             raise StorageError("Invalid or missing 'format_version'")
-        if version != FORMAT_VERSION:
-            raise StorageError(f"Unsupported database format version: {version}")
+        if version not in READABLE_FORMAT_VERSIONS:
+            raise StorageError(
+                f"Unsupported database format version: {version} "
+                f"(supported: {', '.join(str(v) for v in READABLE_FORMAT_VERSIONS)})"
+            )
         raw_tables = data.get("tables")
         if not isinstance(raw_tables, dict):
             raise StorageError("Invalid or missing 'tables' mapping")
@@ -287,7 +324,39 @@ class Database:
             if not isinstance(key, str) or not key:
                 raise StorageError("Invalid table key in database file")
             db.tables[key] = Table.from_dict(key, tbl_data)
+
+        # Version 1 files predate indexes and load with an empty index catalog.
+        raw_indexes = data.get("indexes", {})
+        if not isinstance(raw_indexes, dict):
+            raise StorageError("Invalid or missing 'indexes' mapping")
+        for index_name, spec in raw_indexes.items():
+            db.indexes[index_name] = _index_from_spec(db, index_name, spec)
         return db
+
+
+def _index_from_spec(db: Database, name: Any, spec: Any) -> Index:
+    """Validate a persisted index definition and rebuild its tree from table rows."""
+    if not isinstance(name, str) or not INDEX_NAME_PATTERN.fullmatch(name):
+        raise StorageError(f"Invalid index name {name!r} in database file")
+    if not isinstance(spec, dict):
+        raise StorageError(f"Invalid index definition for '{name}'")
+    table_name = spec.get("table")
+    column = spec.get("column")
+    if not isinstance(table_name, str) or not table_name:
+        raise StorageError(f"Invalid table reference for index '{name}'")
+    if not isinstance(column, str) or not column:
+        raise StorageError(f"Invalid column reference for index '{name}'")
+    if table_name not in db.tables:
+        raise StorageError(f"Index '{name}' references unknown table '{table_name}'")
+    table = db.tables[table_name]
+    if column not in table.column_names:
+        raise StorageError(f"Index '{name}' references unknown column '{table_name}.{column}'")
+    index = Index(name, table_name, column, table.rows)
+    try:
+        index.validate()
+    except BTreeError as exc:
+        raise StorageError(f"Index '{name}' is corrupted: {exc}") from exc
+    return index
 
 
 class JsonFileStorage:

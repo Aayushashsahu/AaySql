@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
+from aaysql import __version__
 from aaysql.cli import main
 
 
@@ -100,7 +101,7 @@ def test_cli_demo_script_in_memory(tmp_path: Path):
 def test_cli_version_flag(tmp_path: Path):
     p = _run_cli(["--version"], cwd=tmp_path)
     assert p.returncode == 0
-    assert "aaysql 0.3.0" in p.stdout
+    assert f"aaysql {__version__}" in p.stdout
 
 
 def test_cli_script_success_returns_zero(tmp_path: Path):
