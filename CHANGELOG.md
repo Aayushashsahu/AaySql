@@ -2,6 +2,23 @@
 
 All notable changes to AayushSQL are documented in this file.
 
+## [0.6.0] — 2026-11-10
+
+### Added
+- **Write-Ahead Log (`src/aaysql/wal.py`)**:
+  - Adjacent `<db_path>.wal` using newline-delimited canonical JSON records (`begin`, `write`, `commit`, `checkpoint`) protected by canonical SHA-256 checksums, strict monotonic LSNs, and unique UUID4 transaction IDs.
+  - WAL `os.fsync()` commit durability (with POSIX directory-entry `fsync_dir()`) precedes `.aaydb` snapshot writes across both explicit `BEGIN` / `COMMIT` transactions and single-statement autocommit mutations (`INSERT`, `UPDATE`, `DELETE`, `CREATE/DROP TABLE`, `CREATE/DROP INDEX`).
+  - Distinguished commit error semantics (`AmbiguousCommitError` in `src/aaysql/errors.py`): pre-commit errors restore memory cleanly; post-commit checkpoint errors keep the committed state and preserve the WAL without reporting failure; `COMMIT` `fsync` errors mark the engine `needs_recovery=True` and require reopen recovery.
+- **Database format version 3 & migration (`src/aaysql/storage.py`)**:
+  - Added `wal_lsn` to `.aaydb` format version `3` tracking the highest committed WAL LSN applied to the snapshot.
+  - Preserved read compatibility with format versions `1` and `2` (`wal_lsn = 0`) without overwriting legacy files on read, upgrading safely to v3 on write or recovery checkpoint.
+- **Crash-safe checkpointing & startup recovery (`src/aaysql/storage.py`)**:
+  - Safe checkpoint ordering: atomic `.tmp` write + `os.fsync()` -> `os.replace()` -> `fsync_dir()` -> WAL `checkpoint` record -> WAL truncation -> stale `.tmp` cleanup.
+  - Startup recovery validates WAL integrity, ignores trailing torn or checksum-corrupt records, stops immediately at mid-log corruption without skipping forward, discards incomplete transactions, and idempotently replays the newest committed image with `commit_lsn > snapshot.wal_lsn`.
+- **Tests (`tests/test_wal_recovery.py`)**: Added 24 tests including real child subprocess `os._exit()` crash tests across all critical pre-commit, post-`COMMIT` `fsync`, snapshot write, `os.replace()`, checkpoint, and WAL truncation stages, plus corruption, idempotency, error-semantics, and v1/v2->v3 migration coverage.
+- **Documentation (`WAL.md`, `ARCHITECTURE.md`, `LANGUAGE_SPEC.md`, `README.md`)**: Documented WAL protocol, LSN/txn invariants, durability semantics, checkpoint ordering, recovery, format v3, and platform limitations.
+- **Version metadata** updated to `0.6.0`.
+
 ## [0.5.0] — 2026-11-10
 
 ### Added
