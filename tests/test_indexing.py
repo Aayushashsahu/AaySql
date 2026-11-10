@@ -343,7 +343,7 @@ def test_version_1_database_file_migrates_to_version_2(tmp_path: Path):
         e.execute("AAYUSH CREATE INDEX idx_users_age ON users (age)")
 
     payload = json.loads(db_file.read_text(encoding="utf-8"))
-    assert payload["format_version"] == FORMAT_VERSION == 2
+    assert payload["format_version"] == FORMAT_VERSION == 3
     assert payload["indexes"] == {"idx_users_age": {"table": "users", "column": "age"}}
 
     with Engine(db_file) as e2:

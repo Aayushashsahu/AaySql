@@ -22,3 +22,9 @@ class StorageError(AayushSQLError):
     """Raised when loading, validating, or saving persistent database state fails."""
     pass
 
+
+class AmbiguousCommitError(StorageError):
+    """Raised when WAL COMMIT fsync fails, leaving commit durability ambiguous."""
+    pass
+
+

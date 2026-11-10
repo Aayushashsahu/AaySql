@@ -15,7 +15,7 @@ from .ast import (
     Rollback,
     Update,
 )
-from .errors import StorageError
+from .errors import AmbiguousCommitError, StorageError
 from .executor import Executor
 from .lexer import Lexer
 from .parser import Parser
@@ -37,8 +37,9 @@ class Engine:
     """Top-level AayushSQL engine coordinating lexing, parsing, execution, and persistence.
 
     Outside an explicit transaction every mutating statement is autocommitted and
-    persisted immediately. Inside ``BEGIN`` ... ``COMMIT`` mutations stay in memory
-    until the single commit-time save.
+    persisted durably through the WAL before checkpointing. Inside ``BEGIN`` ...
+    ``COMMIT`` mutations stay in memory until the single commit-time WAL write
+    and checkpoint.
     """
 
     def __init__(self, db_path: str | Path | None = None):
@@ -56,6 +57,7 @@ class Engine:
         self.executor = Executor(self.db)
         self.transactions = TransactionManager()
         self._closed = False
+        self._recovery_required = False
 
     @property
     def is_persistent(self) -> bool:
@@ -65,14 +67,26 @@ class Engine:
     def in_transaction(self) -> bool:
         return self.transactions.in_transaction
 
+    @property
+    def needs_recovery(self) -> bool:
+        return self._recovery_required
+
+    def _ensure_usable(self) -> None:
+        if self._closed:
+            raise StorageError("Cannot execute statement on a closed Engine")
+        if self._recovery_required:
+            raise StorageError(
+                "Database durability state is ambiguous after a WAL fsync failure; "
+                "reopen the database to recover"
+            )
+
     def _install(self, db: Database) -> None:
         """Replace in-memory state and rebind the executor to the new database."""
         self.db = db
         self.executor.db = db
 
     def execute(self, sql: str) -> dict[str, Any]:
-        if self._closed:
-            raise StorageError("Cannot execute statement on a closed Engine")
+        self._ensure_usable()
         tokens = self.lexer.tokenize(sql)
         stmt = Parser(tokens).parse()
 
@@ -88,9 +102,12 @@ class Engine:
 
         if self.storage is not None and isinstance(stmt, _MUTATION_STATEMENTS):
             snapshot = self.db.clone()
-            result = self.executor.execute(stmt)
             try:
+                result = self.executor.execute(stmt)
                 self.storage.save(self.db)
+            except AmbiguousCommitError:
+                self._recovery_required = True
+                raise
             except Exception:
                 self._install(snapshot)
                 raise
@@ -112,34 +129,47 @@ class Engine:
         return result
 
     def begin(self) -> dict[str, Any]:
+        self._ensure_usable()
         self.transactions.begin(self.db.clone())
         return {"status": "ok", "message": "Transaction started"}
 
     def commit(self) -> dict[str, Any]:
+        self._ensure_usable()
         transaction = self.transactions.commit()
         try:
             if self.storage is not None:
                 self.storage.save(self.db)
+        except AmbiguousCommitError:
+            self._recovery_required = True
+            raise
         except Exception:
-            # The commit never became durable, so memory must match the file that
-            # was never replaced: restore the state captured at BEGIN.
+            # The commit never became durable before WAL COMMIT fsync, so memory
+            # must match the previously durable state captured at BEGIN.
             self._install(transaction.snapshot)
             raise
         return {"status": "ok", "message": "Transaction committed"}
 
     def rollback(self) -> dict[str, Any]:
+        self._ensure_usable()
         transaction = self.transactions.rollback()
         self._install(transaction.snapshot)
         return {"status": "ok", "message": "Transaction rolled back"}
 
     def close(self) -> None:
-        if self.transactions.in_transaction:
-            # An uncommitted transaction must never become durable.
-            self.rollback()
-        self._closed = True
+        if not self._closed:
+            if self._recovery_required:
+                self._closed = True
+                return
+            if self.transactions.in_transaction:
+                # An uncommitted transaction must never become durable.
+                self.rollback()
+            if self.storage is not None:
+                self.storage.cleanup_if_clean()
+            self._closed = True
 
     def __enter__(self) -> Engine:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+

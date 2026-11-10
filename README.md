@@ -12,7 +12,7 @@ Every top-level SQL statement must begin with `AAYUSH`. Ordinary SQL without the
 
 ## Current Version
 
-**v0.5.0** — Transactions: `AAYUSH BEGIN` / `COMMIT` / `ROLLBACK` with deferred persistence, atomic multi-statement commits, per-statement rollback on failure, index-aware snapshots, automatic rollback on engine/CLI exit, and a CLI warning for uncommitted work — on top of the v0.4.0 indexing engine.
+**v0.6.0** — Write-Ahead Logging (WAL) & Crash Recovery: newline-delimited JSON WAL (`<db>.wal`) with SHA-256 checksums, `fsync` commit durability, `.aaydb` format v3 (`wal_lsn`) with v1/v2 migration, crash-safe checkpoint ordering, idempotent startup recovery, and real subprocess `os._exit()` crash verification — on top of the v0.5.0 transactional engine.
 
 ## Why the `AAYUSH` Prefix Exists
 
@@ -24,11 +24,11 @@ SELECT * FROM users;
 AAYUSH SELECT * FROM users;
 ```
 
-Everything behind the parser — relational joins, column resolution, grouping, aggregation, constraints, atomic mutations, and persistent storage — follows real database engineering principles.
+Everything behind the parser — relational joins, column resolution, grouping, aggregation, constraints, atomic mutations, WAL durability, and persistent storage — follows real database engineering principles.
 
 ## Implemented vs. Planned Features
 
-### Implemented (v0.3.0)
+### Implemented (v0.6.0)
 - Mandatory `AAYUSH` top-level statement prefix (rejects missing or duplicate `AAYUSH`).
 - DDL & DML: `CREATE TABLE`, `DROP TABLE`, `INSERT INTO ... VALUES ...`, `SELECT ... FROM ...`, `UPDATE ... SET ...`, `DELETE FROM ...`.
 - Relational joins & source binding:
@@ -41,7 +41,6 @@ Everything behind the parser — relational joins, column resolution, grouping, 
   - Indexes stay synchronized with `INSERT`, `UPDATE`, and `DELETE`, are removed by `DROP TABLE`, and never replace table rows as the source of truth.
   - Query planner reuses an index for single-table `=`, `>`, `>=`, `<`, `<=` predicates and falls back to a table scan otherwise. The full `WHERE` clause is always re-applied and candidate rows keep table order, so indexed and unindexed results are identical.
   - `EXPLAIN SELECT ...` reports the real access path (`INDEX SCAN` / `TABLE SCAN`); `EXPLAIN ANALYZE` adds measured rows scanned, rows filtered, rows returned, index used, and execution time.
-  - `.aaydb` format version 2 stores index definitions; version 1 files load unchanged and upgrade on the next write.
   - Reproducible benchmarks in `benchmarks/benchmark_index.py`, with recorded measurements in `BENCHMARKS.md`.
 - Aggregation & grouping:
   - `COUNT(*)`, `COUNT(column)`, `SUM(column)`, `AVG(column)`, `MIN(column)`, `MAX(column)`.
@@ -53,17 +52,22 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 - Transactions (v0.5.0):
   - `AAYUSH BEGIN`, `AAYUSH COMMIT`, `AAYUSH ROLLBACK` for multi-statement transactions.
   - Mutations inside a transaction are visible to later statements but stay in memory until the single `COMMIT` save; `ROLLBACK` restores the pre-`BEGIN` snapshot, including DDL and index changes.
-  - Each statement stays atomic inside a transaction, and a failed `COMMIT` restores the pre-`BEGIN` state and raises `StorageError` instead of reporting success.
-  - Closing the engine or exiting the CLI with an active transaction rolls it back and prints a warning to `stderr`. Autocommit behavior outside transactions is unchanged.
+  - Each statement stays atomic inside a transaction.
+  - Closing the engine or exiting the CLI with an active transaction rolls it back and prints a warning to `stderr`.
+- Write-Ahead Log & Crash Recovery (v0.6.0 — see [`WAL.md`](WAL.md)):
+  - Adjacent newline-delimited JSON WAL (`<db>.wal`) with canonical SHA-256 checksums, monotonic LSNs, unique per-transaction IDs, and `BEGIN` / `WRITE` / `COMMIT` / `CHECKPOINT` records.
+  - WAL `os.fsync()` commit durability precedes snapshot checkpointing for both explicit transactions and autocommit mutations (`INSERT`, `UPDATE`, `DELETE`, `CREATE/DROP TABLE`, `CREATE/DROP INDEX`).
+  - Distinguished error semantics: pre-commit errors roll back cleanly, post-`COMMIT` checkpoint failures preserve the committed state and WAL without misreporting failure, and `COMMIT` `fsync` errors raise `AmbiguousCommitError` and require reopen recovery.
+  - Crash-safe checkpoint ordering (`.tmp` write + `fsync` -> `os.replace` -> dir `fsync` -> `CHECKPOINT` record -> WAL truncation) and idempotent startup recovery.
+  - Trailing torn/corrupt WAL records are safely ignored; mid-log corruption stops immediately without skipping forward.
+  - `.aaydb` format version `3` (`wal_lsn`) with safe read-only compatibility and on-write migration for format v1 and v2 databases.
 - Persistent storage:
-  - Versioned JSON database files (`.aaydb`, format version `1`) with atomic replacement (`os.replace`) and startup corruption/schema validation.
   - Read-only `SELECT` queries (including joins and aggregations) never modify persisted files.
   - Configurable database file path (`--db`) and in-memory mode (`--memory` / `--db :memory:`).
 - Fail-fast script runner (non-zero exit code on error) and error-resilient interactive REPL.
 - Automated GitHub Actions CI across Python 3.10–3.13.
 
 ### Planned (Future Roadmap)
-- **v0.6** — Reliability: write-ahead logging (WAL), checkpoints, crash recovery.
 - **v0.7** — Query optimizer: hash joins, cardinality statistics, filter pushdown, profiling.
 - **v0.8** — Client/server: network protocol, server binary, authentication, localhost-by-default binding.
 - **v0.9** — SQL language expansion: `IS NULL`, `LIKE`, `IN`, `BETWEEN`, `DISTINCT`, arithmetic expressions, `OFFSET`, `CASE`.
@@ -157,7 +161,8 @@ GitHub Actions CI (`.github/workflows/tests.yml`) runs `python -m pytest -v` on 
 - Duplicate output labels in one `SELECT` list are rejected with `ExecutionError` (result rows are keyed by label), so distinct aliases are required.
 - `RIGHT JOIN`, `FULL JOIN`, `CROSS JOIN`, and qualified wildcards (`u.*`) are not supported.
 - `GROUP BY` supports simple column references (qualified or unqualified), not arbitrary expressions; nested aggregate functions (`SUM(COUNT(*))`) are not supported.
-- No subqueries, `UNION`, `IS NULL` syntax, arithmetic expressions, `ALTER TABLE`, or multi-statement transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) yet.
-- Single-process, single-writer execution with full-database JSON rewrite on mutations.
-- Transactions are single-process and single-writer: no nested transactions, savepoints, isolation levels, or concurrent connections; `COMMIT` persists by rewriting the whole `.aaydb` file.
+- No subqueries, `UNION`, `IS NULL` syntax, arithmetic expressions, or `ALTER TABLE`.
+- Single-process, single-writer execution: no nested transactions, savepoints, isolation levels, or concurrent connections.
+- WAL durability guarantees target single-process crash recovery; directory `fsync` is executed where supported (POSIX) and is limited on Windows (`os.open` on directories is unsupported). Hardware/firmware write-cache failures or OS filesystem corruption remain outside process-crash guarantees (see [`WAL.md`](WAL.md)).
 - Table and column names are case-sensitive at execution time.
+

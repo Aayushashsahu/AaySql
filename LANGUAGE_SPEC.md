@@ -1,4 +1,4 @@
-# AayushSQL Language Specification (v0.5.0)
+# AayushSQL Language Specification (v0.6.0)
 
 ## 1. Overview
 
@@ -163,10 +163,10 @@ AAYUSH COMMIT;
 - `BEGIN` starts an explicit transaction. Mutations are visible to later statements from the same engine but are **not** written to the `.aaydb` file until `COMMIT`.
 - `ROLLBACK` discards every change since `BEGIN`, including DDL (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`).
 - Each statement inside a transaction is atomic: a statement that fails validation or a constraint leaves no partial changes, and the transaction remains usable.
-- `COMMIT` is the only durability point. It persists all changes together through the existing atomic file replacement. If persistence fails, the transaction is rolled back to its pre-`BEGIN` state and `StorageError` is raised; success is never reported for an unpersisted commit.
+- `COMMIT` is the durability point. Persistent mutations and explicit `COMMIT` append `begin`, `write`, and `commit` WAL records with SHA-256 checksums and call `os.fsync()` before atomically checkpointing `.aaydb` (format v3). Failures before `COMMIT` restore the pre-`BEGIN` state; failures during post-commit checkpointing preserve the committed state and WAL; `COMMIT` `fsync` errors raise `AmbiguousCommitError` and require reopen recovery.
 - Nested `BEGIN`, and `COMMIT` / `ROLLBACK` without an active transaction, raise `ExecutionError`.
 - Closing the engine or exiting the CLI with an active transaction rolls it back. The CLI prints `WARNING: rolling back uncommitted transaction on exit` to `stderr`.
-- Autocommit behavior outside explicit transactions is unchanged: each mutating statement persists immediately.
+- Autocommit behavior outside explicit transactions persists every mutating statement through the WAL before returning.
 - The model is single-process and single-writer. There are no savepoints, isolation levels, or concurrent writers.
 
 ### `UPDATE` & `DELETE`
@@ -178,7 +178,7 @@ Every assignment in `UPDATE ... SET` requires an explicit `=`.
 
 ## 5. Unsupported / Planned Syntax
 
-The following SQL features are **not yet implemented** in v0.5.0:
+The following SQL features are **not yet implemented** in v0.6.0:
 - `RIGHT JOIN`, `FULL JOIN`, `CROSS JOIN`, natural joins, or comma joins
 - Qualified wildcards (`u.*`)
 - Subqueries, `UNION`, `DISTINCT`, `CASE`, `IS NULL` / `IS NOT NULL`, `LIKE`, `IN`, `BETWEEN`, arithmetic expressions
