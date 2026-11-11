@@ -1,6 +1,6 @@
 # Architecture
 
-AayushSQL v0.8.0 separates the language front end, logical/physical query planning, statistics, relational execution, index maintenance, DML/constraint execution, Write-Ahead Logging (WAL), persistent snapshot storage, and the client/server layer into focused modules under `src/aaysql/`. The embedded engine is unchanged: the server is a front end over one `Engine` instance.
+AayushSQL v0.9.0 separates the language front end, the expression engine, logical/physical query planning, statistics, relational execution, index maintenance, DML/constraint execution, Write-Ahead Logging (WAL), persistent snapshot storage, and the client/server layer into focused modules under `src/aaysql/`. The embedded engine is unchanged: the server is a front end over one `Engine` instance.
 
 ```text
                   AayushSQL CLI (cli.py)
@@ -18,8 +18,10 @@ AayushSQL v0.8.0 separates the language front end, logical/physical query planni
      Planner (planner.py)      Database / Table (storage.py)
             |        \                /
    Statistics    Execution pipeline (execution.py)
- (statistics.py)          /
-              Expression helpers (query.py)
+ (statistics.py)          /                \
+              Expression engine (expressions.py)
+                            |
+              Statement validation (query.py)
 ```
 
 ## Query Planning & Execution (`src/aaysql/planner.py`, `src/aaysql/execution.py`)
@@ -52,7 +54,24 @@ Plan execution             [execution.py]
 - `EXPLAIN` renders the plan and never executes the statement; `EXPLAIN ANALYZE` executes it and appends measured per-operator counters. Figures prefixed with `~` are estimates and the plan text says so.
 - `plan_select(..., force_join_algorithm=..., force_access_path=...)` keeps the v0.6.x nested-loop/table-scan path forceable for equivalence tests and benchmarks. There is no SQL syntax for it.
 
-Three-valued logic is centralized in `query.py` (`sql_and`, `sql_or`, `sql_not`, `is_sql_true`): `NULL` comparisons produce `UNKNOWN`, `UNKNOWN` propagates through `AND`/`OR`/`NOT`, and row filters admit only `TRUE`. A single recursive `eval_expr()` serves row-level and group-level evaluation so the two paths cannot diverge.
+## Expression Engine (`src/aaysql/expressions.py`, `src/aaysql/parser.py`)
+
+Every scalar expression in the language is one of a small set of immutable AST nodes (`Literal`, `Identifier`, `AggregateCall`, `UnaryExpr`, `BinaryExpr`, `IsNull`, `Like`, `InList`, `Between`, `Case`) parsed by one precedence-climbing parser. The precedence table lives in one place in `parser.py` and is mirrored for rendering in `planner.format_expr`, so a rendered plan re-parses to the same tree.
+
+- **One traversal.** `iter_expr_children()` is the only place that knows the shape of each node; `walk_expr()` walks it pre-order. Identifier validation, aggregate detection and placement rules, grouped-expression checks, planner predicate-source analysis, `contains_aggregate`, and EXPLAIN rendering all use it. A new node type that is not handled by the traversal is reported as unevaluable (`ensure_known_expr`) instead of being silently skipped, and a test asserts every expression class yields children or is a declared leaf.
+- **One evaluator.** `eval_expr()` implements row-level and group-level semantics for every node, including three-valued logic (`sql_and`, `sql_or`, `sql_not`, `is_sql_true`), arithmetic, `LIKE`, `IN`, `BETWEEN`, and `CASE`. Aggregates are resolved through a callback, so the same function evaluates an aggregate argument per row and a `HAVING` expression per group. The reference path (`Executor.update`/`delete`/`_filtered`) and the plan-driven path (`execution.execute_select`) both call it; there is no second evaluator.
+- **LIKE safety.** A pattern is translated character by character into an anchored regex: `%` → `.*`, `_` → `.`, everything else `re.escape`d, compiled through a 256-entry LRU cache. A user pattern is never treated as a regular expression.
+- **Arithmetic rules.** Only `int`/`float` (never `bool`) are numeric; `+ - *` keep integers integral, `/` is always float, `%` uses Python floored semantics, `NULL` propagates, division/modulo by zero and non-finite results raise `ExecutionError`.
+- **`CASE` rules.** Searched `CASE` takes the first branch whose condition is `TRUE`; simple `CASE` uses SQL `=` so a `NULL` base never matches `WHEN NULL`; a missing `ELSE` yields `NULL`.
+- **Statement layer** (`query.py`) keeps the non-expression rules: output labels, grouped-column validation, aggregate argument rules, and the `execute_select` entry point.
+
+Lexing note: numbers are lexed unsigned so `1-2` is `number, minus, number`. The parser folds a sign into an adjacent numeric literal (`-5`, `DEFAULT -4`), which keeps negative literals working in `INSERT`, `DEFAULT`, and plan text while keeping binary subtraction unambiguous. `*` is multiplication inside an expression and a wildcard only in the `SELECT` list position.
+
+## Execution Pipeline Order (v0.9.0)
+
+`FROM`/`JOIN` → `WHERE` → `GROUP BY`/aggregates → `HAVING` → projection → `DISTINCT` → `ORDER BY` → `OFFSET` → `LIMIT`.
+
+`DISTINCT` deduplicates projected rows (type-tagged keys, `NULL`s equal, first occurrence kept) before ordering. Because ordering then refers to the projected row, a `DISTINCT` query requires `ORDER BY` keys to be a unique alias, a selected expression, or a selected column for `DISTINCT *`. `OFFSET` runs after ordering and before limiting, and `EXPLAIN ANALYZE` reports `duplicates_removed`, `rows_discarded`, and post-`LIMIT` counts from the real run.
 
 ## Transactions (`src/aaysql/transaction.py`, `src/aaysql/engine.py`)
 
@@ -114,11 +133,12 @@ The complete contract, framing details, error codes and limitations are in
 ## Module Responsibilities
 
 - **`token.py` & `lexer.py`**: Tokenizes SQL into typed tokens (`PREFIX` for `AAYUSH`, identifiers, numbers, strings, operators, punctuation).
-- **`ast.py` & `parser.py`**: Enforce the single `AAYUSH` prefix and parse DDL/DML, `CREATE INDEX`, `DROP INDEX`, `EXPLAIN [ANALYZE]`, and relational queries into immutable AST nodes.
-- **`query.py`**: Source binding, identifier resolution, three-valued logic, expression evaluation, grouping/aggregate helpers, and duplicate output-label rejection.
+- **`ast.py` & `parser.py`**: Enforce the single `AAYUSH` prefix and parse DDL/DML, `CREATE INDEX`, `DROP INDEX`, `EXPLAIN [ANALYZE]`, and relational queries into immutable AST nodes. Expression parsing is one precedence-climbing chain (`OR` → `AND` → `NOT` → comparison/predicate → additive → multiplicative → unary → primary) with `CASE`, `DISTINCT`, and `OFFSET` handled in place.
+- **`expressions.py`**: The canonical expression engine: source bindings, identifier resolution, three-valued logic, the shared AST traversal, arithmetic/`LIKE`/`IN`/`BETWEEN`/`CASE` semantics, and the single `eval_expr`.
+- **`query.py`**: Statement-level validation on top of the expression engine: aggregate placement, grouped-expression checks, duplicate output-label rejection, aggregate evaluation, and the `execute_select` entry point.
 - **`planner.py`**: Logical planning (predicate placement), physical planning (access paths, join algorithms), the cost model, and plan/metric rendering. Imports no executor code.
 - **`statistics.py`**: Bounded-memory per-table statistics and the revision-validated cache used by the cost model.
-- **`execution.py`**: Runs the physical plan tree: scans, hash/nested-loop joins, post-join filters, aggregation, projection, sort, limit, and per-operator metrics.
+- **`execution.py`**: Runs the physical plan tree: scans, hash/nested-loop joins, post-join filters, aggregation, projection, `DISTINCT`, sort, `OFFSET`, `LIMIT`, and per-operator metrics.
 - **`index.py` / `btree.py`**: Secondary index maintenance, lookups, range scans, and B+ tree invariants.
 - **`executor.py`**: Executes DDL/DML and `EXPLAIN`, maintains indexes on mutations, and delegates `SELECT` to the query pipeline.
 - **`wal.py`**: WAL record schema, SHA-256 checksums, strict validation, byte-accurate tail parsing and repair, the append state machine with write-all/poisoning, directory fsync error classification, checkpoint/truncation helpers, and internal crash-test hooks.

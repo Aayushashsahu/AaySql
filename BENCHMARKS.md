@@ -1,5 +1,97 @@
 # AayushSQL Benchmarks
 
+## v0.9.0 SQL language benchmarks
+
+Produced by `benchmarks/benchmark_language.py`. Nothing here is enforced in CI:
+the script has no timing assertions and CI does not fail on noisy runners.
+
+### Environment
+
+- OS: Windows 10 (10.0.26300), Python 3.11.15 (CPython)
+- In-memory database, so the numbers describe expression evaluation and plan
+  execution rather than WAL `fsync` or socket overhead
+- Deterministic data: `seed=20261111`, 7 measured runs after one discarded
+  warm-up (the warm-up also builds the planner statistics cache); reported value
+  is the **median** wall clock with the observed min/max spread
+- `docs` = 10,000 rows (`id INT, dept TEXT, score INT, price FLOAT, title TEXT`,
+  ~5% NULLs in `score` and `price`); text tables = 10,000 rows with 400-character
+  bodies and 250 rows with 25-character bodies; join pair = 5,000 x 5,000
+- Every measured query's row count is asserted equal to the reference
+  table-scan / nested-loop execution path
+
+Reproduce with:
+
+```bash
+python benchmarks/benchmark_language.py
+```
+
+### Expressions over 10,000 rows
+
+| Scenario | rows | path | median | spread |
+| --- | --- | --- | --- | --- |
+| arithmetic projection (`score * 2 + 1`, `price / 2`) | 10000 | table scan | 62.7 ms | 58.9–68.6 ms |
+| arithmetic filter (`score * 2 + 10 > 150`) | 2872 | table scan | 43.5 ms | 41.6–46.1 ms |
+| `IS NULL` filter | 527 | table scan | 15.6 ms | 13.9–16.4 ms |
+| `LIKE` filter over text | 232 | table scan | 21.8 ms | 20.7–26.9 ms |
+| `IN` list (3 values) | 4268 | table scan | 39.5 ms | 35.8–52.0 ms |
+| `BETWEEN` filter | 3769 | table scan | 33.5 ms | 31.7–42.0 ms |
+| `NOT BETWEEN` filter | 5704 | table scan | 38.2 ms | 35.7–40.9 ms |
+| `CASE` classification (4-way) | 10000 | table scan | 67.4 ms | 62.7–77.6 ms |
+| `DISTINCT` low cardinality (7 values) | 7 | table scan | 26.1 ms | 20.1–30.3 ms |
+| `DISTINCT` high cardinality (10,000 values) | 10000 | table scan | 33.5 ms | 25.0–35.4 ms |
+| `OFFSET` over ordered rows (`LIMIT 50 OFFSET 5000`) | 50 | table scan | 45.5 ms | 36.2–55.7 ms |
+| filter + group + sort (`IS NOT NULL`, `LIKE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`) | 5 | table scan | 35.0 ms | 33.1–39.2 ms |
+
+These are end-to-end statement times for the whole pipeline (scan, expression
+evaluation, projection, sort/dedupe), not per-row microbenchmarks. Spread is
+wide because the runs are short and Windows timer/GC noise is not smoothed.
+
+### `LIKE` over small vs large text payloads
+
+| Scenario | rows | path | median | spread |
+| --- | --- | --- | --- | --- |
+| `LIKE '%beta%'` on 250 rows x 25 chars | 66 | table scan | 0.67 ms | 0.62–0.81 ms |
+| `LIKE '%beta%'` on 10,000 rows x 400 chars | 2557 | table scan | 36.2 ms | 33.7–47.3 ms |
+
+Cost scales with total matched text length: the pattern is compiled once per
+distinct pattern (bounded cache) and matching itself is linear in the payload.
+
+### `BETWEEN` with and without an index
+
+Query: `SELECT id FROM docs WHERE score BETWEEN 30 AND 60` (3,769 rows).
+
+| Scenario | path | median | spread |
+| --- | --- | --- | --- |
+| before `CREATE INDEX` | table scan | 33.8 ms | 31.7–40.1 ms |
+| after `CREATE INDEX` (planner's choice) | index scan (`idx_docs_score`) | 17.1 ms | 16.4–18.3 ms |
+| forced table scan | table scan | 32.1 ms | 30.3–33.8 ms |
+| forced index scan | index scan | 19.6 ms | 17.1–41.1 ms |
+
+Both access paths returned identical rows, including with `ORDER BY` and
+`LIMIT`/`OFFSET`. The index wins here because the range is selective enough that
+candidate retrieval plus table-order restoration beats scanning all 10,000 rows.
+
+### Join regression check (v0.7.0 optimizer)
+
+| Scenario | rows returned (after `LIMIT 500`) | path | median | spread |
+| --- | --- | --- | --- | --- |
+| hash join, equality only | 500 | hash join + table scan | 18.6 ms | 18.2–26.1 ms |
+| hash join with arithmetic residual in `ON` | 163 | hash join + table scan | 51.7 ms | 42.4–54.7 ms |
+
+The second query keeps the hash join for the equality key and evaluates
+`o.amount * 2 > u.base` as a residual predicate on every candidate, which costs
+roughly one extra expression evaluation per candidate pair.
+
+### Notes
+
+- No speedup is claimed for any v0.9.0 feature. This release adds expressiveness;
+  the arithmetic, `LIKE`, `IN`, `CASE`, and `DISTINCT` operators are evaluated in
+  the ordinary Python row loop, and `IS NULL` / `LIKE` / `IN` / `NOT BETWEEN`
+  fall back to a table scan by design.
+- `LIKE`, `IN`, `IS NULL`, and `DISTINCT` have no statistics, so the planner uses
+  the documented conservative selectivity default for them; plan estimates for
+  those predicates are explicitly not measurements.
+
 ## v0.8.0 client/server benchmarks
 
 Produced by `benchmarks/benchmark_server.py`. Nothing here is enforced in CI: the

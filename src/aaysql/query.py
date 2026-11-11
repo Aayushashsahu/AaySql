@@ -1,156 +1,46 @@
+"""Expression validation and SELECT entry point.
+
+The runtime semantics live in :mod:`aaysql.expressions`; this module keeps the
+statement-level validation helpers (column resolution, aggregate placement,
+grouped-expression rules, output labels) and the ``execute_select`` entry point.
+Everything here walks expressions through the shared traversal in
+:mod:`aaysql.expressions`, so a new node type is validated automatically.
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
-from .ast import (
-    AggregateCall,
-    BinaryExpr,
-    ColumnDef,
-    Identifier,
-    Literal,
-    Select,
-    SelectItem,
-    UnaryExpr,
-)
+from .ast import AggregateCall, Identifier, Literal, Select, SelectItem
 from .errors import ExecutionError
-from .storage import Database, Table
+from .expressions import (  # re-exported: the canonical implementation
+    COMPARISON_OPS,
+    EXPRESSION_TYPES,
+    NUMERIC_TYPES,
+    SourceBinding,
+    compare_values,
+    contains_aggregate,
+    ensure_known_expr,
+    eval_expr,
+    eval_row_expr,
+    is_sql_true,
+    iter_expr_children,
+    resolve_identifier,
+    sql_and,
+    sql_not,
+    sql_or,
+    to_logic,
+    walk_expr,
+)
+from .storage import Database
 
-_NUMERIC_TYPES = {"INT", "INTEGER", "FLOAT", "DOUBLE"}
-
-
-@dataclass(frozen=True)
-class SourceBinding:
-    """A table bound to an effective reference name (alias or table name)."""
-
-    ref: str
-    table: Table
-    column_map: dict[str, ColumnDef]
-
-    @classmethod
-    def from_table(cls, ref: str, table: Table) -> SourceBinding:
-        return cls(
-            ref=ref,
-            table=table,
-            column_map={col.name: col for col in table.columns},
-        )
-
-
-# --- SQL three-valued logic (TRUE / FALSE / UNKNOWN) ---
-#
-# UNKNOWN is represented by ``None``. Comparisons against NULL yield UNKNOWN,
-# and UNKNOWN propagates through AND / OR / NOT instead of collapsing to FALSE.
-# Only TRUE admits a row in WHERE, JOIN ON, and HAVING.
-
-
-def to_logic(value: Any) -> bool | None:
-    """Normalize a runtime value to a SQL logical state (``None`` means UNKNOWN)."""
-    if value is None:
-        return None
-    return True if bool(value) else False
-
-
-def sql_not(value: Any) -> bool | None:
-    state = to_logic(value)
-    return None if state is None else not state
-
-
-def sql_and(left: Any, right: Any) -> bool | None:
-    left_state = to_logic(left)
-    right_state = to_logic(right)
-    if left_state is False or right_state is False:
-        return False
-    if left_state is None or right_state is None:
-        return None
-    return True
-
-
-def sql_or(left: Any, right: Any) -> bool | None:
-    left_state = to_logic(left)
-    right_state = to_logic(right)
-    if left_state is True or right_state is True:
-        return True
-    if left_state is None or right_state is None:
-        return None
-    return False
-
-
-def is_sql_true(value: Any) -> bool:
-    """Row filters (WHERE, JOIN ON, HAVING) admit a row only when the result is TRUE."""
-    return value is not None and bool(value)
-
-
-def compare_values(op: str, left: Any, right: Any) -> bool | None:
-    """Compare two runtime values using SQL comparison semantics.
-
-    Returns ``None`` (UNKNOWN) when either operand is NULL, because a NULL
-    comparison is neither TRUE nor FALSE in SQL.
-    """
-    normalized = op.upper()
-    if normalized not in {"=", "!=", "<>", "<", "<=", ">", ">="}:
-        raise ExecutionError(f"Unsupported operator '{op}'")
-    if left is None or right is None:
-        return None
-    if normalized == "=":
-        return left == right
-    if normalized in {"!=", "<>"}:
-        return left != right
-    try:
-        if normalized == "<":
-            return left < right
-        if normalized == "<=":
-            return left <= right
-        if normalized == ">":
-            return left > right
-        if normalized == ">=":
-            return left >= right
-    except TypeError as exc:
-        raise ExecutionError(
-            f"Cannot compare {type(left).__name__} and {type(right).__name__} with operator '{op}'"
-        ) from exc
-    raise ExecutionError(f"Unsupported operator '{op}'")
-
-
-def resolve_identifier(ident: Identifier, sources: list[SourceBinding]) -> tuple[str, ColumnDef]:
-    """Resolve a qualified or unqualified Identifier against active table sources."""
-    if ident.qualifier is not None:
-        source = next((s for s in sources if s.ref == ident.qualifier), None)
-        if source is None:
-            raise ExecutionError(f"Unknown table or alias '{ident.qualifier}'")
-        col_def = source.column_map.get(ident.name)
-        if col_def is None:
-            raise ExecutionError(f"Unknown column '{ident.label}'")
-        return source.ref, col_def
-
-    if ident.name == "*":
-        raise ExecutionError("Unexpected '*' in expression")
-
-    matches = [(s.ref, s.column_map[ident.name]) for s in sources if ident.name in s.column_map]
-    if not matches:
-        raise ExecutionError(f"Unknown column '{ident.name}'")
-    if len(matches) > 1:
-        raise ExecutionError(f"Ambiguous column reference '{ident.name}'")
-    return matches[0]
-
-
-def contains_aggregate(expr: Any) -> bool:
-    if isinstance(expr, AggregateCall):
-        return True
-    if isinstance(expr, UnaryExpr):
-        return contains_aggregate(expr.expr)
-    if isinstance(expr, BinaryExpr):
-        return contains_aggregate(expr.left) or contains_aggregate(expr.right)
-    return False
+_NUMERIC_TYPES = NUMERIC_TYPES
 
 
 def _validate_no_aggregates(expr: Any, context_name: str) -> None:
-    if isinstance(expr, AggregateCall):
+    ensure_known_expr(expr)
+    if contains_aggregate(expr):
         raise ExecutionError(f"Aggregate functions are not allowed in {context_name}")
-    if isinstance(expr, UnaryExpr):
-        _validate_no_aggregates(expr.expr, context_name)
-    elif isinstance(expr, BinaryExpr):
-        _validate_no_aggregates(expr.left, context_name)
-        _validate_no_aggregates(expr.right, context_name)
 
 
 def _validate_aggregate_arg(agg: AggregateCall, sources: list[SourceBinding]) -> None:
@@ -180,24 +70,14 @@ def validate_expr_columns(
     context_name: str = "expression",
 ) -> None:
     """Validate all column references and aggregate placement in an expression."""
-    if expr is None or isinstance(expr, (Literal, str, int, float, bool)):
-        return
-    if isinstance(expr, Identifier):
-        resolve_identifier(expr, sources)
-        return
-    if isinstance(expr, AggregateCall):
-        if not allow_aggregates:
-            raise ExecutionError(f"Aggregate functions are not allowed in {context_name}")
-        _validate_aggregate_arg(expr, sources)
-        return
-    if isinstance(expr, UnaryExpr):
-        validate_expr_columns(expr.expr, sources, allow_aggregates=allow_aggregates, context_name=context_name)
-        return
-    if isinstance(expr, BinaryExpr):
-        validate_expr_columns(expr.left, sources, allow_aggregates=allow_aggregates, context_name=context_name)
-        validate_expr_columns(expr.right, sources, allow_aggregates=allow_aggregates, context_name=context_name)
-        return
-    raise ExecutionError(f"Cannot evaluate expression {expr}")
+    ensure_known_expr(expr)
+    for node in walk_expr(expr):
+        if isinstance(node, Identifier):
+            resolve_identifier(node, sources)
+        elif isinstance(node, AggregateCall):
+            if not allow_aggregates:
+                raise ExecutionError(f"Aggregate functions are not allowed in {context_name}")
+            _validate_aggregate_arg(node, sources)
 
 
 def _validate_grouped_expr(
@@ -206,67 +86,20 @@ def _validate_grouped_expr(
     grouped_keys: set[tuple[str, str]],
 ) -> None:
     """Ensure every non-aggregated column reference in expr belongs to GROUP BY."""
-    if expr is None or isinstance(expr, (Literal, str, int, float, bool)):
-        return
-    if isinstance(expr, Identifier):
-        ref, col_def = resolve_identifier(expr, sources)
-        if (ref, col_def.name) not in grouped_keys:
-            raise ExecutionError(
-                f"Column '{expr.label}' must appear in GROUP BY clause or be used in an aggregate function"
-            )
+    if expr is None or isinstance(expr, (Literal, Identifier, str, int, float, bool)):
+        if isinstance(expr, Identifier):
+            ref, col_def = resolve_identifier(expr, sources)
+            if (ref, col_def.name) not in grouped_keys:
+                raise ExecutionError(
+                    f"Column '{expr.label}' must appear in GROUP BY clause or be used in an aggregate function"
+                )
         return
     if isinstance(expr, AggregateCall):
         _validate_aggregate_arg(expr, sources)
         return
-    if isinstance(expr, UnaryExpr):
-        _validate_grouped_expr(expr.expr, sources, grouped_keys)
-        return
-    if isinstance(expr, BinaryExpr):
-        _validate_grouped_expr(expr.left, sources, grouped_keys)
-        _validate_grouped_expr(expr.right, sources, grouped_keys)
-        return
-    raise ExecutionError(f"Cannot evaluate expression {expr}")
-
-
-def eval_expr(
-    expr: Any,
-    row_ctx: dict[str, dict[str, Any]] | None,
-    sources: list[SourceBinding],
-    aggregate_eval: Any | None = None,
-) -> Any:
-    """Evaluate an expression against a row context, optionally resolving aggregates."""
-    if isinstance(expr, Literal):
-        return expr.value
-    if expr is None or isinstance(expr, (str, int, float, bool)):
-        return expr
-    if isinstance(expr, AggregateCall):
-        if aggregate_eval is None:
-            raise ExecutionError(f"Aggregate function '{expr.func}' is not allowed in this context")
-        return aggregate_eval(expr)
-    if isinstance(expr, Identifier):
-        if row_ctx is None:
-            return None
-        ref, col_def = resolve_identifier(expr, sources)
-        return row_ctx[ref][col_def.name]
-    if isinstance(expr, UnaryExpr):
-        if expr.op.upper() != "NOT":
-            raise ExecutionError(f"Unsupported unary operator '{expr.op}'")
-        return sql_not(eval_expr(expr.expr, row_ctx, sources, aggregate_eval))
-    if isinstance(expr, BinaryExpr):
-        op = expr.op.upper()
-        left = eval_expr(expr.left, row_ctx, sources, aggregate_eval)
-        right = eval_expr(expr.right, row_ctx, sources, aggregate_eval)
-        if op == "AND":
-            return sql_and(left, right)
-        if op == "OR":
-            return sql_or(left, right)
-        return compare_values(op, left, right)
-    raise ExecutionError(f"Cannot evaluate expression {expr}")
-
-
-def eval_row_expr(expr: Any, row_ctx: dict[str, dict[str, Any]], sources: list[SourceBinding]) -> Any:
-    """Evaluate a non-aggregate expression against a single joined/table row context."""
-    return eval_expr(expr, row_ctx, sources)
+    ensure_known_expr(expr)
+    for child in iter_expr_children(expr):
+        _validate_grouped_expr(child, sources, grouped_keys)
 
 
 def _eval_aggregate(
@@ -389,3 +222,24 @@ def execute_select(
         collect_metrics=collect_metrics,
         **options,
     )
+
+
+__all__ = [
+    "COMPARISON_OPS",
+    "EXPRESSION_TYPES",
+    "SourceBinding",
+    "compare_values",
+    "contains_aggregate",
+    "eval_expr",
+    "eval_row_expr",
+    "execute_select",
+    "is_sql_true",
+    "iter_expr_children",
+    "resolve_identifier",
+    "sql_and",
+    "sql_not",
+    "sql_or",
+    "to_logic",
+    "validate_expr_columns",
+    "walk_expr",
+]

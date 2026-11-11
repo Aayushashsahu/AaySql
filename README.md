@@ -12,9 +12,11 @@ Every top-level SQL statement must begin with `AAYUSH`. Ordinary SQL without the
 
 ## Current Version
 
-**v0.8.0** — Client/server architecture: a dedicated server process owns one `Engine`, multiple clients connect over TCP with a versioned length-prefixed JSON protocol, each connection gets a server-generated session, and explicit transactions are owned by exactly one session at a time. Execution against the engine is serialized; a second client's statements receive a retryable `TRANSACTION_BUSY` instead of seeing uncommitted data. Token authentication, TLS with client-side certificate verification, a loopback-by-default bind, a process-level database lock, and a Python client (`AayushSQLClient`) ship with it. Full contract in [`SERVER_ARCHITECTURE.md`](SERVER_ARCHITECTURE.md).
+**v0.9.0** — SQL language expansion: a unified expression system with `IS NULL` / `IS NOT NULL`, `LIKE` / `NOT LIKE`, `IN` / `NOT IN`, `BETWEEN` / `NOT BETWEEN`, arithmetic (`+ - * / %`, unary `+`/`-`), searched and simple `CASE`, `SELECT DISTINCT`, and `OFFSET`. One precedence-climbing parser and one evaluator implement all of it, so every expression works in `SELECT`, `WHERE`, `JOIN ON`, `GROUP BY`/`HAVING`, `ORDER BY`, `UPDATE`, `DELETE`, `EXPLAIN`, the embedded engine, and the network client. Full grammar and semantics in [`LANGUAGE_SPEC.md`](LANGUAGE_SPEC.md).
 
-**Multiple connections, one writer.** v0.8.0 adds accessibility, not concurrency: there is no MVCC, no snapshot isolation, and no parallel query execution.
+v0.8.0 added the client/server architecture: one server process owns one `Engine`, and multiple clients connect over TCP with a versioned length-prefixed JSON protocol (see [`SERVER_ARCHITECTURE.md`](SERVER_ARCHITECTURE.md)).
+
+**Multiple connections, one writer.** The server adds accessibility, not concurrency: there is no MVCC, no snapshot isolation, and no parallel query execution.
 
 ## Why the `AAYUSH` Prefix Exists
 
@@ -30,7 +32,23 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 
 ## Implemented vs. Planned Features
 
-### Implemented (v0.8.0)
+### Implemented (v0.9.0)
+- **SQL expression language** (`src/aaysql/expressions.py`, `src/aaysql/parser.py`):
+  - One precedence-climbing parser for the whole expression grammar (`OR` < `AND` < `NOT` < comparisons/predicates < `+ -` < `* / %` < unary sign < primary), with parentheses overriding it. Numbers are lexed unsigned so subtraction and unary negation are unambiguous (`1-2` and `1 - 2` both mean minus).
+  - One canonical evaluator used by every execution path (reference/embedded and plan-driven), with a shared AST traversal (`iter_expr_children`/`walk_expr`) that all validation, aggregate detection, grouped-expression checks, predicate placement, and EXPLAIN rendering go through — a new node type cannot silently bypass a rule.
+  - `IS NULL` / `IS NOT NULL`: never `UNKNOWN`, and never implemented as an equality comparison.
+  - `LIKE` / `NOT LIKE`: `%` and `_`, case-sensitive, compiled from a fully escaped and anchored pattern (no user-supplied regular expressions), with a bounded pattern cache.
+  - `IN` / `NOT IN`: scalar membership with three-valued logic, including the `NULL`-in-list `UNKNOWN` case; empty lists and subqueries are rejected.
+  - `BETWEEN` / `NOT BETWEEN`: inclusive both ends, `UNKNOWN`-preserving, and index-assisted as a range scan when bounds are literals.
+  - Arithmetic `+ - * / %` and unary `+`/`-`: integer results stay integer, `/` is float, `%` follows Python floored semantics, `NULL` propagates, `BOOL`/`TEXT` operands, division/modulo by zero, and non-finite results are `ExecutionError`.
+  - `CASE`: searched and simple forms, evaluated in order with only `TRUE` matching, nested `CASE`, `CASE` inside aggregates, and `CASE` in `UPDATE` still passing column coercion and constraints.
+  - `SELECT DISTINCT`: whole-projected-row duplicate elimination after projection and before ordering, first-occurrence ordering preserved, `NULL`s equal, type-tagged keys, and `ORDER BY` required to reference the projected row.
+  - `OFFSET` (with or without `LIMIT`): applied after ordering and before limiting, with non-negative-integer validation.
+  - `TRUE` / `FALSE` literals and signed literals in `INSERT`/`DEFAULT`.
+- **Optimizer integration**: new expressions participate in predicate pushdown, grouped validation, hash-join eligibility (only `column = column` keys; everything else is a residual predicate), and `EXPLAIN`/`EXPLAIN ANALYZE` rendering (`DISTINCT`, `OFFSET`, computed projections, `CASE`/`LIKE`/`IN`/`BETWEEN` text). Selectivity is refined only where statistics exist; `LIKE`/`CASE`/arithmetic keep the honest default.
+- **Client/server**: the new syntax works through `AayushSQLClient` unchanged — the protocol stays version `1` because SQL is still a string, and integration tests compare every feature against the embedded engine over real sockets.
+- **Tests**: `tests/test_expressions.py` (parser, precedence, truth tables), `tests/test_language_queries.py` (planning, EXPLAIN, index equivalence, joins, persistence), `tests/test_expression_fuzz.py` (deterministic randomized differential testing against an independent reference interpreter), `tests/test_client_server_language.py` (real TCP).
+- **Benchmarks**: `benchmarks/benchmark_language.py` with recorded results in `BENCHMARKS.md`.
 - **Server** (`src/aaysql/server.py`, entry point `python -m aaysql.server`): owns exactly one `Engine`, one session per connection, all engine access serialized through a single coordinator lock, session-owned transactions with immediate retryable `TRANSACTION_BUSY` for other sessions, automatic rollback when a transaction owner disconnects, and `RECOVERY_REQUIRED` for every session after an ambiguous commit.
 - **Versioned network protocol** (`src/aaysql/protocol.py`, protocol version `1`): 4-byte big-endian length + UTF-8 JSON frames, 1 MiB default frame limit validated before allocation, `hello`/`ping`/`execute` operations, request IDs with duplicate detection, and stable error codes (`INVALID_REQUEST`, `UNSUPPORTED_PROTOCOL_VERSION`, `AUTHENTICATION_FAILED`, `SQL_PARSE_ERROR`, `SQL_EXECUTION_ERROR`, `CONSTRAINT_ERROR`, `TRANSACTION_BUSY`, `TRANSACTION_ERROR`, `REQUEST_TOO_LARGE`, `DATABASE_UNAVAILABLE`, `RECOVERY_REQUIRED`, `CONNECTION_TIMEOUT`, `INTERNAL_ERROR`, `TOO_MANY_CONNECTIONS`, `HELLO_REQUIRED`, `UNKNOWN_OPERATION`). Tracebacks are never sent to clients.
 - **Python client** (`src/aaysql/client.py`): `AayushSQLClient` with `connect`/`execute`/`ping`/`close`, context manager, optional token and TLS, configurable timeouts, a documented exception hierarchy, and **no automatic retries** — an interrupted request reports `outcome_unknown`.
@@ -46,7 +64,7 @@ Everything behind the parser — relational joins, column resolution, grouping, 
   - From-scratch B+ tree (`src/aaysql/btree.py`): ordered linked leaves with range traversal, internal separator nodes, node splitting, borrowing/merging on delete, duplicate keys, and structural invariant validation.
   - `CREATE INDEX idx ON table (column)` / `DROP INDEX idx` for single-column, non-unique indexes. Definitions persist in `.aaydb`; trees are rebuilt from table rows on open.
   - Indexes stay synchronized with `INSERT`, `UPDATE`, and `DELETE`, are removed by `DROP TABLE`, and never replace table rows as the source of truth.
-  - The cost-based planner matches an index to a `=`, `>`, `>=`, `<`, `<=` conjunct per source and then decides between `INDEX SCAN` and `TABLE SCAN` by estimated cost. Pushed predicates are re-checked on every candidate and candidate rows keep table order, so indexed and unindexed results are identical.
+  - The cost-based planner matches an index to a `=`, `>`, `>=`, `<`, `<=` conjunct per source (and, since v0.9.0, to `column BETWEEN literal AND literal` as one inclusive range) and then decides between `INDEX SCAN` and `TABLE SCAN` by estimated cost. Pushed predicates are re-checked on every candidate and candidate rows keep table order, so indexed and unindexed results are identical.
   - Reproducible benchmarks in `benchmarks/benchmark_index.py` and `benchmarks/benchmark_optimizer.py`, with recorded measurements in `BENCHMARKS.md`.
 - Query optimizer (v0.7.0):
   - Structured planning: a logical plan (bound sources, join order/type, predicate placement) is separate from the physical plan (`TABLE SCAN`, `INDEX SCAN`, `NESTED LOOP JOIN`, `HASH JOIN`, `FILTER`, `AGGREGATE`, `PROJECTION`, `SORT`, `LIMIT`). The executor runs the physical plan that was selected.
@@ -61,7 +79,7 @@ Everything behind the parser — relational joins, column resolution, grouping, 
   - `COUNT(*)`, `COUNT(column)`, `SUM(column)`, `AVG(column)`, `MIN(column)`, `MAX(column)`.
   - `GROUP BY` across one or more columns (including `NULL` grouping keys) with SQL grouping correctness validation.
   - `HAVING` group-level filtering after aggregation.
-- Query clauses: column selection, `SELECT *`, `AS` aliases, `WHERE`, comparison operators (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), boolean logic (`AND`, `OR`, `NOT`), parentheses, `ORDER BY ... [ASC|DESC]` (columns, aliases, or aggregates), `LIMIT`.
+- Query clauses: expression selection, `SELECT *`, `SELECT DISTINCT`, `AS` aliases, `WHERE`, comparison operators (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), predicates (`IS [NOT] NULL`, `[NOT] LIKE`, `[NOT] IN`, `[NOT] BETWEEN`), arithmetic (`+ - * / %`, unary `+`/`-`), `CASE WHEN ... THEN ... [ELSE ...] END`, boolean logic (`AND`, `OR`, `NOT`), parentheses, `ORDER BY ... [ASC|DESC]` (columns, aliases, aggregates, or expressions), `LIMIT n`, and `OFFSET m`.
 - SQL `NULL` semantics with full three-valued logic: comparisons against `NULL` yield `UNKNOWN`, `UNKNOWN` propagates through `AND`/`OR`/`NOT`, and `WHERE` / `JOIN ON` / `HAVING` / `UPDATE` / `DELETE` predicates accept a row only on `TRUE`.
 - Data types & constraints: `INT`/`INTEGER`, `TEXT`/`VARCHAR`, `FLOAT`/`DOUBLE`, `BOOL`/`BOOLEAN`; `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`.
 - Transactions (v0.5.0):
@@ -87,8 +105,82 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 - Automated GitHub Actions CI across Python 3.10–3.13.
 
 ### Planned (Future Roadmap)
-- **v0.8** — Client/server: network protocol, server binary, authentication, localhost-by-default binding.
-- **v0.9** — SQL language expansion: `IS NULL`, `LIKE`, `IN`, `BETWEEN`, `DISTINCT`, arithmetic expressions, `OFFSET`, `CASE`.
+- **v1.0** — Not started. Candidate work: subqueries/`UNION`, expression or multi-column indexes, aggregate `DISTINCT` and window functions, and a real concurrency story (the current model is single-writer).
+
+## Example SQL Expressions (v0.9.0)
+
+### `NULL` filtering
+
+```sql
+AAYUSH SELECT * FROM users WHERE email IS NOT NULL;
+```
+
+### Pattern matching
+
+```sql
+AAYUSH SELECT * FROM users WHERE name LIKE 'A%';
+AAYUSH SELECT * FROM users WHERE name NOT LIKE '%son';
+```
+
+### Membership
+
+```sql
+AAYUSH SELECT * FROM employees WHERE department IN ('Engineering', 'Research');
+AAYUSH SELECT * FROM employees WHERE department NOT IN ('Sales', 'HR');
+```
+
+### Range
+
+```sql
+AAYUSH SELECT * FROM employees WHERE salary BETWEEN 30000 AND 60000;
+```
+
+### Numeric expressions
+
+```sql
+AAYUSH SELECT name, salary * 1.10 AS revised_salary FROM employees;
+AAYUSH SELECT price * quantity AS total FROM order_items;
+AAYUSH UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+```
+
+### `CASE` classification
+
+```sql
+AAYUSH SELECT
+    name,
+    CASE
+        WHEN score >= 90 THEN 'A'
+        WHEN score >= 75 THEN 'B'
+        WHEN score >= 60 THEN 'C'
+        ELSE 'F'
+    END AS grade
+FROM students;
+```
+
+### `DISTINCT` and `OFFSET`
+
+```sql
+AAYUSH SELECT DISTINCT department
+FROM employees
+ORDER BY department
+LIMIT 10 OFFSET 20;
+```
+
+### Expressions compose with grouping and joins
+
+```sql
+AAYUSH SELECT
+    department,
+    COUNT(*) AS headcount,
+    SUM(CASE WHEN salary BETWEEN 50000 AND 90000 THEN salary ELSE 0 END) AS banded,
+    AVG(salary) * 1.1 AS projected
+FROM employees
+WHERE name IS NOT NULL AND name NOT LIKE '%test%'
+GROUP BY department
+HAVING COUNT(*) > 1
+ORDER BY headcount DESC, department
+LIMIT 5 OFFSET 0;
+```
 
 ## Example Relational Queries
 
@@ -299,7 +391,12 @@ GitHub Actions CI (`.github/workflows/tests.yml`) runs `python -m pytest -v` on 
 - Duplicate output labels in one `SELECT` list are rejected with `ExecutionError` (result rows are keyed by label), so distinct aliases are required.
 - `RIGHT JOIN`, `FULL JOIN`, `CROSS JOIN`, and qualified wildcards (`u.*`) are not supported.
 - `GROUP BY` supports simple column references (qualified or unqualified), not arbitrary expressions; nested aggregate functions (`SUM(COUNT(*))`) are not supported.
-- No subqueries, `UNION`, `IS NULL` syntax, arithmetic expressions, or `ALTER TABLE`.
+- No subqueries (including `IN (SELECT ...)`), `UNION`, `EXISTS`, `WITH`, window functions, `CAST`, `COALESCE`, string concatenation (`||`), `LIKE ... ESCAPE`, or `ALTER TABLE`. `IS TRUE` / `IS FALSE` / `IS DISTINCT FROM` are not implemented — only `IS NULL` and `IS NOT NULL`.
+- `LIKE` is case-sensitive and has no collation or escape clause. Patterns never execute as regular expressions.
+- Only comparisons against literals and `BETWEEN` between two literals can use an index. `IS NULL`, `LIKE`, `IN`, `NOT BETWEEN`, arithmetic, and `CASE` predicates always use a table scan; the planner does not rewrite an arbitrary expression into an indexed comparison.
+- Statistics refine selectivity only for single-column comparison, `IS NULL`, `IN`, and `BETWEEN` with literal bounds. `LIKE`, `CASE`, and arithmetic predicates use the documented conservative default; there are no histograms or pattern statistics.
+- Arithmetic accepts only `INT` and `FLOAT` (never `BOOL`/`TEXT`); division and modulo by zero raise `ExecutionError`, and non-finite results are refused rather than stored.
+- `DISTINCT` orders through the projected row only: with `DISTINCT`, `ORDER BY` expressions must be selected (alias, selected expression, or a selected column for `DISTINCT *`).
 - Single-writer execution: no nested transactions, savepoints, isolation levels, MVCC, snapshot isolation, or concurrent writes. The v0.8.0 server accepts many connections but serializes every statement behind one execution lock, and only one session may hold an explicit transaction at a time.
 - WAL durability guarantees target single-process crash recovery; directory `fsync` is executed where supported (POSIX). Windows cannot open directories through the CRT, so directory-entry durability relies on NTFS metadata behaviour; this fallback is selected by platform, not by swallowing errors. Genuine directory `fsync` failures (`EACCES`, `EIO`, `ENOSPC`, ...) are surfaced as `StorageError`. Hardware/firmware write-cache failures or OS filesystem corruption remain outside process-crash guarantees (see [`WAL.md`](WAL.md)).
 - Table and column names are case-sensitive at execution time.
