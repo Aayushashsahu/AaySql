@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aaysql"
-version = "1.0.0rc1"
+version = "1.0.0"
 description = "A custom SQL-compatible relational database requiring the AAYUSH prefix"
 readme = "README.md"
 requires-python = ">=3.10"
