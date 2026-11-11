@@ -220,13 +220,24 @@ def decode_message(payload: bytes) -> dict[str, Any]:
     return message
 
 
-def send_frame(sock: Any, message: dict[str, Any], max_frame_size: int) -> int:
-    """Encode and send one envelope. Returns the payload length."""
+def send_frame(
+    sock: Any,
+    message: dict[str, Any],
+    max_frame_size: int,
+    *,
+    too_large_code: str = RESPONSE_TOO_LARGE,
+) -> int:
+    """Encode and send one envelope. Returns the payload length.
+
+    ``too_large_code`` lets a client label its own oversized *request* correctly
+    (``REQUEST_TOO_LARGE``) instead of the server-side default.
+    """
     payload = encode_message(message)
     if len(payload) > max_frame_size:
+        kind = "request" if too_large_code == REQUEST_TOO_LARGE else "response"
         raise FrameError(
-            RESPONSE_TOO_LARGE,
-            f"response of {len(payload)} bytes exceeds the maximum of {max_frame_size} bytes",
+            too_large_code,
+            f"{kind} of {len(payload)} bytes exceeds the maximum of {max_frame_size} bytes",
         )
     sock.sendall(frame_bytes(payload))
     return len(payload)
