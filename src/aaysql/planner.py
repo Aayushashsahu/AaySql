@@ -28,14 +28,24 @@ from typing import Any
 
 from .ast import (
     AggregateCall,
+    Between,
     BinaryExpr,
+    Case,
     Identifier,
+    InList,
+    IsNull,
+    Like,
     Literal,
     Select,
     UnaryExpr,
 )
 from .errors import ExecutionError
-from .query import SourceBinding, resolve_identifier
+from .expressions import (
+    SourceBinding,
+    contains_aggregate,
+    resolve_identifier,
+    walk_expr,
+)
 from .statistics import TableStats
 from .storage import Database
 
@@ -50,9 +60,22 @@ _FLIPPED_OPS = {
 }
 _INDEX_OPS = {"=", "<", "<=", ">", ">="}
 
+# Mirrors the parser's precedence table so EXPLAIN renders expressions that
+# re-parse to the same tree.
 _PRECEDENCE = {"OR": 1, "AND": 2}
-_COMPARISON_PRECEDENCE = 3
-_NOT_PRECEDENCE = 4
+_NOT_PRECEDENCE = 3
+_COMPARISON_PRECEDENCE = 4
+_ADDITIVE_PRECEDENCE = 5
+_MULTIPLICATIVE_PRECEDENCE = 6
+_UNARY_ARITHMETIC_PRECEDENCE = 7
+_PRIMARY_PRECEDENCE = 8
+_ARITHMETIC_PRECEDENCE = {
+    "+": _ADDITIVE_PRECEDENCE,
+    "-": _ADDITIVE_PRECEDENCE,
+    "*": _MULTIPLICATIVE_PRECEDENCE,
+    "/": _MULTIPLICATIVE_PRECEDENCE,
+    "%": _MULTIPLICATIVE_PRECEDENCE,
+}
 
 # --- cost model constants -------------------------------------------------
 #
@@ -146,6 +169,8 @@ class LogicalPlan:
     has_group_by: bool
     has_order_by: bool
     limit: int | None
+    distinct: bool = False
+    offset: int | None = None
     predicates: dict[str, list[Any]] = field(default_factory=dict)
     on_predicates: dict[int, list[Any]] = field(default_factory=dict)
     projection_text: str | None = None
@@ -221,10 +246,16 @@ def _expr_precedence(expr: Any) -> int:
         op = expr.op.upper()
         if op in _PRECEDENCE:
             return _PRECEDENCE[op]
-        return _COMPARISON_PRECEDENCE
+        return _ARITHMETIC_PRECEDENCE.get(op, _COMPARISON_PRECEDENCE)
     if isinstance(expr, UnaryExpr):
-        return _NOT_PRECEDENCE
-    return _NOT_PRECEDENCE + 1
+        return _UNARY_ARITHMETIC_PRECEDENCE if expr.op.upper() in {"+", "-"} else _NOT_PRECEDENCE
+    if isinstance(expr, (IsNull, Like, InList, Between)):
+        return _COMPARISON_PRECEDENCE
+    return _PRIMARY_PRECEDENCE
+
+
+def _wrap(inner: str, precedence: int, minimum: int) -> str:
+    return f"({inner})" if precedence < minimum else inner
 
 
 def format_expr(expr: Any) -> str:
@@ -234,21 +265,49 @@ def format_expr(expr: Any) -> str:
     if isinstance(expr, Identifier):
         return expr.label
     if isinstance(expr, AggregateCall):
-        return expr.label
+        if isinstance(expr.arg, Identifier) and expr.arg.name == "*":
+            return f"{expr.func}(*)"
+        return f"{expr.func}({format_expr(expr.arg)})"
     if isinstance(expr, UnaryExpr):
-        inner = format_expr(expr.expr)
-        if _expr_precedence(expr.expr) < _NOT_PRECEDENCE:
-            inner = f"({inner})"
+        precedence = _expr_precedence(expr)
+        inner = _wrap(format_expr(expr.expr), _expr_precedence(expr.expr), precedence)
         return f"{expr.op.upper()} {inner}"
     if isinstance(expr, BinaryExpr):
         precedence = _expr_precedence(expr)
-        left = format_expr(expr.left)
-        right = format_expr(expr.right)
-        if _expr_precedence(expr.left) < precedence:
-            left = f"({left})"
-        if _expr_precedence(expr.right) < precedence:
-            right = f"({right})"
+        left = _wrap(format_expr(expr.left), _expr_precedence(expr.left), precedence)
+        right_precedence = precedence
+        if expr.op.upper() in {"-", "/", "%"}:
+            # Non-associative operators need their right operand parenthesized
+            # even at equal precedence: ``a - (b - c)`` is not ``a - b - c``.
+            right_precedence = precedence + 1
+        right = _wrap(format_expr(expr.right), _expr_precedence(expr.right), right_precedence)
         return f"{left} {expr.op.upper()} {right}"
+    if isinstance(expr, IsNull):
+        inner = _wrap(format_expr(expr.expr), _expr_precedence(expr.expr), _COMPARISON_PRECEDENCE)
+        return f"{inner} IS {'NOT ' if expr.negated else ''}NULL"
+    if isinstance(expr, Like):
+        inner = _wrap(format_expr(expr.expr), _expr_precedence(expr.expr), _COMPARISON_PRECEDENCE)
+        pattern = _wrap(format_expr(expr.pattern), _expr_precedence(expr.pattern), _COMPARISON_PRECEDENCE)
+        return f"{inner} {'NOT ' if expr.negated else ''}LIKE {pattern}"
+    if isinstance(expr, InList):
+        inner = _wrap(format_expr(expr.expr), _expr_precedence(expr.expr), _COMPARISON_PRECEDENCE)
+        items = ", ".join(format_expr(item) for item in expr.items)
+        return f"{inner} {'NOT ' if expr.negated else ''}IN ({items})"
+    if isinstance(expr, Between):
+        inner = _wrap(format_expr(expr.expr), _expr_precedence(expr.expr), _COMPARISON_PRECEDENCE)
+        low = _wrap(format_expr(expr.low), _expr_precedence(expr.low), _COMPARISON_PRECEDENCE)
+        high = _wrap(format_expr(expr.high), _expr_precedence(expr.high), _COMPARISON_PRECEDENCE)
+        return f"{inner} {'NOT ' if expr.negated else ''}BETWEEN {low} AND {high}"
+    if isinstance(expr, Case):
+        parts = ["CASE"]
+        if expr.base is not None:
+            parts.append(format_expr(expr.base))
+        for when in expr.whens:
+            parts.append(f"WHEN {format_expr(when.condition)} THEN {format_expr(when.result)}")
+        if expr.else_expr is not None:
+            parts.append(f"ELSE {format_expr(expr.else_expr)}")
+        parts.append("END")
+        return " ".join(parts)
     if expr is None:
         return "NULL"
     return str(expr)
@@ -261,25 +320,14 @@ def _expr_sources(expr: Any, sources: list[SourceBinding]) -> set[str]:
     canonical error message for an invalid column reference.
     """
     refs: set[str] = set()
-
-    def visit(node: Any) -> None:
-        if isinstance(node, Identifier):
-            if node.name == "*":
-                return
-            try:
-                ref, _ = resolve_identifier(node, sources)
-            except ExecutionError:
-                return
-            refs.add(ref)
-            return
-        if isinstance(node, UnaryExpr):
-            visit(node.expr)
-            return
-        if isinstance(node, BinaryExpr):
-            visit(node.left)
-            visit(node.right)
-
-    visit(expr)
+    for node in walk_expr(expr):
+        if not isinstance(node, Identifier) or node.name == "*":
+            continue
+        try:
+            ref, _ = resolve_identifier(node, sources)
+        except ExecutionError:
+            continue
+        refs.add(ref)
     return refs
 
 
@@ -332,7 +380,26 @@ def _predicate_selectivity(
     stats: TableStats | None,
     sources: list[SourceBinding],
 ) -> float:
-    """A labelled estimate of the fraction of rows a predicate keeps."""
+    """A labelled estimate of the fraction of rows a predicate keeps.
+
+    Only shapes the statistics actually describe get a refined estimate: a
+    single-column comparison / ``IS NULL`` / ``IN`` / ``BETWEEN`` against literal
+    values. Everything else (LIKE patterns, CASE conditions, arithmetic on
+    columns) keeps the conservative default, because no statistics exist for
+    them and inventing precision would be dishonest.
+    """
+    if isinstance(predicate, UnaryExpr):
+        return DEFAULT_SELECTIVITY
+    if isinstance(predicate, BinaryExpr) and predicate.op.upper() in {"AND", "OR"}:
+        return DEFAULT_SELECTIVITY
+    if isinstance(predicate, Like):
+        return DEFAULT_SELECTIVITY
+    if isinstance(predicate, Between):
+        return _between_selectivity(predicate, stats, sources)
+    if isinstance(predicate, InList):
+        return _in_list_selectivity(predicate, stats, sources)
+    if isinstance(predicate, IsNull):
+        return _is_null_selectivity(predicate, stats, sources)
     if not isinstance(predicate, BinaryExpr):
         return DEFAULT_SELECTIVITY
     op = predicate.op.upper()
@@ -373,6 +440,76 @@ def _predicate_selectivity(
     return fraction
 
 
+def _single_column_of(expr: Any, sources: list[SourceBinding]) -> str | None:
+    """Return the column name when ``expr`` is exactly one column of one source."""
+    if not isinstance(expr, Identifier) or expr.name == "*":
+        return None
+    if len(_expr_sources(expr, sources)) != 1:
+        return None
+    try:
+        _, col_def = resolve_identifier(expr, sources)
+    except ExecutionError:
+        return None
+    return col_def.name
+
+
+def _is_null_selectivity(
+    predicate: IsNull,
+    stats: TableStats | None,
+    sources: list[SourceBinding],
+) -> float:
+    column_name = _single_column_of(predicate.expr, sources)
+    if column_name is None or stats is None:
+        return DEFAULT_SELECTIVITY
+    column_stats = stats.column(column_name)
+    if column_stats is None or stats.row_count <= 0:
+        return DEFAULT_SELECTIVITY
+    fraction = getattr(column_stats, "null_count", 0) / stats.row_count
+    return min(1.0, max(0.0, fraction if not predicate.negated else 1.0 - fraction))
+
+
+def _between_selectivity(
+    predicate: Between,
+    stats: TableStats | None,
+    sources: list[SourceBinding],
+) -> float:
+    if predicate.negated:
+        return DEFAULT_SELECTIVITY
+    column_name = _single_column_of(predicate.expr, sources)
+    if column_name is None or stats is None:
+        return DEFAULT_SELECTIVITY
+    low_ok, low = _literal_value(predicate.low)
+    high_ok, high = _literal_value(predicate.high)
+    if not (low_ok and high_ok) or low is None or high is None:
+        return DEFAULT_SELECTIVITY
+    column_stats = stats.column(column_name)
+    lower = _range_fraction(column_stats, ">=", low)
+    upper = _range_fraction(column_stats, "<=", high)
+    if lower is None or upper is None:
+        return DEFAULT_SELECTIVITY
+    return min(1.0, max(0.0, lower + upper - 1.0))
+
+
+def _in_list_selectivity(
+    predicate: InList,
+    stats: TableStats | None,
+    sources: list[SourceBinding],
+) -> float:
+    column_name = _single_column_of(predicate.expr, sources)
+    if column_name is None or stats is None:
+        return DEFAULT_SELECTIVITY
+    if not all(isinstance(item, Literal) for item in predicate.items):
+        return DEFAULT_SELECTIVITY
+    if any(item.value is None for item in predicate.items):
+        # A NULL member can make the result UNKNOWN, never TRUE for that row;
+        # the non-NULL members still select rows, so stay conservative.
+        return DEFAULT_SELECTIVITY
+    column_stats = stats.column(column_name)
+    distinct = max(getattr(column_stats, "distinct", 0), 1)
+    fraction = len({repr((type(i.value).__name__, i.value)) for i in predicate.items}) / distinct
+    return min(1.0, max(0.0, fraction))
+
+
 # --- index matching -------------------------------------------------------
 
 
@@ -403,7 +540,14 @@ def match_indexed_predicate(
     ref: str,
     predicate: Any,
 ) -> IndexMatch | None:
-    """Match ``column <op> literal`` against an existing single-column index."""
+    """Match ``column <op> literal`` or ``column BETWEEN literal AND literal``.
+
+    Only shapes that are provably equivalent to a contiguous B+ tree range are
+    matched; everything else (``IS NULL``, ``LIKE``, arithmetic, ``NOT BETWEEN``)
+    keeps a table scan.
+    """
+    if isinstance(predicate, Between):
+        return _match_between(db, table_name, ref, predicate)
     if not isinstance(predicate, BinaryExpr):
         return None
     op = predicate.op.upper()
@@ -449,6 +593,46 @@ def match_indexed_predicate(
     return match
 
 
+def _match_between(
+    db: Database,
+    table_name: str,
+    ref: str,
+    predicate: Between,
+) -> IndexMatch | None:
+    """``col BETWEEN low AND high`` over an index is one inclusive range."""
+    if predicate.negated:
+        return None
+    column = _identifier_for(predicate.expr, ref)
+    low_ok, low = _literal_value(predicate.low)
+    high_ok, high = _literal_value(predicate.high)
+    if column is None or not (low_ok and high_ok):
+        return None
+    if low is None or high is None:
+        # A NULL bound makes the predicate UNKNOWN for every row: never an index
+        # range, and never TRUE.
+        return None
+
+    table = db.table(table_name)
+    column_def = next((col for col in table.columns if col.name == column.name), None)
+    if column_def is None:
+        return None
+    if not (
+        _literal_matches_column_type(low, column_def.type_name)
+        and _literal_matches_column_type(high, column_def.type_name)
+    ):
+        return None
+    candidates = _indexed_candidates(db, table_name, column.name)
+    if not candidates:
+        return None
+    return IndexMatch(
+        index_name=candidates[0],
+        column=column.name,
+        predicate=predicate,
+        start=low,
+        end=high,
+    )
+
+
 def _estimate_index_candidates(
     stats: TableStats,
     index_column: str,
@@ -459,9 +643,15 @@ def _estimate_index_candidates(
     non_null = stats.row_count - getattr(column_stats, "null_count", 0)
     if non_null <= 0:
         return 0.0
-    if match.start is not None and match.end is not None and match.start == match.end:
-        distinct = max(getattr(column_stats, "distinct", 0), 1)
-        return max(1.0, non_null / distinct)
+    if match.start is not None and match.end is not None:
+        if match.start == match.end:
+            distinct = max(getattr(column_stats, "distinct", 0), 1)
+            return max(1.0, non_null / distinct)
+        lower = _range_fraction(column_stats, ">=" if match.start_inclusive else ">", match.start)
+        upper = _range_fraction(column_stats, "<=" if match.end_inclusive else "<", match.end)
+        if lower is None or upper is None:
+            return max(1.0, non_null / 3.0)
+        return max(0.0, non_null * max(0.0, lower + upper - 1.0))
     if match.start is not None and match.end is None:
         fraction = _range_fraction(column_stats, ">=" if match.start_inclusive else ">", match.start)
     elif match.end is not None and match.start is None:
@@ -493,10 +683,21 @@ def _projection_text(stmt: Select) -> str:
         return "*"
     labels = []
     for index, item in enumerate(stmt.columns):
-        label = item.alias
-        if not label:
-            expr = item.expr
-            label = expr.label if hasattr(expr, "label") else f"expr_{index + 1}"
+        expr = item.expr
+        computed = not isinstance(expr, (Identifier, AggregateCall))
+        if not item.alias:
+            if isinstance(expr, Identifier):
+                label = expr.label
+            elif isinstance(expr, AggregateCall):
+                label = format_expr(expr)
+            else:
+                label = f"expr_{index + 1}: {format_expr(expr)}"
+        elif computed:
+            # Keep the computed expression visible beside its alias, otherwise
+            # EXPLAIN would hide the whole arithmetic / CASE expression.
+            label = f"{item.alias}: {format_expr(expr)}"
+        else:
+            label = item.alias
         labels.append(label)
     return ", ".join(labels)
 
@@ -562,7 +763,7 @@ def build_logical_plan(stmt: Select, sources: list[SourceBinding]) -> LogicalPla
 
     has_group_by = bool(stmt.group_by)
     is_grouped = has_group_by or stmt.having is not None or any(
-        _contains_aggregate(item.expr) for item in stmt.columns
+        contains_aggregate(item.expr) for item in stmt.columns
     )
     group_text = None
     if has_group_by:
@@ -580,22 +781,14 @@ def build_logical_plan(stmt: Select, sources: list[SourceBinding]) -> LogicalPla
         has_group_by=has_group_by,
         has_order_by=bool(stmt.order_by),
         limit=stmt.limit,
+        distinct=stmt.distinct,
+        offset=stmt.offset,
         on_predicates=on_predicates,
         projection_text=_projection_text(stmt),
         sort_text=_sort_text(stmt),
         group_text=group_text,
         nullable_refs=nullable_refs,
     )
-
-
-def _contains_aggregate(expr: Any) -> bool:
-    if isinstance(expr, AggregateCall):
-        return True
-    if isinstance(expr, UnaryExpr):
-        return _contains_aggregate(expr.expr)
-    if isinstance(expr, BinaryExpr):
-        return _contains_aggregate(expr.left) or _contains_aggregate(expr.right)
-    return False
 
 
 # --- physical planning ----------------------------------------------------
@@ -881,14 +1074,30 @@ def physical_plan(
             detail=logical.group_text,
         )
 
+    # A pure column projection over one table stays elided; a computed
+    # projection (arithmetic, CASE, a predicate value) is a real operator the
+    # plan must show, so its expression text is readable in EXPLAIN.
+    trivial_projection = all(
+        isinstance(item.expr, Identifier) for item in logical.stmt.columns
+    )
     root = PlanNode(
         op="PROJECTION",
         children=[root],
         estimated_rows=root.estimated_rows,
         estimated_cost=root.estimated_cost + root.estimated_rows,
         detail=logical.projection_text,
-        elided=not logical.joins and not logical.is_grouped,
+        elided=not logical.joins and not logical.is_grouped and trivial_projection,
     )
+
+    if logical.distinct:
+        rows = root.estimated_rows
+        root = PlanNode(
+            op="DISTINCT",
+            children=[root],
+            estimated_rows=rows,
+            estimated_cost=root.estimated_cost + rows,
+            detail=logical.projection_text,
+        )
 
     if logical.has_order_by:
         rows = root.estimated_rows
@@ -898,6 +1107,16 @@ def physical_plan(
             estimated_rows=rows,
             estimated_cost=root.estimated_cost + rows * math.log2(rows + 1.0) * COST_HASH_MATCH * 2,
             detail=logical.sort_text,
+        )
+
+    if logical.offset:
+        rows = max(0.0, root.estimated_rows - float(logical.offset))
+        root = PlanNode(
+            op="OFFSET",
+            children=[root],
+            estimated_rows=rows,
+            estimated_cost=root.estimated_cost + float(logical.offset),
+            detail=str(logical.offset),
         )
 
     if logical.limit is not None:
@@ -1041,6 +1260,12 @@ def _render_node(node: PlanNode, depth: int) -> list[str]:
         lines.append(f"{indent}PROJECTION: {node.detail}")
     elif node.op == "SORT":
         lines.append(f"{indent}SORT: {node.detail}")
+        lines.append(f"{indent}  ESTIMATED ROWS: ~{node.estimated_rows:.0f}")
+    elif node.op == "DISTINCT":
+        lines.append(f"{indent}DISTINCT: {node.detail or 'all selected columns'}")
+        lines.append(f"{indent}  ESTIMATED ROWS: ~{node.estimated_rows:.0f} (upper bound)")
+    elif node.op == "OFFSET":
+        lines.append(f"{indent}OFFSET: {node.detail}")
         lines.append(f"{indent}  ESTIMATED ROWS: ~{node.estimated_rows:.0f}")
     elif node.op == "LIMIT":
         lines.append(f"{indent}LIMIT: {node.detail}")

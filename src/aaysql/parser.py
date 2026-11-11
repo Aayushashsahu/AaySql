@@ -18,7 +18,10 @@ _CLAUSE_KEYWORDS = {
     "HAVING",
     "ORDER",
     "LIMIT",
+    "OFFSET",
 }
+_COMPARISON_OPS = {TokenType.EQ, TokenType.NE, TokenType.LT, TokenType.LE, TokenType.GT, TokenType.GE}
+_PREDICATE_KEYWORDS = {"IN", "BETWEEN", "LIKE"}
 
 
 class Parser:
@@ -212,16 +215,7 @@ class Parser:
         return None
 
     def parse_order_item(self):
-        tok = self.current()
-        if tok.type == TokenType.IDENT and self.peek(1).type == TokenType.LPAREN:
-            expr = self.parse_aggregate()
-        elif tok.type == TokenType.IDENT and not self.keyword("NULL"):
-            expr = self.parse_qualified_ident()
-        else:
-            got = tok.value if tok.value is not None else tok.type.name
-            raise ParserError(
-                f"Expected column or aggregate in ORDER BY, got {got!r} at position {tok.position}"
-            )
+        expr = self.parse_expr()
         desc = False
         if self.keyword("ASC"):
             self.advance()
@@ -230,8 +224,32 @@ class Parser:
             desc = True
         return expr, desc
 
+    def _parse_nonnegative_int(self, label: str) -> int:
+        tok = self.current()
+        if (
+            tok.type in {TokenType.PLUS, TokenType.MINUS}
+            and self.peek(1).type == TokenType.NUMBER
+        ) or tok.type != TokenType.NUMBER:
+            raise ParserError(
+                f"{label} must be a non-negative integer at position {tok.position}"
+            )
+        self.advance()
+        if not isinstance(tok.value, int) or tok.value < 0:
+            raise ParserError(
+                f"{label} must be a non-negative integer at position {tok.position}"
+            )
+        return tok.value
+
     def parse_select(self):
         self.expect_kw("SELECT")
+        distinct = False
+        if self.keyword("DISTINCT"):
+            self.advance()
+            distinct = True
+            if self.keyword("DISTINCT"):
+                raise ParserError(
+                    f"Duplicate DISTINCT keyword at position {self.current().position}"
+                )
         items = []
         if self.match(TokenType.STAR):
             self.advance(); items.append(SelectItem(Identifier("*")))
@@ -287,9 +305,12 @@ class Parser:
                 order_by.append(self.parse_order_item())
         limit = None
         if self.keyword("LIMIT"):
-            self.advance(); tok = self.expect(TokenType.NUMBER)
-            if not isinstance(tok.value, int) or tok.value < 0: raise ParserError("LIMIT must be a non-negative integer")
-            limit = tok.value
+            self.advance()
+            limit = self._parse_nonnegative_int("LIMIT")
+        offset = None
+        if self.keyword("OFFSET"):
+            self.advance()
+            offset = self._parse_nonnegative_int("OFFSET")
         return Select(
             columns=items,
             table=table,
@@ -300,10 +321,12 @@ class Parser:
             joins=joins,
             group_by=group_by,
             having=having,
+            distinct=distinct,
+            offset=offset,
         )
 
     def parse_select_item(self):
-        expr = self.parse_primary()
+        expr = self.parse_expr()
         alias = None
         if self.keyword("AS"):
             self.advance(); alias = self.ident()
@@ -331,12 +354,12 @@ class Parser:
             raise ParserError(f"Unexpected '=' at position {tok.position}")
         if self.keyword("WHERE"):
             raise ParserError(f"Expected assignment value, got 'WHERE' at position {tok.position}")
-        if tok.type in {TokenType.STRING, TokenType.NUMBER} or self.keyword("NULL"):
-            return self.parse_literal().value
-        if tok.type == TokenType.IDENT or self.match(TokenType.LPAREN):
-            return self.parse_primary()
-        got = tok.value if tok.value is not None else tok.type.name
-        raise ParserError(f"Expected assignment value, got {got!r} at position {tok.position}")
+        if self.keyword("SET"):
+            raise ParserError(f"Expected assignment value, got 'SET' at position {tok.position}")
+        if tok.type in {TokenType.RPAREN, TokenType.COMMA, TokenType.EOF, TokenType.SEMICOLON}:
+            got = tok.value if tok.value is not None else tok.type.name
+            raise ParserError(f"Expected assignment value, got {got!r} at position {tok.position}")
+        return self.parse_expr()
 
     def parse_delete(self):
         self.expect_kw("DELETE"); self.expect_kw("FROM"); table = self.ident()
@@ -345,44 +368,216 @@ class Parser:
             self.advance(); where = self.parse_expr()
         return Delete(table, where)
 
+    # --- expressions ------------------------------------------------------
+    #
+    # Precedence, lowest to highest:
+    #   1  OR
+    #   2  AND
+    #   3  NOT                       (prefix)
+    #   4  = != <> < <= > >=         IS [NOT] NULL   [NOT] IN   [NOT] BETWEEN
+    #      [NOT] LIKE
+    #   5  + -
+    #   6  * / %
+    #   7  unary + -                 (prefix, right associative)
+    #   8  primary: literal, identifier, aggregate, CASE, ( expr )
+    #
+    # Postfix predicates (``IS NULL``, ``IN``, ``LIKE``, ``BETWEEN``) bind tighter
+    # than ``NOT`` and exactly as tightly as a comparison. ``BETWEEN`` consumes
+    # its own ``AND`` by parsing both bounds above the ``AND`` precedence level,
+    # so ``a BETWEEN 1 AND 5 AND b = 2`` keeps the two conditions separate.
+
     def parse_expr(self):
         return self.parse_or()
 
     def parse_or(self):
         left = self.parse_and()
         while self.keyword("OR"):
-            self.advance(); left = BinaryExpr(left, "OR", self.parse_and())
+            self.advance()
+            left = BinaryExpr(left, "OR", self.parse_and())
         return left
 
     def parse_and(self):
         left = self.parse_not()
         while self.keyword("AND"):
-            self.advance(); left = BinaryExpr(left, "AND", self.parse_not())
+            self.advance()
+            left = BinaryExpr(left, "AND", self.parse_not())
         return left
 
     def parse_not(self):
         if self.keyword("NOT"):
-            self.advance(); return UnaryExpr("NOT", self.parse_not())
+            self.advance()
+            return UnaryExpr("NOT", self.parse_not())
         return self.parse_comparison()
 
     def parse_comparison(self):
-        left = self.parse_primary()
-        if self.current().type in {TokenType.EQ, TokenType.NE, TokenType.LT, TokenType.LE, TokenType.GT, TokenType.GE}:
+        left = self.parse_additive()
+        if self.current().type in _COMPARISON_OPS:
             op = str(self.advance().value)
-            return BinaryExpr(left, op, self.parse_primary())
+            return BinaryExpr(left, op, self.parse_additive())
+
+        if self.keyword("IS"):
+            pos = self.current().position
+            self.advance()
+            negated = False
+            if self.keyword("NOT"):
+                self.advance()
+                negated = True
+            if not self.keyword("NULL"):
+                got = self.current().value if self.current().value is not None else self.current().type.name
+                raise ParserError(
+                    f"Expected NULL after IS at position {pos}, got {got!r}; "
+                    f"only IS NULL and IS NOT NULL are supported"
+                )
+            self.advance()
+            return IsNull(left, negated)
+
+        negated = False
+        if self.keyword("NOT") and self._next_is_predicate():
+            self.advance()
+            negated = True
+
+        if self.keyword("IN"):
+            self.advance()
+            return InList(left, tuple(self._parse_in_list()), negated)
+        if self.keyword("LIKE"):
+            pos = self.current().position
+            self.advance()
+            if self._at_expression_end():
+                raise ParserError(f"Expected a pattern after LIKE at position {pos}")
+            return Like(left, self.parse_additive(), negated)
+        if self.keyword("BETWEEN"):
+            self.advance()
+            low = self.parse_additive()
+            if not self.keyword("AND"):
+                got = self.current().value if self.current().value is not None else self.current().type.name
+                raise ParserError(
+                    f"Expected AND in BETWEEN ... AND ... at position {self.current().position}, got {got!r}"
+                )
+            self.advance()
+            high = self.parse_additive()
+            return Between(left, low, high, negated)
+        if negated:  # pragma: no cover - guarded by _next_is_predicate
+            raise ParserError("NOT must be followed by IN, BETWEEN, or LIKE here")
         return left
+
+    def _next_is_predicate(self) -> bool:
+        nxt = self.peek(1)
+        return nxt.type == TokenType.IDENT and str(nxt.value).upper() in _PREDICATE_KEYWORDS
+
+    def _at_expression_end(self) -> bool:
+        tok = self.current()
+        if tok.type in {TokenType.EOF, TokenType.RPAREN, TokenType.COMMA, TokenType.SEMICOLON}:
+            return True
+        return tok.type == TokenType.IDENT and str(tok.value).upper() in {
+            "FROM",
+            "WHERE",
+            "GROUP",
+            "HAVING",
+            "ORDER",
+            "LIMIT",
+            "OFFSET",
+            "THEN",
+            "ELSE",
+            "END",
+            "WHEN",
+        }
+
+    def _parse_in_list(self) -> list:
+        pos = self.current().position
+        self.expect(TokenType.LPAREN)
+        if self.keyword("SELECT"):
+            raise ParserError(
+                f"Subqueries inside IN are not supported at position {pos}"
+            )
+        if self.match(TokenType.RPAREN):
+            raise ParserError(f"IN list must not be empty at position {pos}")
+        items = [self.parse_expr()]
+        while self.match(TokenType.COMMA):
+            self.advance()
+            items.append(self.parse_expr())
+        self.expect(TokenType.RPAREN)
+        return items
+
+    def parse_additive(self):
+        left = self.parse_multiplicative()
+        while self.current().type in {TokenType.PLUS, TokenType.MINUS}:
+            op = str(self.advance().value)
+            left = BinaryExpr(left, op, self.parse_multiplicative())
+        return left
+
+    def parse_multiplicative(self):
+        left = self.parse_unary()
+        while self.current().type in {TokenType.STAR, TokenType.SLASH, TokenType.PERCENT}:
+            op = str(self.advance().value)
+            left = BinaryExpr(left, op, self.parse_unary())
+        return left
+
+    def parse_unary(self):
+        if self.current().type in {TokenType.PLUS, TokenType.MINUS}:
+            op = str(self.advance().value)
+            operand = self.parse_unary()
+            # Fold a sign into a numeric literal so ``-5`` stays a single
+            # literal (INSERT VALUES, DEFAULT, and plan rendering rely on it).
+            if (
+                op == "-"
+                and isinstance(operand, Literal)
+                and isinstance(operand.value, (int, float))
+                and not isinstance(operand.value, bool)
+            ):
+                return Literal(-operand.value)
+            if (
+                op == "+"
+                and isinstance(operand, Literal)
+                and isinstance(operand.value, (int, float))
+                and not isinstance(operand.value, bool)
+            ):
+                return Literal(operand.value)
+            return UnaryExpr(op, operand)
+        return self.parse_primary()
 
     def parse_primary(self):
         if self.match(TokenType.LPAREN):
             self.advance(); expr = self.parse_expr(); self.expect(TokenType.RPAREN); return expr
+        if self.keyword("CASE"):
+            return self.parse_case()
         tok = self.current()
         if tok.type == TokenType.IDENT:
             if self.peek(1).type == TokenType.LPAREN:
                 return self.parse_aggregate()
             if self.keyword("NULL"):
                 return self.parse_literal()
+            if self.keyword("TRUE") or self.keyword("FALSE"):
+                self.advance()
+                return Literal(str(tok.value).upper() == "TRUE")
             return self.parse_qualified_ident()
         return self.parse_literal()
+
+    def parse_case(self) -> Case:
+        pos = self.current().position
+        self.expect_kw("CASE")
+        base = None
+        if not self.keyword("WHEN"):
+            base = self.parse_expr()
+        whens: list[CaseWhen] = []
+        while self.keyword("WHEN"):
+            self.advance()
+            condition = self.parse_expr()
+            if not self.keyword("THEN"):
+                raise ParserError(
+                    f"Expected THEN in CASE expression at position {self.current().position}"
+                )
+            self.advance()
+            whens.append(CaseWhen(condition, self.parse_expr()))
+        if not whens:
+            raise ParserError(f"CASE requires at least one WHEN branch (at position {pos})")
+        else_expr = None
+        if self.keyword("ELSE"):
+            self.advance()
+            else_expr = self.parse_expr()
+        if not self.keyword("END"):
+            raise ParserError(f"Expected END to close CASE expression at position {pos}")
+        self.advance()
+        return Case(base, tuple(whens), else_expr)
 
     def parse_qualified_ident(self) -> Identifier:
         first = self.ident()
@@ -409,6 +604,10 @@ class Parser:
             raise ParserError(
                 f"{func_name}(*) is not supported at position {self.current().position}; only COUNT(*) accepts '*'"
             )
+        elif self.match(TokenType.RPAREN):
+            raise ParserError(
+                f"{func_name}() requires an argument at position {self.current().position}"
+            )
         else:
             arg = self.parse_expr()
         self.expect(TokenType.RPAREN)
@@ -416,9 +615,16 @@ class Parser:
 
     def parse_literal(self):
         tok = self.current()
+        if tok.type in {TokenType.PLUS, TokenType.MINUS} and self.peek(1).type == TokenType.NUMBER:
+            sign = -1 if tok.type == TokenType.MINUS else 1
+            self.advance()
+            number = self.advance()
+            return Literal(sign * number.value)
         if tok.type in {TokenType.STRING, TokenType.NUMBER}:
             self.advance(); return Literal(tok.value)
         if self.keyword("NULL"):
             self.advance(); return Literal(None)
+        if self.keyword("TRUE") or self.keyword("FALSE"):
+            self.advance(); return Literal(str(tok.value).upper() == "TRUE")
         got = tok.value if tok.value is not None else tok.type.name
         raise ParserError(f"Expected literal, got {got!r} at position {tok.position}")

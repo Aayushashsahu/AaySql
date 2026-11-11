@@ -57,6 +57,59 @@ class BinaryExpr:
 
 
 @dataclass(frozen=True)
+class IsNull:
+    """``expr IS NULL`` / ``expr IS NOT NULL``: never evaluates to UNKNOWN."""
+
+    expr: Any
+    negated: bool = False
+
+
+@dataclass(frozen=True)
+class Like:
+    """``expr LIKE pattern`` / ``expr NOT LIKE pattern`` (``%`` and ``_``)."""
+
+    expr: Any
+    pattern: Any
+    negated: bool = False
+
+
+@dataclass(frozen=True)
+class InList:
+    """``expr IN (a, b, ...)`` / ``expr NOT IN (...)`` using SQL equality."""
+
+    expr: Any
+    items: tuple[Any, ...]
+    negated: bool = False
+
+
+@dataclass(frozen=True)
+class Between:
+    """``expr BETWEEN low AND high`` (inclusive at both ends)."""
+
+    expr: Any
+    low: Any
+    high: Any
+    negated: bool = False
+
+
+@dataclass(frozen=True)
+class CaseWhen:
+    """One ``WHEN <condition> THEN <result>`` branch of a CASE expression."""
+
+    condition: Any
+    result: Any
+
+
+@dataclass(frozen=True)
+class Case:
+    """A searched (``base is None``) or simple CASE expression."""
+
+    base: Any
+    whens: tuple[CaseWhen, ...]
+    else_expr: Any = None
+
+
+@dataclass(frozen=True)
 class SelectItem:
     expr: Any
     alias: str | None = None
@@ -99,6 +152,8 @@ class Select:
     joins: list[JoinClause] = field(default_factory=list)
     group_by: list[Identifier] | None = None
     having: Any | None = None
+    distinct: bool = False
+    offset: int | None = None
 
 
 @dataclass(frozen=True)

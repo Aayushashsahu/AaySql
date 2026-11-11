@@ -36,8 +36,49 @@ from .query import (
 )
 from .storage import Database
 
-_WRAPPER_OPS = ("FILTER", "AGGREGATE", "PROJECTION", "SORT", "LIMIT")
+_WRAPPER_OPS = ("FILTER", "AGGREGATE", "PROJECTION", "DISTINCT", "SORT", "OFFSET", "LIMIT")
 _SCAN_OPS = ("TABLE SCAN", "INDEX SCAN")
+
+
+def _distinct_key(values: list[Any]) -> tuple[Any, ...]:
+    """Canonical duplicate-elimination key: NULLs are equal, types stay apart.
+
+    Tagging each value with its Python type keeps ``True`` distinct from ``1`` and
+    ``1`` distinct from ``1.0``, which SQL column semantics also keep apart, while
+    ``("NULL",)`` makes every NULL duplicate the same.
+    """
+    return tuple(
+        ("NULL",) if value is None else (type(value).__name__, value)
+        for value in values
+    )
+
+
+def _distinct_order_target(
+    stmt: Select,
+    order_expr: Any,
+    sources: list[SourceBinding],
+    cols: list[str],
+    alias_counts: dict[str, int],
+    is_wildcard: bool,
+) -> str:
+    """Resolve which projected column a DISTINCT ORDER BY key sorts by.
+
+    Duplicate elimination happens on the projected row, so ordering must refer to
+    that same row. An ORDER BY key is therefore required to be a unique SELECT
+    alias, a selected expression, or (for ``SELECT DISTINCT *``) a selected column.
+    """
+    if isinstance(order_expr, Identifier):
+        if order_expr.qualifier is None and alias_counts.get(order_expr.name) == 1:
+            return order_expr.name
+        if is_wildcard:
+            ref, col_def = resolve_identifier(order_expr, sources)
+            return f"{ref}.{col_def.name}" if stmt.joins else col_def.name
+    for index, item in enumerate(stmt.columns):
+        if item.expr == order_expr:
+            return cols[index]
+    raise ExecutionError(
+        "For SELECT DISTINCT, ORDER BY expressions must appear in the select list"
+    )
 
 
 def _source_for(ref: str, sources: list[SourceBinding]) -> SourceBinding:
@@ -306,6 +347,16 @@ def _validation_and_bindings(db: Database, stmt: Select) -> tuple[list[SourceBin
             for i, item in enumerate(stmt.columns)
         ]
     _validate_output_labels(cols)
+    if stmt.distinct and stmt.order_by:
+        for raw_expr, _ in stmt.order_by:
+            _distinct_order_target(
+                stmt,
+                _normalize_order_expr(raw_expr),
+                sources,
+                cols,
+                explicit_alias_counts,
+                is_wildcard,
+            )
     return sources, cols, is_grouped_query
 
 
@@ -439,6 +490,32 @@ def execute_select(
         if item.alias:
             explicit_alias_counts[item.alias] = explicit_alias_counts.get(item.alias, 0) + 1
 
+    # DISTINCT removes duplicate projected rows after projection and before
+    # ORDER BY, keeping the first occurrence so unordered output stays stable.
+    if stmt.distinct:
+        rows_before_distinct = len(records)
+        seen: set[tuple[Any, ...]] = set()
+        kept: list[tuple[dict[str, Any], Any, Any]] = []
+        for rec in records:
+            key = _distinct_key([rec[0][name] for name in cols])
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(rec)
+        records = kept
+        removed = rows_before_distinct - len(records)
+        distinct_node = wrappers.get("DISTINCT")
+        if distinct_node is not None:
+            distinct_node.actual.update(
+                rows_in=rows_before_distinct,
+                rows_out=len(records),
+                duplicates_removed=removed,
+            )
+        state["lines"].append(
+            f"DISTINCT: rows_in={rows_before_distinct} rows_out={len(records)} "
+            f"duplicates_removed={removed}"
+        )
+
     if stmt.order_by:
         sort_node = wrappers.get("SORT")
         rows_before_sort = len(records)
@@ -449,10 +526,22 @@ def execute_select(
                 and order_expr.qualifier is None
                 and explicit_alias_counts.get(order_expr.name, 0) == 1
             )
+            projected_key = None
+            if stmt.distinct:
+                projected_key = _distinct_order_target(
+                    stmt,
+                    order_expr,
+                    sources,
+                    cols,
+                    explicit_alias_counts,
+                    is_wildcard,
+                )
             keyed: list[tuple[Any, tuple[dict[str, Any], Any, Any]]] = []
             for rec in records:
                 out_row, ctx_or_sample, group_rows = rec
-                if use_alias:
+                if projected_key is not None:
+                    sort_val = out_row[projected_key]
+                elif use_alias:
                     sort_val = out_row[order_expr.name]
                 elif is_grouped_query:
                     sort_val = _eval_group_expr(order_expr, ctx_or_sample, group_rows or [], sources)
@@ -468,6 +557,22 @@ def execute_select(
         if sort_node is not None:
             sort_node.actual.update(rows_in=rows_before_sort, rows_out=len(records))
             state["lines"].append(f"SORT: rows_in={rows_before_sort} rows_out={len(records)}")
+
+    # OFFSET is applied after ordering and before LIMIT.
+    if stmt.offset:
+        rows_before_offset = len(records)
+        records = records[stmt.offset:]
+        discarded = rows_before_offset - len(records)
+        offset_node = wrappers.get("OFFSET")
+        if offset_node is not None:
+            offset_node.actual.update(
+                rows_in=rows_before_offset,
+                rows_out=len(records),
+                rows_discarded=discarded,
+            )
+        state["lines"].append(
+            f"OFFSET: discarded={discarded} rows_in={rows_before_offset} rows_out={len(records)}"
+        )
 
     if stmt.limit is not None:
         rows_before_limit = len(records)

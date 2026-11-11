@@ -19,6 +19,10 @@ class TokenType(Enum):
     LE = auto()
     GT = auto()
     GE = auto()
+    PLUS = auto()
+    MINUS = auto()
+    SLASH = auto()
+    PERCENT = auto()
     EOF = auto()
 
 
