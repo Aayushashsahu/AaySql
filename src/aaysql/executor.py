@@ -2,7 +2,7 @@ import time
 
 from .ast import *
 from .errors import ConstraintError, ExecutionError
-from .planner import format_metrics, format_plan, plan_select
+from .planner import ESTIMATE_NOTE, format_metrics, format_plan, plan_select
 from .query import (
     SourceBinding,
     eval_row_expr,
@@ -61,14 +61,17 @@ class Executor:
         if not isinstance(s.statement, Select):
             raise ExecutionError("EXPLAIN currently supports SELECT statements only")
         plan = plan_select(self.db, s.statement)
-        started = time.perf_counter()
-        result = execute_select(self.db, s.statement, plan=plan, collect_metrics=True)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
-        metrics = dict(result["metrics"])
-        metrics["execution_ms"] = elapsed_ms
-        text = format_plan(plan)
+        text = format_plan(plan, include_note=False)
         if s.analyze:
+            # Only EXPLAIN ANALYZE runs the statement; plain EXPLAIN reports the
+            # plan from statistics and never executes or mutates anything.
+            started = time.perf_counter()
+            result = execute_select(self.db, s.statement, plan=plan, collect_metrics=True)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            metrics = dict(result["metrics"])
+            metrics["execution_ms"] = elapsed_ms
             text = f"{text}\n{format_metrics(metrics)}"
+        text = f"{text}\n\n{ESTIMATE_NOTE}"
         return {"status": "ok", "message": text}
 
     def _coerce(self, value, col):
@@ -118,6 +121,7 @@ class Executor:
             self._check_constraints(table, row, rows=staged_pool)
             staged_pool.append(row)
         table.rows.extend(new_rows)
+        table.touch()
         for index in self.db.indexes_on(table.name):
             for row in new_rows:
                 index.add(row)
@@ -173,6 +177,8 @@ class Executor:
         ]
         for old, new in staged:
             old.update(new)
+        if staged:
+            table.touch()
         for (old, _), previous in zip(staged, previous_keys):
             for index in indexes:
                 index.remove(old, key=previous[index.name], forget=False)
@@ -188,4 +194,6 @@ class Executor:
                 index.remove(row)
         before = len(table.rows)
         table.rows[:] = [row for row in table.rows if id(row) not in targets]
+        if len(table.rows) != before:
+            table.touch()
         return {"status": "ok", "rows_affected": before - len(table.rows)}

@@ -14,7 +14,6 @@ from .ast import (
     UnaryExpr,
 )
 from .errors import ExecutionError
-from .planner import fetch_plan_rows
 from .storage import Database, Table
 
 _NUMERIC_TYPES = {"INT", "INTEGER", "FLOAT", "DOUBLE"}
@@ -373,231 +372,20 @@ def execute_select(
     stmt: Select,
     plan: Any | None = None,
     collect_metrics: bool = False,
+    **options: Any,
 ) -> dict[str, Any]:
-    """Execute a SELECT through source binding, JOIN, WHERE, GROUP BY, HAVING, projection, ORDER BY, and LIMIT.
+    """Execute a SELECT through the physical plan chosen for it.
 
-    When ``plan`` selects an index scan, candidate rows come from that index. The
-    complete WHERE clause is always re-applied afterwards, so indexed and unindexed
-    execution return identical rows.
+    The implementation lives in :mod:`aaysql.execution`. It is imported lazily so
+    that the expression and three-valued-logic helpers defined here stay free of
+    any planning dependency.
     """
-    base_ref = stmt.table_alias or stmt.table
-    sources: list[SourceBinding] = [SourceBinding.from_table(base_ref, db.table(stmt.table))]
-    seen_refs = {base_ref}
+    from .execution import execute_select as _execute_select
 
-    for join in stmt.joins:
-        join_ref = join.alias or join.table
-        if join_ref in seen_refs:
-            raise ExecutionError(f"Duplicate table name or alias '{join_ref}' in FROM/JOIN clause")
-        seen_refs.add(join_ref)
-        join_table = db.table(join.table)
-        join_source = SourceBinding.from_table(join_ref, join_table)
-        scoped_sources = [*sources, join_source]
-        _validate_no_aggregates(join.condition, "JOIN ON clause")
-        validate_expr_columns(join.condition, scoped_sources, allow_aggregates=False, context_name="JOIN ON clause")
-        sources.append(join_source)
-
-    if stmt.where is not None:
-        _validate_no_aggregates(stmt.where, "WHERE clause")
-        validate_expr_columns(stmt.where, sources, allow_aggregates=False, context_name="WHERE clause")
-
-    is_wildcard = _is_wildcard_select(stmt.columns)
-    has_group_by = bool(stmt.group_by)
-    has_aggregates = (
-        any(contains_aggregate(item.expr) for item in stmt.columns)
-        or (stmt.having is not None and contains_aggregate(stmt.having))
-        or (stmt.order_by is not None and any(contains_aggregate(expr) for expr, _ in stmt.order_by))
+    return _execute_select(
+        db,
+        stmt,
+        plan=plan,
+        collect_metrics=collect_metrics,
+        **options,
     )
-    is_grouped_query = has_group_by or has_aggregates or stmt.having is not None
-
-    explicit_alias_counts: dict[str, int] = {}
-    for item in stmt.columns:
-        if item.alias:
-            explicit_alias_counts[item.alias] = explicit_alias_counts.get(item.alias, 0) + 1
-
-    grouped_keys: set[tuple[str, str]] = set()
-    group_idents = stmt.group_by or []
-    if is_grouped_query:
-        for g_ident in group_idents:
-            ref, col_def = resolve_identifier(g_ident, sources)
-            grouped_keys.add((ref, col_def.name))
-
-        if is_wildcard:
-            for src in sources:
-                for col_name in src.table.column_names:
-                    if (src.ref, col_name) not in grouped_keys:
-                        raise ExecutionError(
-                            f"Column '{src.ref}.{col_name}' must appear in GROUP BY clause or be used in an aggregate function"
-                        )
-        else:
-            for item in stmt.columns:
-                _validate_grouped_expr(item.expr, sources, grouped_keys)
-        if stmt.having is not None:
-            _validate_grouped_expr(stmt.having, sources, grouped_keys)
-    else:
-        if not is_wildcard:
-            for item in stmt.columns:
-                validate_expr_columns(item.expr, sources, allow_aggregates=False, context_name="SELECT list")
-
-    if stmt.order_by:
-        for raw_expr, _ in stmt.order_by:
-            order_expr = _normalize_order_expr(raw_expr)
-            if isinstance(order_expr, Identifier) and order_expr.qualifier is None:
-                alias_count = explicit_alias_counts.get(order_expr.name, 0)
-                if alias_count > 1:
-                    raise ExecutionError(f"Ambiguous ORDER BY alias '{order_expr.name}'")
-                if alias_count == 1:
-                    continue
-            if is_grouped_query:
-                _validate_grouped_expr(order_expr, sources, grouped_keys)
-            else:
-                validate_expr_columns(order_expr, sources, allow_aggregates=False, context_name="ORDER BY clause")
-
-    if is_wildcard:
-        if not stmt.joins:
-            cols = list(sources[0].table.column_names)
-        else:
-            cols = [f"{src.ref}.{col}" for src in sources for col in src.table.column_names]
-    else:
-        cols = [
-            item.alias or _default_expr_label(item.expr, i)
-            for i, item in enumerate(stmt.columns)
-        ]
-    _validate_output_labels(cols)
-
-    if plan is not None and plan.index_name is not None and not stmt.joins:
-        base_rows = fetch_plan_rows(db, plan)
-    else:
-        base_rows = list(sources[0].table.rows)
-    rows_scanned = len(base_rows)
-
-    active_sources = [sources[0]]
-    working_rows: list[dict[str, dict[str, Any]]] = [
-        {sources[0].ref: row} for row in base_rows
-    ]
-
-    for idx, join in enumerate(stmt.joins):
-        right_source = sources[idx + 1]
-        active_sources = [*active_sources, right_source]
-        null_right = {col: None for col in right_source.table.column_names}
-        next_rows: list[dict[str, dict[str, Any]]] = []
-        for left_ctx in working_rows:
-            matched = False
-            for right_row in right_source.table.rows:
-                candidate = {**left_ctx, right_source.ref: right_row}
-                if is_sql_true(eval_row_expr(join.condition, candidate, active_sources)):
-                    next_rows.append(candidate)
-                    matched = True
-            if join.join_type == "LEFT" and not matched:
-                next_rows.append({**left_ctx, right_source.ref: dict(null_right)})
-        working_rows = next_rows
-
-    if stmt.where is not None:
-        working_rows = [
-            ctx for ctx in working_rows if is_sql_true(eval_row_expr(stmt.where, ctx, sources))
-        ]
-
-    records: list[tuple[dict[str, Any], dict[str, dict[str, Any]] | None, list[dict[str, dict[str, Any]]] | None]] = []
-
-    if is_grouped_query:
-        if has_group_by:
-            grouped: dict[tuple[tuple[type, Any], ...], tuple[dict[str, dict[str, Any]], list[dict[str, dict[str, Any]]]]] = {}
-            resolved_group_refs = [resolve_identifier(g, sources) for g in group_idents]
-            for ctx in working_rows:
-                key_parts = []
-                for ref, col_def in resolved_group_refs:
-                    val = ctx[ref][col_def.name]
-                    key_parts.append((type(None), None) if val is None else (type(val), val))
-                key = tuple(key_parts)
-                if key not in grouped:
-                    grouped[key] = (ctx, [ctx])
-                else:
-                    grouped[key][1].append(ctx)
-            groups = list(grouped.values())
-        else:
-            groups = [(working_rows[0] if working_rows else None, working_rows)]
-
-        if stmt.having is not None:
-            groups = [
-                (sample_ctx, group_rows)
-                for sample_ctx, group_rows in groups
-                if is_sql_true(_eval_group_expr(stmt.having, sample_ctx, group_rows, sources))
-            ]
-
-        for sample_ctx, group_rows in groups:
-            if is_wildcard:
-                if not stmt.joins:
-                    out = sample_ctx[sources[0].ref].copy() if sample_ctx is not None else {}
-                else:
-                    out = {
-                        f"{src.ref}.{col}": (sample_ctx[src.ref][col] if sample_ctx is not None else None)
-                        for src in sources
-                        for col in src.table.column_names
-                    }
-            else:
-                out = {
-                    cols[i]: _eval_group_expr(item.expr, sample_ctx, group_rows, sources)
-                    for i, item in enumerate(stmt.columns)
-                }
-            records.append((out, sample_ctx, group_rows))
-    else:
-        for ctx in working_rows:
-            if is_wildcard:
-                if not stmt.joins:
-                    out = ctx[sources[0].ref].copy()
-                else:
-                    out = {
-                        f"{src.ref}.{col}": ctx[src.ref][col]
-                        for src in sources
-                        for col in src.table.column_names
-                    }
-            else:
-                out = {
-                    cols[i]: eval_row_expr(item.expr, ctx, sources)
-                    for i, item in enumerate(stmt.columns)
-                }
-            records.append((out, ctx, None))
-
-    if stmt.order_by:
-        for raw_expr, desc in reversed(stmt.order_by):
-            order_expr = _normalize_order_expr(raw_expr)
-            use_alias = (
-                isinstance(order_expr, Identifier)
-                and order_expr.qualifier is None
-                and explicit_alias_counts.get(order_expr.name, 0) == 1
-            )
-            keyed: list[tuple[Any, tuple[dict[str, Any], Any, Any]]] = []
-            for rec in records:
-                out_row, ctx_or_sample, group_rows = rec
-                if use_alias:
-                    sort_val = out_row[order_expr.name]
-                elif is_grouped_query:
-                    sort_val = _eval_group_expr(order_expr, ctx_or_sample, group_rows or [], sources)
-                else:
-                    sort_val = eval_row_expr(order_expr, ctx_or_sample, sources)
-                keyed.append((sort_val, rec))
-            try:
-                keyed.sort(key=lambda pair: (pair[0] is None, "" if pair[0] is None else pair[0]), reverse=desc)
-            except TypeError as exc:
-                label = order_expr.label if isinstance(order_expr, (Identifier, AggregateCall)) else str(order_expr)
-                raise ExecutionError(f"Cannot sort column '{label}' due to incompatible values") from exc
-            records = [rec for _, rec in keyed]
-
-    if stmt.limit is not None:
-        records = records[: stmt.limit]
-
-    data = [out_row for out_row, _, _ in records]
-    result: dict[str, Any] = {
-        "status": "ok",
-        "columns": cols,
-        "rows": data,
-        "row_count": len(data),
-    }
-    if collect_metrics:
-        result["metrics"] = {
-            "rows_scanned": rows_scanned,
-            "rows_filtered": max(rows_scanned - len(working_rows), 0),
-            "rows_produced": len(data),
-            "index": plan.index_name if plan is not None else None,
-            "join_algorithm": "NESTED LOOP" if stmt.joins else None,
-        }
-    return result
