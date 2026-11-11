@@ -1,4 +1,4 @@
-# AayushSQL Language Specification (v0.9.0)
+# AayushSQL Language Specification (v1.0.0)
 
 ## 1. Overview
 

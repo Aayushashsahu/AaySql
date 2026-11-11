@@ -13,11 +13,12 @@ permissions:
 
 jobs:
   test:
-    name: pytest (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: pytest (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
@@ -34,5 +35,84 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
+      - name: Report platform behaviour for the skipped paths
+        run: |
+          python -c "import os, sys; print('os.name =', os.name, 'python =', sys.version)"
+
       - name: Run pytest suite
-        run: python -m pytest -v
+        run: python -m pytest -q
+
+  packaging:
+    name: build and install distribution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and source distribution
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Verify artifact contents and metadata
+        run: |
+          python - <<'PY'
+          import pathlib, tomllib, zipfile
+
+          project = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]
+          expected = project["version"]
+          wheels = sorted(pathlib.Path("dist").glob("*.whl"))
+          sdists = sorted(pathlib.Path("dist").glob("*.tar.gz"))
+          assert len(wheels) == 1 and len(sdists) == 1, (wheels, sdists)
+          with zipfile.ZipFile(wheels[0]) as archive:
+              names = archive.namelist()
+              metadata = next(n for n in names if n.endswith(".dist-info/METADATA"))
+              text = archive.read(metadata).decode()
+          assert f"Version: {expected}" in text, text
+          required = {
+              "aaysql/__init__.py", "aaysql/engine.py", "aaysql/server.py",
+              "aaysql/client.py", "aaysql/backup.py", "aaysql/protocol.py",
+          }
+          missing = sorted(required - set(names))
+          assert not missing, f"missing modules in wheel: {missing}"
+          banned = [n for n in names if n.endswith((".aaydb", ".wal", ".lock", ".pyc"))]
+          assert not banned, banned
+          assert not any(n.startswith("tests/") for n in names), "tests packaged in wheel"
+          print("wheel:", wheels[0].name, "files:", len(names), "version:", expected)
+          print("sdist:", sdists[0].name)
+          PY
+
+      - name: Install the wheel into a clean virtual environment and smoke test
+        run: |
+          python -m venv /tmp/clean-venv
+          /tmp/clean-venv/bin/python -m pip install --upgrade pip
+          /tmp/clean-venv/bin/python -m pip install dist/*.whl
+          cd /tmp
+          /tmp/clean-venv/bin/aaysql --version
+          /tmp/clean-venv/bin/aaysql-server --help > /dev/null
+          /tmp/clean-venv/bin/aaysql-backup --version
+          /tmp/clean-venv/bin/python - <<'PY'
+          import importlib.metadata
+
+          import aaysql
+          from aaysql import Engine
+          from aaysql.client import AayushSQLClient  # noqa: F401 - import smoke test
+
+          installed = importlib.metadata.version("aaysql")
+          assert installed == aaysql.__version__, (installed, aaysql.__version__)
+          print("installed version:", installed)
+          engine = Engine("/tmp/ci-smoke.aaydb")
+          engine.execute("AAYUSH CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+          engine.execute("AAYUSH INSERT INTO t VALUES (1, 'ada')")
+          assert engine.execute("AAYUSH SELECT * FROM t")["rows"] == [{"id": 1, "name": "ada"}]
+          engine.close()
+          reopened = Engine("/tmp/ci-smoke.aaydb")
+          assert reopened.execute("AAYUSH SELECT COUNT(*) FROM t")["rows"] == [{"COUNT(*)": 1}]
+          reopened.close()
+          print("clean-install smoke test OK")
+          PY

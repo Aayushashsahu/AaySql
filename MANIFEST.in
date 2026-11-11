@@ -1,0 +1,20 @@
+include README.md
+include CHANGELOG.md
+include LANGUAGE_SPEC.md
+include ARCHITECTURE.md
+include SERVER_ARCHITECTURE.md
+include WAL.md
+include BENCHMARKS.md
+include RELEASE_BENCHMARKS.md
+include COMPATIBILITY.md
+include SECURITY.md
+include THREAT_MODEL.md
+include AUDIT.md
+recursive-include docs *.md
+
+# Never ship local runtime state, tests, benchmarks, or editor artefacts.
+prune tests
+prune benchmarks
+prune .github
+global-exclude *.aaydb *.aaydb.wal *.wal *.lock *.pyc *.tmp .DS_Store
+global-exclude __pycache__/*

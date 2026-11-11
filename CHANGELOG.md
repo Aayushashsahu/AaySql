@@ -2,6 +2,30 @@
 
 All notable changes to AayushSQL are documented in this file.
 
+## [1.0.0] — 2026-11-11
+
+### Added
+- **Official offline backup and restore (`src/aaysql/backup.py`, `aaysql-backup` CLI)**:
+  - Exclusive DB ownership via the server lock, automatic pending WAL recovery before reading, `manifest.json` with format versions and SHA-256 checksum, atomic staged writes, `verify`, and safe `restore` validating loadability and preserving the replaced database until validation passes (`<target>.pre-restore-<id>`).
+- **Formal compatibility & security documentation**:
+  - Added [`COMPATIBILITY.md`](COMPATIBILITY.md) (SQL, format v3, network protocol v1, and Python API compatibility contract), [`AUDIT.md`](AUDIT.md) (module-by-module v1.0.0 stabilization audit), [`SECURITY.md`](SECURITY.md), [`THREAT_MODEL.md`](THREAT_MODEL.md), [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md), [`docs/OPERATIONS.md`](docs/OPERATIONS.md), and [`RELEASE_BENCHMARKS.md`](RELEASE_BENCHMARKS.md).
+- **Permanent format fixtures (`tests/fixtures/`, `tests/test_format_fixtures.py`)**:
+  - Read-only fixtures for format v1, v2, v3, valid indexed databases, `NULL` values, and corrupt JSON/schema files, verifying non-destructive read-only opens and v1/v2 -> v3 migration on write.
+- **Packaging & cross-platform CI**:
+  - Added `MANIFEST.in`, console scripts (`aaysql`, `aaysql-server`, `aaysql-backup`), Python 3.10–3.13 classifiers, and GitHub Actions testing across Ubuntu, Windows, and macOS plus wheel/sdist artifact and clean-venv install validation.
+- **Additional stress & documentation tests**:
+  - `tests/test_stability.py`, `tests/test_backup.py`, `tests/test_server_stress.py` (1–32 concurrent TCP client mixed workloads & timeouts), `tests/test_docs_examples.py`, and `benchmarks/benchmark_release.py`.
+
+### Fixed
+- **SQL boolean comparison guard (`src/aaysql/expressions.py`)**: Mixed `BOOL` vs numeric comparisons (`flag = 1`) now raise `ExecutionError` instead of silently evaluating Python `True == 1`.
+- **Client framing & error diagnostics (`src/aaysql/protocol.py`, `src/aaysql/client.py`)**: Client-side oversized requests now report `REQUEST_TOO_LARGE` instead of `RESPONSE_TOO_LARGE`, and `ProtocolError` includes the stable error code.
+- **Server environment config (`src/aaysql/server.py`)**: `ServerConfig.from_environment(auth_token=...)` pops explicit `auth_token` cleanly without `TypeError` when `AAYUSQL_AUTH_TOKEN` is also set.
+- **Windows backup fsync (`src/aaysql/backup.py`)**: Opened staged backup files with `O_RDWR` for `os.fsync()` to satisfy Windows CRT constraints.
+
+### Notes
+- `.aaydb` format remains **version 3** and network protocol remains **version 1**.
+- Single-writer architecture: no MVCC, parallel queries, or live online backup.
+
 ## [0.9.0] — 2026-11-11
 
 ### Added

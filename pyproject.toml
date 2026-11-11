@@ -4,16 +4,42 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aaysql"
-version = "0.9.0"
+version = "1.0.0rc1"
 description = "A custom SQL-compatible relational database requiring the AAYUSH prefix"
+readme = "README.md"
 requires-python = ">=3.10"
+# No license is declared: choosing a license is the repository owner's decision,
+# not something this release can assume. See AUDIT.md (packaging findings).
+authors = [{ name = "Aayush Sahu" }]
+keywords = ["database", "sql", "storage", "wal", "btree", "sqlite-alternative"]
 dependencies = []
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "build>=1.0", "ruff>=0.5"]
+
+[project.urls]
+Homepage = "https://github.com/Aayushashsahu/AaySql"
+Repository = "https://github.com/Aayushashsahu/AaySql"
+Changelog = "https://github.com/Aayushashsahu/AaySql/blob/main/CHANGELOG.md"
+Compatibility = "https://github.com/Aayushashsahu/AaySql/blob/main/COMPATIBILITY.md"
 
 [project.scripts]
 aaysql = "aaysql.cli:main"
+aaysql-server = "aaysql.server:main"
+aaysql-backup = "aaysql.backup:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
