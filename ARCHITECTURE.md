@@ -1,6 +1,6 @@
 # Architecture
 
-AayushSQL v0.7.0 separates the language front end, logical/physical query planning, statistics, relational execution, index maintenance, DML/constraint execution, Write-Ahead Logging (WAL), and persistent snapshot storage into focused modules under `src/aaysql/`.
+AayushSQL v0.8.0 separates the language front end, logical/physical query planning, statistics, relational execution, index maintenance, DML/constraint execution, Write-Ahead Logging (WAL), persistent snapshot storage, and the client/server layer into focused modules under `src/aaysql/`. The embedded engine is unchanged: the server is a front end over one `Engine` instance.
 
 ```text
                   AayushSQL CLI (cli.py)
@@ -77,6 +77,40 @@ Three-valued logic is centralized in `query.py` (`sql_and`, `sql_or`, `sql_not`,
 - Checkpointing writes a temporary `.aaydb` snapshot, calls `os.fsync()`, atomically swaps via `os.replace()`, calls `fsync_dir()` where supported, appends a `checkpoint` record, and only then truncates the WAL. `fsync_dir()` distinguishes unsupported directory fsync (`EINVAL`/`ENOTSUP`/`EOPNOTSUPP`, plus Windows' deliberate platform fallback) from genuine failures (`EACCES`/`EIO`/`ENOSPC`), which raise `StorageError` instead of claiming durability.
 - On startup `load()`, `parse_wal()` validates records, tracks `valid_bytes_end` for the last valid record, ignores torn/checksum-corrupt trailing records, rejects mid-log corruption without skipping forward, and idempotently replays the newest committed image where `commit_lsn > snapshot.wal_lsn`. Before appending a recovery `CHECKPOINT`, it truncates only the invalid trailing bytes and fsyncs, so a repaired tail cannot become mid-log corruption after a crash. See [`WAL.md`](WAL.md) for the complete protocol specification.
 
+## Client/Server Layer (`src/aaysql/server.py`, `src/aaysql/protocol.py`, `src/aaysql/client.py`)
+
+- **One engine per server.** `AayushSQLServer` opens the `Engine` before binding
+  the socket, so WAL recovery completes before any request can arrive, and it
+  never creates an engine per connection.
+- **Connection threads, serialized execution.** `socketserver.ThreadingTCPServer`
+  runs one thread per connection, but every statement is executed under the
+  single `TransactionCoordinator` lock, released before the response is written.
+- **Session-owned transactions.** The coordinator tracks the one session allowed
+  to use the engine's single `TransactionManager`. Non-owners are rejected with a
+  retryable `TRANSACTION_BUSY` before the engine is touched, so uncommitted rows
+  are never observable and statements are never absorbed into another session's
+  transaction. Ownership is re-derived from `engine.in_transaction` after each
+  statement — the engine stays authoritative.
+- **Disconnect rollback.** Session cleanup rolls back an active transaction and
+  releases ownership. An ambiguous `COMMIT` instead marks the whole service
+  `RECOVERY_REQUIRED`, keeps the ownership tombstone, and preserves the WAL for
+  reopen recovery; no rollback is ever claimed.
+- **Process lock.** `<db>.server.lock` is held with `fcntl.flock` (POSIX) or
+  `msvcrt.locking` (Windows) from startup until shutdown, so two server processes
+  cannot own one database and a crash releases the lock automatically.
+- **Protocol.** 4-byte big-endian length + UTF-8 JSON frames, independently
+  versioned (`PROTOCOL_VERSION = 1`), with `hello`/`ping`/`execute`, per-session
+  request-ID validation, allocation-safe frame limits, stable error codes, and no
+  tracebacks on the wire.
+- **Transport security.** Loopback bind by default; non-loopback binds require
+  both `AAYUSQL_AUTH_TOKEN` (compared with `hmac.compare_digest`, never logged or
+  persisted) and TLS via the standard `ssl` module. The client verifies
+  certificates and hostnames by default and never retries a request whose outcome
+  may be unknown.
+
+The complete contract, framing details, error codes and limitations are in
+[`SERVER_ARCHITECTURE.md`](SERVER_ARCHITECTURE.md).
+
 ## Module Responsibilities
 
 - **`token.py` & `lexer.py`**: Tokenizes SQL into typed tokens (`PREFIX` for `AAYUSH`, identifiers, numbers, strings, operators, punctuation).
@@ -90,6 +124,9 @@ Three-valued logic is centralized in `query.py` (`sql_and`, `sql_or`, `sql_not`,
 - **`wal.py`**: WAL record schema, SHA-256 checksums, strict validation, byte-accurate tail parsing and repair, the append state machine with write-all/poisoning, directory fsync error classification, checkpoint/truncation helpers, and internal crash-test hooks.
 - **`storage.py`**: Schema/type/constraint validation, `Table`/`Database` models, v1/v2->v3 migration, crash-safe checkpointing, and startup WAL recovery.
 - **`engine.py` & `transaction.py`**: Coordinate lexing, parsing, execution, and persistence. Autocommit and explicit `COMMIT` persist through WAL + checkpoint; ambiguous fsync errors and poisoned WALs enforce reopen recovery.
+- **`server.py`**: One `Engine` per server, session model, transaction coordinator, TCP server, framed request dispatch, authentication, TLS configuration, process lock, bounded graceful shutdown, `python -m aaysql.server` CLI.
+- **`protocol.py`**: Frame encoding/decoding and incremental reading, envelope and request validation, protocol version, capabilities, and the stable protocol error codes.
+- **`client.py`**: `AayushSQLClient` (handshake, correlation, timeouts, TLS, token), the client exception hierarchy, and the no-automatic-retry contract for ambiguous requests.
 - **`cli.py` & `formatting.py`**: `--db`, `--memory`, `--version`, fail-fast scripts, error-resilient REPL, ASCII tables, plan text output.
 - **`errors.py`**: Exception hierarchy rooted at `AayushSQLError` (`LexerError`, `ParserError`, `ExecutionError`, `ConstraintError`, `StorageError`, `AmbiguousCommitError`).
 

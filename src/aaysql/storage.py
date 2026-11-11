@@ -19,7 +19,7 @@ FORMAT_VERSION = 3
 # Format versions 1 (pre-index) and 2 (pre-WAL) remain readable and upgrade to
 # version 3 on the next write or recovery checkpoint.
 READABLE_FORMAT_VERSIONS = (1, 2, 3)
-ENGINE_VERSION = "0.7.0"
+ENGINE_VERSION = "0.8.0"
 
 TYPE_MAP: dict[str, type] = {
     "INT": int,
