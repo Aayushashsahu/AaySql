@@ -9,4 +9,5 @@ dist/
 .venv/
 venv/
 *.aaydb
+!tests/fixtures/*.aaydb
 *.aaydb.*.tmp

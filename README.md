@@ -12,9 +12,9 @@ Every top-level SQL statement must begin with `AAYUSH`. Ordinary SQL without the
 
 ## Current Version
 
-**v0.9.0** — SQL language expansion: a unified expression system with `IS NULL` / `IS NOT NULL`, `LIKE` / `NOT LIKE`, `IN` / `NOT IN`, `BETWEEN` / `NOT BETWEEN`, arithmetic (`+ - * / %`, unary `+`/`-`), searched and simple `CASE`, `SELECT DISTINCT`, and `OFFSET`. One precedence-climbing parser and one evaluator implement all of it, so every expression works in `SELECT`, `WHERE`, `JOIN ON`, `GROUP BY`/`HAVING`, `ORDER BY`, `UPDATE`, `DELETE`, `EXPLAIN`, the embedded engine, and the network client. Full grammar and semantics in [`LANGUAGE_SPEC.md`](LANGUAGE_SPEC.md).
+**v1.0.0 — First Stable Release** (`.aaydb` format v3, network protocol v1).
 
-v0.8.0 added the client/server architecture: one server process owns one `Engine`, and multiple clients connect over TCP with a versioned length-prefixed JSON protocol (see [`SERVER_ARCHITECTURE.md`](SERVER_ARCHITECTURE.md)).
+AayushSQL v1.0.0 establishes a frozen, documented compatibility contract, security boundary, offline backup and restore (`aaysql-backup`), cross-platform CI (Ubuntu/Windows/macOS across Python 3.10–3.13), and wheel/source packaging on top of the full v0.1.0–v0.9.0 engine: relational queries, expressions (`IS NULL`, `LIKE`, `IN`, `BETWEEN`, arithmetic, `CASE`, `DISTINCT`, `OFFSET`), B+ tree indexes, cost-based optimizer and hash joins, transactions, WAL crash recovery, and TCP server with token auth and TLS.
 
 **Multiple connections, one writer.** The server adds accessibility, not concurrency: there is no MVCC, no snapshot isolation, and no parallel query execution.
 
@@ -32,7 +32,7 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 
 ## Implemented vs. Planned Features
 
-### Implemented (v0.9.0)
+### Implemented (v1.0.0)
 - **SQL expression language** (`src/aaysql/expressions.py`, `src/aaysql/parser.py`):
   - One precedence-climbing parser for the whole expression grammar (`OR` < `AND` < `NOT` < comparisons/predicates < `+ -` < `* / %` < unary sign < primary), with parentheses overriding it. Numbers are lexed unsigned so subtraction and unary negation are unambiguous (`1-2` and `1 - 2` both mean minus).
   - One canonical evaluator used by every execution path (reference/embedded and plan-driven), with a shared AST traversal (`iter_expr_children`/`walk_expr`) that all validation, aggregate detection, grouped-expression checks, predicate placement, and EXPLAIN rendering go through — a new node type cannot silently bypass a rule.
@@ -102,12 +102,12 @@ Everything behind the parser — relational joins, column resolution, grouping, 
   - Read-only `SELECT` queries (including joins and aggregations) never modify persisted files.
   - Configurable database file path (`--db`) and in-memory mode (`--memory` / `--db :memory:`).
 - Fail-fast script runner (non-zero exit code on error) and error-resilient interactive REPL.
-- Automated GitHub Actions CI across Python 3.10–3.13.
+- Automated cross-platform GitHub Actions CI across Ubuntu, Windows, and macOS on Python 3.10–3.13, plus packaging and clean-venv install validation.
 
-### Planned (Future Roadmap)
-- **v1.0** — Not started. Candidate work: subqueries/`UNION`, expression or multi-column indexes, aggregate `DISTINCT` and window functions, and a real concurrency story (the current model is single-writer).
+### Planned (Post-1.0 Roadmap)
+- Candidate future work beyond v1.0.0: subqueries/`UNION`, expression or multi-column indexes, aggregate `DISTINCT`, window functions, and concurrent MVCC writers (the v1.0.0 model is strictly single-writer).
 
-## Example SQL Expressions (v0.9.0)
+## Example SQL Expressions
 
 ### `NULL` filtering
 
@@ -215,15 +215,23 @@ ORDER BY average_salary DESC;
 
 ## Installation and Execution
 
-Requires **Python 3.10+** with no external runtime dependencies (`pytest` is declared under `[project.optional-dependencies] dev`).
+Requires **Python 3.10–3.13** with **zero external runtime dependencies** (`pytest`, `build`, and `ruff` are declared under `[project.optional-dependencies] dev`).
 
-### Option 1: Editable install
+### Option 1: Install from wheel (recommended)
+```bash
+pip install aaysql-1.0.0-py3-none-any.whl
+aaysql --version          # aaysql 1.0.0
+aaysql-server --help
+aaysql-backup --version
+```
+
+### Option 2: Editable install from source
 ```bash
 pip install -e ".[dev]"
 aaysql --help
 ```
 
-### Option 2: Run directly from the repository root
+### Option 3: Run directly from the repository root
 
 PowerShell:
 ```powershell
@@ -236,16 +244,25 @@ Bash / macOS / Linux:
 PYTHONPATH=src python -m aaysql.cli
 ```
 
-## CLI Usage
+## Embedded Usage & CLI
 
 ```text
-python -m aaysql.cli [--db PATH | --memory] [--version] [script]
+aaysql [--db PATH | --memory] [--version] [script]
 ```
 
-- **Default persistent mode** (`./aaysql.aaydb`): `python -m aaysql.cli`
-- **Custom database file**: `python -m aaysql.cli --db university.aaydb`
-- **In-memory mode**: `python -m aaysql.cli --memory` or `python -m aaysql.cli --db :memory:`
-- **Run a script file**: `python -m aaysql.cli --memory examples/demo.aay`
+- **Default persistent mode** (`./aaysql.aaydb`): `aaysql`
+- **Custom database file**: `aaysql --db university.aaydb`
+- **In-memory mode**: `aaysql --memory` or `aaysql --db :memory:`
+- **Run a script file**: `aaysql --memory examples/demo.aay`
+
+```python
+from aaysql import Engine
+
+with Engine("university.aaydb") as db:
+    db.execute("AAYUSH CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL)")
+    db.execute("AAYUSH INSERT INTO users VALUES (1, 'Aayush')")
+    print(db.execute("AAYUSH SELECT * FROM users")["rows"])
+```
 
 ### Script Fail-Fast & Exit-Code Behavior
 
@@ -261,7 +278,8 @@ optional front end for external applications.
 ### Start the server
 
 ```bash
-python -m aaysql.server --db university.aaydb
+aaysql-server --db university.aaydb
+# or: python -m aaysql.server --db university.aaydb
 ```
 
 Defaults: `127.0.0.1:8765`, in-file database, 32 connections, 1 MiB frames.
@@ -337,8 +355,8 @@ with AayushSQLClient("127.0.0.1", 8765) as db:
 ```bash
 # Token from the environment; never passed on the command line.
 export AAYUSQL_AUTH_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-python -m aaysql.server --db university.aaydb                       # loopback, no TLS needed
-python -m aaysql.server --db university.aaydb --host 0.0.0.0 \
+aaysql-server --db university.aaydb                                 # loopback, no TLS needed
+aaysql-server --db university.aaydb --host 0.0.0.0 \
     --tls-cert server-cert.pem --tls-key server-key.pem             # remote: token + TLS required
 ```
 
@@ -368,8 +386,21 @@ determine the real state; never replay mutations or `COMMIT` automatically.
 - Only one session may own a transaction at a time; other sessions are blocked
   with `TRANSACTION_BUSY` rather than being served stale reads.
 - Only one server process may own a database file; the `.server.lock` enforces
-  it. Stop the server before using the CLI or embedded `Engine` on that file.
-- The `.aaydb` format is unchanged (version 3).
+  it. Stop the server before using the CLI, embedded `Engine`, or `aaysql-backup` on that file.
+- The `.aaydb` format is version 3; network protocol is version 1.
+
+## Offline Backup and Restore
+
+`aaysql-backup` provides exclusive **offline** backups (stop any running server first):
+
+```bash
+aaysql-backup backup university.aaydb backups/university-2026-11-11
+aaysql-backup verify backups/university-2026-11-11
+aaysql-backup restore backups/university-2026-11-11 university-restored.aaydb
+```
+
+- Backups recover any pending WAL before reading, verify and record SHA-256 checksums in `manifest.json`, and stage atomically.
+- Restoring validates the candidate copy before swapping and refuses to overwrite an existing database (or a target with unrecovered WAL data) without `--force`. See [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ## Testing & Continuous Integration
 
@@ -379,7 +410,21 @@ Run the full test suite from the project root:
 python -m pytest -v
 ```
 
-GitHub Actions CI (`.github/workflows/tests.yml`) runs `python -m pytest -v` on pushes and pull requests targeting `main` across Python `3.10`, `3.11`, `3.12`, and `3.13`.
+GitHub Actions CI (`.github/workflows/tests.yml`) runs across **Ubuntu, Windows, and macOS** on Python **3.10, 3.11, 3.12, and 3.13**, plus a wheel/sdist packaging and clean-venv install job.
+
+## Documentation
+
+- [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) — End-to-end tutorial (SQL, client/server, backup/restore)
+- [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — Operational runbook, recovery, `RECOVERY_REQUIRED`, locking, troubleshooting
+- [`COMPATIBILITY.md`](COMPATIBILITY.md) — Formal SQL, format v3, protocol v1, and Python API compatibility contract
+- [`LANGUAGE_SPEC.md`](LANGUAGE_SPEC.md) — Full lexical rules and SQL grammar
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — Internal engine architecture
+- [`WAL.md`](WAL.md) — Write-ahead log protocol, checksums, checkpointing, and crash recovery
+- [`SERVER_ARCHITECTURE.md`](SERVER_ARCHITECTURE.md) — TCP server, coordinator lock, and session ownership
+- [`SECURITY.md`](SECURITY.md) & [`THREAT_MODEL.md`](THREAT_MODEL.md) — Security boundary and threat model
+- [`AUDIT.md`](AUDIT.md) — v1.0.0 stabilization audit findings and fixes
+- [`RELEASE_BENCHMARKS.md`](RELEASE_BENCHMARKS.md) & [`BENCHMARKS.md`](BENCHMARKS.md) — Release and subsystem benchmark measurements
+- [`CHANGELOG.md`](CHANGELOG.md) — Release history
 
 ## Known Limitations
 
@@ -397,7 +442,9 @@ GitHub Actions CI (`.github/workflows/tests.yml`) runs `python -m pytest -v` on 
 - Statistics refine selectivity only for single-column comparison, `IS NULL`, `IN`, and `BETWEEN` with literal bounds. `LIKE`, `CASE`, and arithmetic predicates use the documented conservative default; there are no histograms or pattern statistics.
 - Arithmetic accepts only `INT` and `FLOAT` (never `BOOL`/`TEXT`); division and modulo by zero raise `ExecutionError`, and non-finite results are refused rather than stored.
 - `DISTINCT` orders through the projected row only: with `DISTINCT`, `ORDER BY` expressions must be selected (alias, selected expression, or a selected column for `DISTINCT *`).
-- Single-writer execution: no nested transactions, savepoints, isolation levels, MVCC, snapshot isolation, or concurrent writes. The v0.8.0 server accepts many connections but serializes every statement behind one execution lock, and only one session may hold an explicit transaction at a time.
+- Single-writer execution: no nested transactions, savepoints, isolation levels, MVCC, snapshot isolation, or concurrent writes. The server accepts many connections but serializes every statement behind one execution lock, and only one session may hold an explicit transaction at a time.
+- Backup/restore is offline only (`aaysql-backup`); live/online backup is not supported.
 - WAL durability guarantees target single-process crash recovery; directory `fsync` is executed where supported (POSIX). Windows cannot open directories through the CRT, so directory-entry durability relies on NTFS metadata behaviour; this fallback is selected by platform, not by swallowing errors. Genuine directory `fsync` failures (`EACCES`, `EIO`, `ENOSPC`, ...) are surfaced as `StorageError`. Hardware/firmware write-cache failures or OS filesystem corruption remain outside process-crash guarantees (see [`WAL.md`](WAL.md)).
 - Table and column names are case-sensitive at execution time.
+
 

@@ -129,17 +129,46 @@ def is_sql_true(value: Any) -> bool:
     return value is not None and bool(value)
 
 
+_TYPE_LABELS = {bool: "BOOL", int: "INT", float: "FLOAT", str: "TEXT"}
+
+
+def _type_label(value: Any) -> str:
+    return _TYPE_LABELS.get(type(value), type(value).__name__.upper())
+
+
+def _reject_boolean_comparison(op: str, left: Any, right: Any) -> None:
+    """A BOOL value never compares equal to a number in SQL.
+
+    Python's ``True == 1`` is true, which would silently make ``WHERE flag = 1``
+    match every true row. SQL treats BOOL as its own type, so a mixed BOOL/non-BOOL
+    comparison is rejected rather than coerced.
+    """
+    if isinstance(left, bool) == isinstance(right, bool):
+        return
+    other = right if isinstance(left, bool) else left
+    if other is None:
+        return
+    raise ExecutionError(
+        f"Cannot compare BOOL with {_type_label(other)} using operator '{op}'; "
+        "use TRUE/FALSE for boolean comparisons"
+    )
+
+
 def compare_values(op: str, left: Any, right: Any) -> bool | None:
     """Compare two runtime values using SQL comparison semantics.
 
     Returns ``None`` (UNKNOWN) when either operand is NULL, because a NULL
-    comparison is neither TRUE nor FALSE in SQL.
+    comparison is neither TRUE nor FALSE in SQL. BOOL operands only compare with
+    other BOOL operands; numbers compare numerically across INT/FLOAT; a TEXT and
+    a numeric operand are unrelated and compare unequal (never an unevaluated
+    exception).
     """
     normalized = op.upper()
     if normalized not in COMPARISON_OPS:
         raise ExecutionError(f"Unsupported operator '{op}'")
     if left is None or right is None:
         return None
+    _reject_boolean_comparison(normalized, left, right)
     if normalized == "=":
         return left == right
     if normalized in {"!=", "<>"}:

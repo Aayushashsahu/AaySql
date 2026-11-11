@@ -185,12 +185,17 @@ class ServerConfig:
 
     @classmethod
     def from_environment(cls, **kwargs: Any) -> ServerConfig:
-        """Build a config, reading the auth token from the environment only."""
+        """Build a config, reading the auth token from the environment only.
+
+        The environment takes precedence over an explicitly supplied token; the
+        explicit one is popped first so passing both does not raise a duplicate
+        keyword error.
+        """
+        explicit_token = kwargs.pop("auth_token", None)
         token = os.environ.get(AUTH_TOKEN_ENV)
         if token is not None and not token.strip():
             raise ServerConfigError(f"{AUTH_TOKEN_ENV} is set but empty; unset it or provide a token")
-        config = cls(auth_token=token if token is not None else kwargs.pop("auth_token", None), **kwargs)
-        return config
+        return cls(auth_token=token if token is not None else explicit_token, **kwargs)
 
 
 # --- OS-level ownership ---------------------------------------------------

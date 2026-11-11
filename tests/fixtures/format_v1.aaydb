@@ -1,0 +1,56 @@
+{
+  "format": "aaysql",
+  "format_version": 1,
+  "engine_version": "0.3.0",
+  "tables": {
+    "users": {
+      "name": "users",
+      "columns": [
+        {
+          "name": "id",
+          "type_name": "INT",
+          "primary_key": true,
+          "not_null": true,
+          "unique": false,
+          "default": null,
+          "has_default": false
+        },
+        {
+          "name": "name",
+          "type_name": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "unique": false,
+          "default": null,
+          "has_default": false
+        },
+        {
+          "name": "score",
+          "type_name": "INT",
+          "primary_key": false,
+          "not_null": false,
+          "unique": false,
+          "default": null,
+          "has_default": false
+        }
+      ],
+      "rows": [
+        {
+          "id": 1,
+          "name": "ada",
+          "score": 10
+        },
+        {
+          "id": 2,
+          "name": "grace",
+          "score": null
+        },
+        {
+          "id": 3,
+          "name": "alan",
+          "score": 30
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,229 @@
+# Operations Runbook
+
+How to run AayushSQL 1.0.0, read its state, and recover it. Commands assume a
+database called `app.aaydb`; substitute your own path.
+
+**Three rules that never change:**
+
+1. Never delete or truncate a `.wal` file to make an error go away. It may hold the
+   only copy of a committed transaction.
+2. Never run two servers against one database file. The lock prevents it; do not
+   work around the lock by deleting the lock file.
+3. Never copy a `.aaydb` file while a server is writing it. Use `aaysql-backup`,
+   which takes exclusive ownership first.
+
+---
+
+## 1. Starting a server
+
+```bash
+aaysql-server --db app.aaydb --port 8765
+# or: python -m aaysql.server --db app.aaydb
+```
+
+The server validates configuration, takes the database lock, opens the database
+(recovering any pending WAL), binds, and starts accepting. On success it logs
+`AayushSQL v1.0.0 listening on 127.0.0.1:8765 (protocol 1, db=app.aaydb, tls=off,
+auth=off, max_clients=32)`.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--db` | `aaysql.aaydb` | Database path. |
+| `--memory` | off | Run against an in-memory database. |
+| `--host` | `127.0.0.1` | Bind address. Non-loopback requires token + TLS. |
+| `--port` | `8765` | TCP port. `0` picks a free port. |
+| `--max-clients` | 32 | Concurrent connections (semaphore). |
+| `--max-frame-size` | 1048576 | Largest accepted frame, 1 KiB–64 MiB. |
+| `--idle-timeout` | 300 | Seconds without activity before the connection closes. |
+| `--read-timeout` | 60 | Seconds to wait for bytes of a request. |
+| `--write-timeout` | 30 | Seconds allowed for sending a response. |
+| `--shutdown-timeout` | 10 | Grace period for in-flight work at shutdown. |
+| `--tls-cert`, `--tls-key` | none | Enable TLS (both required). |
+| `--tls-client-ca` | none | Require and verify client certificates. |
+| `--log-level` | INFO | `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
+
+Authentication token: **environment only**.
+
+```bash
+export AAYUSQL_AUTH_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+```
+
+An empty `AAYUSQL_AUTH_TOKEN` is a startup error rather than "no authentication".
+
+## 2. Shutting down
+
+`Ctrl+C` (SIGINT) or SIGTERM requests a graceful shutdown: the accept loop stops,
+open connections are closed, an uncommitted transaction is rolled back, in-flight
+work gets up to `--shutdown-timeout`, and the engine is closed. Exit status is `0`
+when the drain succeeded, `1` when it timed out (check the log for
+`shutdown finished without draining in-flight work`).
+
+The database lock is released when the process exits, including on a crash.
+
+## 3. Files on disk
+
+| File | Meaning |
+| --- | --- |
+| `app.aaydb` | The committed snapshot (UTF-8 JSON, format 3). |
+| `app.aaydb.wal` | Present only while a commit is durable but not yet checkpointed. An empty WAL is removed on a clean close. |
+| `app.aaydb.server.lock` | OS-held lock; content is the owner PID for diagnostics only. Never delete it to "fix" a busy database. |
+| `.<db>.<random>.tmp` | Snapshot staging file. Leftovers from a crash are removed on the next successful load. |
+| `app.aaydb.pre-restore-<id>` | The database that a `restore --force` replaced. Delete it once you are satisfied with the restore. |
+
+## 4. Logs
+
+Server logs go to stderr, one line per event, always with the session ID:
+
+```
+2026-11-11 10:12:03,411 INFO aaysql.server: connection accepted from 127.0.0.1 (session 3f2a…)
+2026-11-11 10:12:03,412 INFO aaysql.server: handshake session=3f2a… client=aaysql-python/1.0.0 protocol=1 tls=off
+2026-11-11 10:12:03,415 INFO aaysql.server: request=9c1e… session=3f2a… operation=execute rows=4 duration=0.412ms
+2026-11-11 10:12:05,001 INFO aaysql.server: request=ab77… session=3f2a… code=SQL_PARSE_ERROR duration=0.080ms
+```
+
+What to look for:
+
+- `code=RECOVERY_REQUIRED` or `database service marked unavailable` — see §7.
+- `rejecting connection … maximum of N clients reached` — raise `--max-clients` or
+  reduce concurrency; clients receive `TOO_MANY_CONNECTIONS`.
+- `rolled back the uncommitted transaction of disconnected session …` — normal when
+  a client owning a transaction disappears.
+- `shutdown finished without draining in-flight work` — a statement outlived the
+  shutdown deadline; the engine was not touched, so reopen and inspect.
+- `authentication failed … attempts=2/3` — someone is guessing the token.
+
+Tokens are never logged. Neither are tracebacks sent to clients: an unexpected
+failure is logged server-side with a traceback and the client receives
+`INTERNAL_ERROR: internal server error`.
+
+## 5. WAL recovery
+
+Recovery is automatic on open. The snapshot is loaded, WAL records newer than its
+`wal_lsn` are validated, the newest committed image is installed, and a checkpoint
+rewrites the snapshot atomically before truncating the WAL.
+
+What recovery handles without intervention:
+
+- Torn or checksum-corrupt **trailing** record: dropped, then checkpointed.
+- A crash before `COMMIT`: the transaction is discarded.
+- A crash after the `COMMIT` record was fsynced: the transaction is replayed.
+- Repeated recovery: reopening again is a no-op.
+
+What it refuses (and why that is correct):
+
+- A corrupt record **before** later valid data. Loading fails with `StorageError`
+  instead of silently skipping forward. Restore from a backup; do not edit the WAL.
+- A duplicate `BEGIN`, non-monotonic LSN, mismatched `write_lsn`, or a `CHECKPOINT`
+  pointing at an unknown commit. The log is structurally invalid.
+
+## 6. Ambiguous COMMIT
+
+If `fsync` fails after the `COMMIT` bytes were written, the outcome is genuinely
+unknown. AayushSQL does not guess:
+
+- The engine raises `AmbiguousCommitError` and marks itself unusable.
+- The server answers `RECOVERY_REQUIRED` and marks the whole database unavailable to
+  every session — not just the one that committed.
+- The WAL is preserved untouched; memory is not treated as authoritative.
+
+**Procedure:** stop the server, restart it (recovery decides from the log), then read
+the rows to determine whether the transaction landed. Do not retry the mutation
+blindly, and do not delete the WAL.
+
+## 7. `RECOVERY_REQUIRED`
+
+Every statement returns `RECOVERY_REQUIRED` after an ambiguous commit or a poisoned
+WAL. This is a deliberate stop, not a crash.
+
+1. Note the error text in the log (it says whether the durability state is
+   ambiguous or the WAL is damaged).
+2. Stop the server cleanly if possible; otherwise terminate it.
+3. Confirm no other process is using the database (the lock is released when the
+   owning process exits).
+4. Restart the server. Recovery replays or discards the pending transaction.
+5. Verify the affected rows.
+6. If the restart also fails with `StorageError`, the log or snapshot is damaged:
+   restore the most recent backup into a new path, verify it, then point the server
+   at it. Keep the damaged files for inspection.
+
+## 8. Backup and restore
+
+Offline only: stop the server first.
+
+```bash
+aaysql-backup backup app.aaydb backups/app-2026-11-11
+aaysql-backup verify backups/app-2026-11-11
+aaysql-backup restore backups/app-2026-11-11 app-restored.aaydb
+```
+
+Behavior worth knowing:
+
+- Backup takes the server lock. If a server owns the database you get
+  `database '…' is in use (a server owns it); stop the server first`.
+- Before reading, backup opens the database once so any pending WAL is applied. The
+  backup therefore contains the last durably committed state, not a torn snapshot.
+- An existing backup directory is never replaced without `--force`.
+- Restore verifies the manifest and the SHA-256 of the database file, checks that the
+  format is not newer than this release, and opens the candidate copy before touching
+  the target.
+- Restore refuses an existing target without `--force`, refuses a target owned by a
+  server, and refuses a target that still has a non-empty WAL (recover it first).
+- With `--force` the previous database is moved to
+  `<target>.pre-restore-<uuid>` and kept until the restored copy opens successfully.
+- The source database and WAL are only ever read.
+
+Suggested routine: back up daily while the server is stopped, verify immediately,
+copy the backup directory off the machine, and test a restore into a scratch path
+monthly.
+
+## 9. Disk space
+
+- A snapshot is rewritten in full on every commit. You need free space of roughly
+  the database size during a commit (temporary file) plus the WAL image, which is a
+  full copy of the database per un-checkpointed transaction.
+- A long explicit transaction does **not** accumulate WAL records; only `COMMIT`
+  writes. But a failed checkpoint leaves the WAL in place until the next open.
+- If a commit fails with `StorageError` mentioning the database file or `ENOSPC`,
+  free space and retry the statement; the previous state remains durable.
+- A `RECOVERY_REQUIRED` state does not grow the WAL; further statements are rejected
+  before touching storage.
+
+## 10. Process locking
+
+The lock is an OS advisory lock on `app.aaydb.server.lock`, created with `fcntl.flock`
+on POSIX and `msvcrt.locking` on Windows. It is not a PID-file heuristic, so a crashed
+server (even `SIGKILL`) does not block the next start. A second server on the same
+database fails at startup with
+`database is already owned by another AayushSQL server`.
+
+The lock file may stay on disk after a clean shutdown; an unused lock file is
+harmless. Delete it only when you are certain no process uses the database.
+
+## 11. Single-writer limitations
+
+- Exactly one server process per database, and exactly one active transaction across
+  all its sessions.
+- Other sessions get `TRANSACTION_BUSY` (retryable) while another session holds a
+  transaction. Long transactions block reads from other sessions too.
+- No MVCC, no snapshot isolation, no parallel query execution.
+- Every statement is serialized through one lock, so throughput does not grow with
+  client count.
+
+## 12. Troubleshooting
+
+| Symptom | Likely cause | Action |
+| --- | --- | --- |
+| `database is already owned by another AayushSQL server` | Another server (or backup) holds the lock. | Find and stop it. Do not delete the lock file. |
+| `RECOVERY_REQUIRED` | Ambiguous commit or damaged WAL. | §6 and §7. |
+| `StorageError: Corrupted database file …` | Snapshot is not valid JSON or fails validation. | Restore a backup; keep the file for diagnosis. |
+| `StorageError: Corrupted WAL record …` | Mid-log corruption. | Restore a backup; do not truncate the WAL manually. |
+| `TOO_MANY_CONNECTIONS` | `--max-clients` reached. | Close idle clients or raise the limit. |
+| `TRANSACTION_BUSY` | Another session owns the transaction. | Retry after it commits/rolls back. |
+| `CONNECTION_TIMEOUT` | Client idle or stalled mid-frame. | Reconnect; check client timeouts. |
+| Client raises `ConnectionLostError` | Server closed the connection. | The outcome is unknown — reconnect and inspect before retrying. |
+| Every `CREATE TABLE` says "already exists" | You opened a newer/other database file. | Check `--db` resolves to the file you expect. |
+| `Cannot compare BOOL with INT` | Mixed-type predicate such as `flag = 1`. | Use `flag = TRUE`. |
+
+Reading the database with a text editor is safe only for inspection. Editing it by
+hand is unsupported: validation may reject the file, and a valid-looking but wrong
+edit will be trusted.

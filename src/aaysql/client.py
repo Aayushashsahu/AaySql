@@ -37,6 +37,7 @@ from .protocol import (
     DEFAULT_MAX_FRAME_SIZE,
     DEFAULT_PORT,
     PROTOCOL_VERSION,
+    REQUEST_TOO_LARGE,
     UNSUPPORTED_PROTOCOL_VERSION,
     FrameError,
     TruncatedFrame,
@@ -325,7 +326,12 @@ class AayushSQLClient:
             raise ConnectionError("client is not connected")
 
         try:
-            send_frame(sock, message, self.max_frame_size)
+            send_frame(
+                sock,
+                message,
+                self.max_frame_size,
+                too_large_code=REQUEST_TOO_LARGE,
+            )
         except TimeoutError as exc:
             self._abort()
             raise RequestTimeoutError(
@@ -333,7 +339,7 @@ class AayushSQLClient:
             ) from exc
         except FrameError as exc:
             self._abort()
-            raise ProtocolError(exc.message) from exc
+            raise ProtocolError(f"{exc.code}: {exc.message}") from exc
         except OSError as exc:
             self._abort()
             raise ConnectionLostError(
@@ -354,7 +360,7 @@ class AayushSQLClient:
             ) from exc
         except FrameError as exc:
             self._abort()
-            raise ProtocolError(exc.message) from exc
+            raise ProtocolError(f"{exc.code}: {exc.message}") from exc
         except OSError as exc:
             self._abort()
             raise ConnectionLostError(
@@ -370,7 +376,7 @@ class AayushSQLClient:
             response = decode_message(payload)
         except FrameError as exc:
             self._abort()
-            raise ProtocolError(exc.message) from exc
+            raise ProtocolError(f"{exc.code}: {exc.message}") from exc
         return self._validate_response(response, request_id)
 
     def _validate_response(self, response: dict[str, Any], request_id: str) -> dict[str, Any]:
