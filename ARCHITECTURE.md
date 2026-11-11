@@ -1,6 +1,6 @@
 # Architecture
 
-AayushSQL v0.6.1 separates the language front end, query planning, relational execution, index maintenance, DML/constraint execution, Write-Ahead Logging (WAL), and persistent snapshot storage into focused modules under `src/aaysql/`.
+AayushSQL v0.7.0 separates the language front end, logical/physical query planning, statistics, relational execution, index maintenance, DML/constraint execution, Write-Ahead Logging (WAL), and persistent snapshot storage into focused modules under `src/aaysql/`.
 
 ```text
                   AayushSQL CLI (cli.py)
@@ -16,37 +16,43 @@ AayushSQL v0.6.1 separates the language front end, query planning, relational ex
                  Executor (executor.py)                      |
                   /                 \                    B+ tree (btree.py)
      Planner (planner.py)      Database / Table (storage.py)
-                  \                 /
-              Query pipeline (query.py)
+            |        \                /
+   Statistics    Execution pipeline (execution.py)
+ (statistics.py)          /
+              Expression helpers (query.py)
 ```
 
-## Query Execution Pipeline (`src/aaysql/query.py`)
+## Query Planning & Execution (`src/aaysql/planner.py`, `src/aaysql/execution.py`)
 
-`SELECT` statements follow a structured multi-stage relational pipeline. Planning runs before execution and only chooses the access path for the driving table:
+Planning is split into an explicitly separate logical and physical stage:
 
 ```text
-Planning (index scan or table scan)  [planner.py]
-    -> Source Binding (FROM + aliases)
-    -> JOIN Stage (nested-loop INNER / LEFT JOIN)
-    -> WHERE Stage (row-level filtering, TRUE only)
-    -> GROUP BY Stage (grouping + NULL key handling)
-    -> Aggregate Stage (COUNT, SUM, AVG, MIN, MAX)
-    -> HAVING Stage (group-level filtering, TRUE only)
-    -> Projection Stage (columns, aliases, qualified names)
-    -> ORDER BY Stage (columns, aliases, aggregates)
-    -> LIMIT Stage
+Logical planning            [planner.py: build_logical_plan]
+  source binding (FROM + aliases)
+  join order/type as written, ON conjuncts split on top-level AND
+  WHERE conjuncts assigned to the earliest provably equivalent stage
+  (pushed into a scan, or kept as a post-join FILTER)
+        |
+Physical planning           [planner.py: physical_plan]
+  per-source access path: TABLE SCAN vs INDEX SCAN (cost model)
+  per-join algorithm: NESTED LOOP vs HASH (cost model)
+  wrappers: AGGREGATE -> PROJECTION -> SORT -> LIMIT
+  every node carries estimated rows/cost and a WHY note
+        |
+Plan execution             [execution.py]
+  scans -> joins -> post-join FILTER -> GROUP BY/HAVING -> projection -> ORDER BY -> LIMIT
 ```
 
+- **Logical plan**: a `LogicalPlan` records bound sources, `JoinSpec`s whose order and type are exactly as written, the assigned conjuncts per source (`pushed`) and the conjuncts that must stay after the join (`post_filters`). Predicates are flattened only along top-level `AND`; `OR` is never split. A conjunct is pushed into a scan only when it references exactly that source and that source is not the nullable side of a `LEFT JOIN`. For `LEFT JOIN`s, right-only `ON` conjuncts are pushed into the right input (a row that fails them can never match), while left-only `ON` conjuncts and right-side `WHERE` conjuncts stay above the join.
+- **Physical plan**: `PlanNode` operators are `TABLE SCAN`, `INDEX SCAN`, `JOIN` (`HASH`/`NESTED LOOP`), `FILTER`, `AGGREGATE`, `PROJECTION`, `SORT`, `LIMIT`. Each node stores `estimated_rows`/`estimated_cost` from statistics plus a `why` rationale. The executor runs exactly this tree: the chosen access path and join algorithm are the ones that execute, not a description of a different code path.
+- **Statistics** (`statistics.py`) come from table rows, never from indexes: exact row and NULL counts, distinct counts exact up to 4,096 values and bitmap-estimated beyond, and min/max only when values are comparable. `Table.revision` is bumped by every row mutation; the cache entry is validated against the live table object and revision, and snapshots/rollbacks replace the whole `Database`, so a stale estimate cannot survive a mutation.
+- **Cost model**: costs are abstract units with documented relative constants (`COST_SEQ_ROW`, `COST_INDEX_ROW`, `COST_INDEX_SORT`, `COST_HASH_BUILD`, `COST_HASH_PROBE`, `COST_NL_COMPARE`). The index cost includes restoring table order, so a very wide range can lose to a sequential scan; the hash cost includes build, probe, and estimated matches. Constants were calibrated against `benchmarks/benchmark_optimizer.py`. Small inputs keep the nested-loop reference (`HASH_MIN_INPUT_ROWS`).
+- **Hash join**: buckets are lists, so duplicate keys produce every match; keys are tuples of equality-conjunct columns, so composite keys work; a `NULL` in any key column never matches (SQL `UNKNOWN`); the full `ON` predicate is still evaluated on every candidate, so residual predicates are exact. Output order is left-input order, then right-input order, identical to nested loop.
+- **Row order is unchanged from v0.6.x.** The hash join is an algorithmic substitution, not a reordering: same rows, same order. Join reordering is deliberately not implemented (see Known Limitations).
+- `EXPLAIN` renders the plan and never executes the statement; `EXPLAIN ANALYZE` executes it and appends measured per-operator counters. Figures prefixed with `~` are estimates and the plan text says so.
+- `plan_select(..., force_join_algorithm=..., force_access_path=...)` keeps the v0.6.x nested-loop/table-scan path forceable for equivalence tests and benchmarks. There is no SQL syntax for it.
+
 Three-valued logic is centralized in `query.py` (`sql_and`, `sql_or`, `sql_not`, `is_sql_true`): `NULL` comparisons produce `UNKNOWN`, `UNKNOWN` propagates through `AND`/`OR`/`NOT`, and row filters admit only `TRUE`. A single recursive `eval_expr()` serves row-level and group-level evaluation so the two paths cannot diverge.
-
-## Query Planning (`src/aaysql/planner.py`)
-
-- `plan_select()` returns a `QueryPlan` describing the access path actually executed: `INDEX SCAN` or `TABLE SCAN`.
-- Index eligibility is deliberately narrow: single-table `SELECT`, a top-level `AND` conjunct of the form `column <op> literal` (or `literal <op> column`) with `<op>` in `=`, `>`, `>=`, `<`, `<=`, a matching single-column index, and a literal whose type is compatible with the column. `OR`, `NOT`, `!=`, and `NULL` literals fall back to a table scan.
-- The index only produces candidate rows. The complete original `WHERE` predicate is always re-applied, so results are identical with and without an index.
-- Candidate rows are returned in table order, so an unordered `SELECT ... LIMIT` returns the same rows either way.
-- Indexes are never pushed across joins; joined queries always report `TABLE SCAN` plus `JOIN: NESTED LOOP`.
-- `EXPLAIN` renders the real plan; `EXPLAIN ANALYZE` appends measured counters (rows scanned from the access path, rows filtered, rows returned, execution time). No estimated or fabricated statistics are reported.
 
 ## Transactions (`src/aaysql/transaction.py`, `src/aaysql/engine.py`)
 
@@ -75,8 +81,10 @@ Three-valued logic is centralized in `query.py` (`sql_and`, `sql_or`, `sql_not`,
 
 - **`token.py` & `lexer.py`**: Tokenizes SQL into typed tokens (`PREFIX` for `AAYUSH`, identifiers, numbers, strings, operators, punctuation).
 - **`ast.py` & `parser.py`**: Enforce the single `AAYUSH` prefix and parse DDL/DML, `CREATE INDEX`, `DROP INDEX`, `EXPLAIN [ANALYZE]`, and relational queries into immutable AST nodes.
-- **`query.py`**: Source binding, identifier resolution, `JOIN`, `WHERE`, grouping, aggregates, `HAVING`, projection, `ORDER BY`, and `LIMIT`; owns three-valued logic and duplicate output-label rejection.
-- **`planner.py`**: Chooses and renders the access path; fetches candidate rows for index scans.
+- **`query.py`**: Source binding, identifier resolution, three-valued logic, expression evaluation, grouping/aggregate helpers, and duplicate output-label rejection.
+- **`planner.py`**: Logical planning (predicate placement), physical planning (access paths, join algorithms), the cost model, and plan/metric rendering. Imports no executor code.
+- **`statistics.py`**: Bounded-memory per-table statistics and the revision-validated cache used by the cost model.
+- **`execution.py`**: Runs the physical plan tree: scans, hash/nested-loop joins, post-join filters, aggregation, projection, sort, limit, and per-operator metrics.
 - **`index.py` / `btree.py`**: Secondary index maintenance, lookups, range scans, and B+ tree invariants.
 - **`executor.py`**: Executes DDL/DML and `EXPLAIN`, maintains indexes on mutations, and delegates `SELECT` to the query pipeline.
 - **`wal.py`**: WAL record schema, SHA-256 checksums, strict validation, byte-accurate tail parsing and repair, the append state machine with write-all/poisoning, directory fsync error classification, checkpoint/truncation helpers, and internal crash-test hooks.

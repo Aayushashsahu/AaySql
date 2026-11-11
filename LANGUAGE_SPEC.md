@@ -62,7 +62,7 @@ AAYUSH EXPLAIN SELECT * FROM users WHERE age = 19;
 AAYUSH EXPLAIN ANALYZE SELECT * FROM users WHERE age = 19;
 ```
 
-`EXPLAIN` prints the plan the executor actually uses:
+`EXPLAIN` prints the physical plan the executor actually uses:
 
 ```text
 QUERY PLAN
@@ -70,21 +70,45 @@ QUERY PLAN
 INDEX SCAN: idx_users_age
   TABLE: users
   CONDITION: age = 19
+  FILTER: age = 19
+  WHY: index estimated cheaper: ~1.1 cost units vs ~4.0 for a table scan (~1 candidates)
+  ESTIMATED ROWS: ~1
 ```
 
-Without an applicable index:
+Without an applicable index, or when the cost model prefers a sequential pass:
 
 ```text
 QUERY PLAN
 
 TABLE SCAN: users
   FILTER: age > 18
+  ESTIMATED ROWS: ~2
 ```
 
-- Index-assisted filtering applies to single-table predicates of the form `column <op> literal` or `literal <op> column` with `<op>` in `=`, `>`, `>=`, `<`, `<=` against an existing single-column index. `OR`, `NOT`, `!=` / `<>`, `NULL` literals, type-mismatched literals, and joined queries use a table scan.
-- The full original `WHERE` clause is always re-applied after index retrieval, and candidate rows are returned in table order, so results (including unordered `LIMIT`) are identical with or without an index.
-- `EXPLAIN ANALYZE` appends measured counters: rows scanned from the access path, rows filtered, rows returned, index used, and execution time. Estimates are never fabricated.
-- `EXPLAIN` currently supports `SELECT` statements only. It executes the statement to produce real plans and metrics, so it is not a zero-cost command.
+A join plan names the algorithm and the inputs it consumes:
+
+```text
+QUERY PLAN
+
+PROJECTION: u.id, o.total
+  JOIN: HASH (INNER)
+    ON: u.id = o.user_id
+    HASH KEYS: u.id=o.user_id
+    WHY: hash join estimated cheaper: ... (build ~10000, probe ~10000)
+    ESTIMATED ROWS: ~10000
+    TABLE SCAN: users
+      ESTIMATED ROWS: ~10000
+    TABLE SCAN: orders
+      ESTIMATED ROWS: ~10000
+```
+
+- Plans use the operator vocabulary `TABLE SCAN`, `INDEX SCAN`, `FILTER`, `NESTED LOOP JOIN` / `HASH JOIN`, `AGGREGATE`, `PROJECTION`, `SORT`, and `LIMIT`.
+- Index-assisted filtering applies to a conjunct of the form `column <op> literal` or `literal <op> column` with `<op>` in `=`, `>`, `>=`, `<`, `<=` against an existing single-column index. Indexes are matched per source, so a join input may be indexed too. `OR`, `NOT`, `!=` / `<>`, `NULL` literals, and type-mismatched literals do not use an index.
+- Whether an available index or a table scan is used is decided by a cost model over in-memory statistics (row counts, NULL counts, distinct estimates, min/max). `WHY:` states the choice, and every figure prefixed with `~` is an estimate, not a measurement.
+- Predicates are pushed down only as top-level `AND` conjuncts, never split out of `OR`, and never moved across a `LEFT JOIN` onto its nullable side. Pushed predicates are semantically identical to evaluating the full `WHERE` after the join, so results (including unordered `LIMIT`) are unchanged.
+- Equi-joins of equality conjuncts between the two join inputs may use a hash join; duplicate keys, composite keys, and residual `ON` predicates are all handled. `NULL` keys never match. Every join algorithm emits rows in left-input order and then right-input order, identical to the nested-loop reference.
+- `EXPLAIN ANALYZE` appends measured per-operator counters: rows in/out, rows rejected, index candidates, hash build/probe/bucket matches, nested-loop comparisons, sort/aggregate counts, and per-operator timing.
+- `EXPLAIN` supports `SELECT` statements only. Plain `EXPLAIN` never executes the statement and never mutates state; only `EXPLAIN ANALYZE` runs it.
 
 ### `INSERT INTO`
 ```sql

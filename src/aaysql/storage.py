@@ -11,6 +11,7 @@ from .ast import ColumnDef
 from .btree import BTreeError
 from .errors import ConstraintError, ExecutionError, StorageError
 from .index import INDEX_NAME_PATTERN, Index
+from .statistics import StatisticsStore
 from .wal import _CRASH_ENV_VAR, WalManager, _maybe_crash, fsync_dir, parse_wal
 
 FORMAT_NAME = "aaysql"
@@ -18,7 +19,7 @@ FORMAT_VERSION = 3
 # Format versions 1 (pre-index) and 2 (pre-WAL) remain readable and upgrade to
 # version 3 on the next write or recovery checkpoint.
 READABLE_FORMAT_VERSIONS = (1, 2, 3)
-ENGINE_VERSION = "0.6.1"
+ENGINE_VERSION = "0.7.0"
 
 TYPE_MAP: dict[str, type] = {
     "INT": int,
@@ -168,10 +169,17 @@ class Table:
     name: str
     columns: list[ColumnDef]
     rows: list[dict[str, Any]] = field(default_factory=list)
+    # Bumped on every row mutation so cached planner statistics cannot go stale.
+    # Not persisted: it is a runtime cache key, not part of the file format.
+    revision: int = 0
 
     @property
     def column_names(self) -> list[str]:
         return [c.name for c in self.columns]
+
+    def touch(self) -> None:
+        """Record that this table's rows changed."""
+        self.revision += 1
 
     def ensure_column(self, name: str) -> None:
         if name not in self.column_names:
@@ -182,6 +190,7 @@ class Table:
             name=self.name,
             columns=list(self.columns),
             rows=[row.copy() for row in self.rows],
+            revision=self.revision,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -249,6 +258,10 @@ class Database:
         # table rows whenever a database is loaded.
         self.indexes: dict[str, Index] = {}
         self.wal_lsn: int = 0
+        # Planner statistics cache. A clone/reload starts empty, so snapshot
+        # installation (transaction rollback, WAL recovery) can never expose
+        # statistics that describe a superseded row set.
+        self.stats = StatisticsStore()
 
     def create_table(self, name: str, columns: list[ColumnDef]) -> None:
         if name in self.tables:
@@ -264,6 +277,7 @@ class Database:
     def drop_table(self, name: str) -> None:
         self.table(name)
         del self.tables[name]
+        self.stats.invalidate(name)
         for index_name in [n for n, index in self.indexes.items() if index.table == name]:
             del self.indexes[index_name]
 

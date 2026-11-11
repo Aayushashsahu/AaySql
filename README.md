@@ -12,7 +12,7 @@ Every top-level SQL statement must begin with `AAYUSH`. Ordinary SQL without the
 
 ## Current Version
 
-**v0.6.1** — WAL recovery hardening: newline-delimited JSON WAL (`<db>.wal`) with SHA-256 checksums, `fsync` commit durability, `.aaydb` format v3 (`wal_lsn`) with v1/v2 migration, crash-safe checkpoint ordering, idempotent startup recovery, and real subprocess `os._exit()` crash verification. v0.6.1 repairs corrupt WAL tails before checkpointing, distinguishes genuine directory `fsync` failures from unsupported platforms, and prevents partial appends from being followed by new records.
+**v0.7.0** — Cost-based query optimizer: a structured logical/physical plan pipeline, hand-written hash joins for `INNER` and `LEFT` joins (duplicate keys, composite keys, `NULL` keys, residual predicates, deterministic row order), bounded-memory table statistics with revision-based invalidation, safe top-level `AND` predicate pushdown, cost-based access-path and join-algorithm selection, and per-operator `EXPLAIN`/`EXPLAIN ANALYZE` output. Correctness is defined by the retained nested-loop/table-scan reference path: every optimization is equivalence-tested against it.
 
 ## Why the `AAYUSH` Prefix Exists
 
@@ -28,7 +28,7 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 
 ## Implemented vs. Planned Features
 
-### Implemented (v0.6.1)
+### Implemented (v0.7.0)
 - Mandatory `AAYUSH` top-level statement prefix (rejects missing or duplicate `AAYUSH`).
 - DDL & DML: `CREATE TABLE`, `DROP TABLE`, `INSERT INTO ... VALUES ...`, `SELECT ... FROM ...`, `UPDATE ... SET ...`, `DELETE FROM ...`.
 - Relational joins & source binding:
@@ -39,9 +39,17 @@ Everything behind the parser — relational joins, column resolution, grouping, 
   - From-scratch B+ tree (`src/aaysql/btree.py`): ordered linked leaves with range traversal, internal separator nodes, node splitting, borrowing/merging on delete, duplicate keys, and structural invariant validation.
   - `CREATE INDEX idx ON table (column)` / `DROP INDEX idx` for single-column, non-unique indexes. Definitions persist in `.aaydb`; trees are rebuilt from table rows on open.
   - Indexes stay synchronized with `INSERT`, `UPDATE`, and `DELETE`, are removed by `DROP TABLE`, and never replace table rows as the source of truth.
-  - Query planner reuses an index for single-table `=`, `>`, `>=`, `<`, `<=` predicates and falls back to a table scan otherwise. The full `WHERE` clause is always re-applied and candidate rows keep table order, so indexed and unindexed results are identical.
-  - `EXPLAIN SELECT ...` reports the real access path (`INDEX SCAN` / `TABLE SCAN`); `EXPLAIN ANALYZE` adds measured rows scanned, rows filtered, rows returned, index used, and execution time.
-  - Reproducible benchmarks in `benchmarks/benchmark_index.py`, with recorded measurements in `BENCHMARKS.md`.
+  - The cost-based planner matches an index to a `=`, `>`, `>=`, `<`, `<=` conjunct per source and then decides between `INDEX SCAN` and `TABLE SCAN` by estimated cost. Pushed predicates are re-checked on every candidate and candidate rows keep table order, so indexed and unindexed results are identical.
+  - Reproducible benchmarks in `benchmarks/benchmark_index.py` and `benchmarks/benchmark_optimizer.py`, with recorded measurements in `BENCHMARKS.md`.
+- Query optimizer (v0.7.0):
+  - Structured planning: a logical plan (bound sources, join order/type, predicate placement) is separate from the physical plan (`TABLE SCAN`, `INDEX SCAN`, `NESTED LOOP JOIN`, `HASH JOIN`, `FILTER`, `AGGREGATE`, `PROJECTION`, `SORT`, `LIMIT`). The executor runs the physical plan that was selected.
+  - Hand-written hash join for equi-joins: multi-row buckets (duplicate keys produce every match), composite keys from conjunctions of equalities, `NULL` keys never match, and the full `ON` predicate is still evaluated on every candidate so residual predicates are exact. Non-equi, `OR`, and unsafe key extractions fall back to nested loop.
+  - Deterministic ordering: every join algorithm emits rows in left-input order and then right-input order, exactly like the nested-loop reference, so unordered queries (and `LIMIT`) keep their previous results.
+  - In-memory statistics (`src/aaysql/statistics.py`): exact row and `NULL` counts, distinct counts exact up to 4,096 values and bitmap-estimated beyond (bounded memory), and min/max when comparable. Derived from rows, never from indexes, and invalidated by every mutation, rollback, and reopen.
+  - Safe predicate pushdown: only top-level `AND` conjuncts are pushed, `OR` is never split, predicates are never detached from their relations, right-side `WHERE` predicates of a `LEFT JOIN` stay after the join, right-only `ON` conjuncts are pushed into the right input, and left-only `ON` conjuncts are never pushed below a `LEFT JOIN`.
+  - Cost model: documented relative constants for sequential rows, index seek/candidates/order restoration, hash build/probe/matches, and nested-loop comparisons, with a stated rationale (`WHY:`) for each hardware-free choice in `EXPLAIN`. Small joins keep the nested-loop reference.
+  - `EXPLAIN` reports estimates (`~rows`) and never executes the statement or mutates state; `EXPLAIN ANALYZE` reports measured per-operator counters (rows in/out, rejected, index candidates, hash build/probe/bucket matches, nested-loop comparisons, aggregate/sort/limit counts, per-operator timing).
+  - Equivalence suite (`tests/test_optimizer.py`) comparing every optimization against the forceable nested-loop/table-scan reference across duplicates, `NULL` keys, composite keys, residuals, joins with/without indexes, skew, empty and one-row inputs, and size ratios.
 - Aggregation & grouping:
   - `COUNT(*)`, `COUNT(column)`, `SUM(column)`, `AVG(column)`, `MIN(column)`, `MAX(column)`.
   - `GROUP BY` across one or more columns (including `NULL` grouping keys) with SQL grouping correctness validation.
@@ -72,7 +80,6 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 - Automated GitHub Actions CI across Python 3.10–3.13.
 
 ### Planned (Future Roadmap)
-- **v0.7** — Query optimizer: hash joins, cardinality statistics, filter pushdown, profiling.
 - **v0.8** — Client/server: network protocol, server binary, authentication, localhost-by-default binding.
 - **v0.9** — SQL language expansion: `IS NULL`, `LIKE`, `IN`, `BETWEEN`, `DISTINCT`, arithmetic expressions, `OFFSET`, `CASE`.
 
@@ -159,9 +166,11 @@ GitHub Actions CI (`.github/workflows/tests.yml`) runs `python -m pytest -v` on 
 
 ## Known Limitations
 
-- Nested-loop join execution only; index plans cover single-table predicates, not joins or hash joins.
-- Single-column, non-unique indexes only; no optimizer statistics, and `EXPLAIN` executes the query it explains.
-- `EXPLAIN` supports `SELECT` statements only and reports metrics for the driving access path; nested-loop inner scans are not counted in `ROWS SCANNED`.
+- Join order is never rewritten: joins execute in the order written. Reordering an `INNER` chain would change the documented unordered-result order, so it is deliberately not implemented; `WHERE`/`ON` conjuncts on a single input are pushed down instead.
+- Statistics are recomputed lazily by a full table pass when a table's revision changes; there is no background refresh or persisted histogram. Distinct counts beyond 4,096 values are estimates.
+- Only equality conjuncts between the two join inputs enable a hash join. There is no hash aggregate, index-nested-loop join, sort-merge join, or parallel execution.
+- Single-column, non-unique indexes only; index matching does not use composite indexes, and `UPDATE`/`DELETE` row selection is still a table scan.
+- `EXPLAIN` supports `SELECT` statements only. Plain `EXPLAIN` does not execute the query (it does read rows to compute statistics); `EXPLAIN ANALYZE` does execute it, read-only.
 - Duplicate output labels in one `SELECT` list are rejected with `ExecutionError` (result rows are keyed by label), so distinct aliases are required.
 - `RIGHT JOIN`, `FULL JOIN`, `CROSS JOIN`, and qualified wildcards (`u.*`) are not supported.
 - `GROUP BY` supports simple column references (qualified or unqualified), not arbitrary expressions; nested aggregate functions (`SUM(COUNT(*))`) are not supported.
