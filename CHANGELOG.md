@@ -2,6 +2,36 @@
 
 All notable changes to AayushSQL are documented in this file.
 
+## [0.9.0] — 2026-11-11
+
+### Added
+- **Unified expression engine (`src/aaysql/expressions.py`)** — every expression node is walked by one shared traversal and evaluated by one canonical evaluator:
+  - `iter_expr_children` / `walk_expr` are the single description of expression shape. Identifier validation, aggregate detection and placement, grouped-expression rules, planner predicate-source analysis, and EXPLAIN rendering all use them, so a new node type cannot silently bypass a rule. An unknown node raises `ExecutionError` instead of being ignored, and a test asserts every expression class is covered.
+  - `eval_expr` serves row-level and group-level evaluation (aggregates resolve through a callback) and is used by both the reference DML path and the plan-driven `SELECT` path — there is no second evaluator.
+- **Expression parsing (`src/aaysql/parser.py`, `src/aaysql/lexer.py`)** — one precedence-climbing parser: `OR` < `AND` < `NOT` < comparisons/`IS`/`IN`/`BETWEEN`/`LIKE` < `+ -` < `* / %` < unary `+`/`-` < primary. Parentheses override it. Numbers are now lexed unsigned, so `1-2` is unambiguously subtraction; a sign is folded into an adjacent numeric literal, so `-5` and `DEFAULT -4` still work. `*` remains a wildcard only in the `SELECT` list position. New tokens: `+ - / %`, plus `TRUE`/`FALSE` literals.
+- **`IS NULL` / `IS NOT NULL`** — never `UNKNOWN`, and deliberately not implemented as an equality comparison (`5 = NULL` stays `UNKNOWN`, `5 IS NULL` is `FALSE`). Always a table scan, because NULLs are not indexed.
+- **`LIKE` / `NOT LIKE`** — `%` (any run) and `_` (exactly one character), case-sensitive. Patterns are compiled into an anchored regex with every non-wildcard character escaped and a 256-entry bounded cache, so user patterns are never executed as regular expressions. Both operands must be `TEXT`; `NULL` on either side yields `UNKNOWN`, and `NOT LIKE` preserves it.
+- **`IN` / `NOT IN`** — three-valued membership: TRUE on a match, `UNKNOWN` when nothing matches but a candidate is `NULL`, FALSE otherwise, and `UNKNOWN` when the left operand is `NULL`. Empty lists and subqueries inside `IN` are `ParserError`s. List members may be any scalar expression.
+- **`BETWEEN` / `NOT BETWEEN`** — inclusive at both ends, defined as `x >= low AND x <= high`, preserving `UNKNOWN`. `column BETWEEN literal AND literal` can use a single inclusive index range scan; the original predicate remains authoritative and both paths are tested for identical rows.
+- **Arithmetic** — `+ - * / %` and unary `+`/`-`: `INT` operands stay `INT` for `+ - * %`, `/` always produces a float, modulo follows floored Python semantics, `NULL` propagates, and `BOOL`/`TEXT` operands, division/modulo by zero, and non-finite results raise `ExecutionError`. `UPDATE` remains statement-atomic when an expression raises.
+- **`CASE`** — searched and simple forms, first `TRUE` branch wins (`UNKNOWN` never matches), missing `ELSE` yields `NULL`, simple `CASE` uses SQL `=` so a `NULL` base never matches `WHEN NULL`, nesting is supported, and `CASE` inside aggregates and `UPDATE` assignments composes with existing coercion and constraints.
+- **`SELECT DISTINCT`** — duplicate elimination over the complete projected row, after projection and before ordering; first occurrence kept, `NULL`s equal, type-tagged keys (`TRUE` is not `1`). `ORDER BY` must reference the projected row (unique alias, selected expression, or a selected column for `DISTINCT *`), otherwise the query is rejected.
+- **`OFFSET`** — `LIMIT n OFFSET m` and `OFFSET m` without `LIMIT`; non-negative integers only, `OFFSET` before `LIMIT` rejected. Applied after `ORDER BY` and before `LIMIT`, never before filtering, joining, grouping, or sorting.
+- **`ORDER BY` expressions** — sort keys are now arbitrary expressions (`ORDER BY price * quantity DESC`), in addition to columns, aliases, and aggregates.
+- **Planner/optimizer integration** — new expressions participate in safe predicate pushdown and grouped validation; hash keys still come only from `column = column`, with new expression conjuncts evaluated as residual predicates; `BETWEEN` gets the range-scan access path; `EXPLAIN` renders `DISTINCT`, `OFFSET`, computed projections, and the full `CASE`/`LIKE`/`IN`/`BETWEEN` text; `EXPLAIN ANALYZE` reports `duplicates_removed`, `rows_discarded`, and post-`LIMIT` rows. Selectivity is refined only where statistics exist (`IS NULL`, `IN`, `BETWEEN`, comparisons); `LIKE`, `CASE`, and arithmetic keep the conservative default.
+- **Tests** — `tests/test_expressions.py` (parser precedence, AST shape, truth tables, context coverage), `tests/test_language_queries.py` (planning, EXPLAIN, index equivalence, LEFT JOIN placement, hash/nested-loop equivalence, persistence, transactions), `tests/test_expression_fuzz.py` (deterministic randomized differential testing against an independent reference interpreter and LIKE matcher), and `tests/test_client_server_language.py` (real TCP sockets, embedded-vs-client equivalence, error codes, transaction isolation).
+- **Benchmarks** — `benchmarks/benchmark_language.py` (arithmetic projection/filtering, LIKE on small vs large text, IN, BETWEEN with and without an index, DISTINCT low/high cardinality, CASE, OFFSET, combined filter/group/sort, and join regression), recorded in `BENCHMARKS.md`.
+
+### Changed
+- Version metadata is `0.9.0` (`pyproject.toml`, `aaysql.__version__`, `storage.ENGINE_VERSION`).
+- Computed `SELECT` projections are no longer elided from `EXPLAIN`; a single-table query is only elided when every selected item is a plain column reference.
+- `DEFAULT` accepts signed literals and `TRUE`/`FALSE`, matching the expression parser.
+
+### Notes
+- The `.aaydb` format remains **version 3** and the network protocol remains **version 1**; neither storage nor WAL behaviour changed.
+- Index support remains deliberately narrow: `IS NULL`, `LIKE`, `IN`, `NOT BETWEEN`, arithmetic, and `CASE` predicates use a table scan, and the planner never rewrites an arbitrary expression into an indexed comparison.
+- No optimizer or storage claims are attached to this release: the language expansion does not make existing queries faster, and no measured speedup is claimed.
+
 ## [0.8.0] — 2026-11-11
 
 ### Added
