@@ -2,6 +2,42 @@
 
 All notable changes to AayushSQL are documented in this file.
 
+## [0.7.0] — 2026-11-11
+
+### Added
+- **Cost-based query optimizer (`src/aaysql/planner.py`)** — the planner is now a two-stage optimizer instead of a single-table access-path picker:
+  - **Logical planning** binds sources and decides *what* to compute: join order and join types stay exactly as written, `WHERE` and `ON` clauses are split along top-level `AND` only (`OR` is never split), and each conjunct is assigned to the earliest stage where it is provably equivalent.
+  - **Physical planning** decides *how*: per-source `INDEX SCAN` vs `TABLE SCAN`, per-join `HASH JOIN` vs `NESTED LOOP JOIN`, plus `FILTER`, `AGGREGATE`, `PROJECTION`, `SORT`, and `LIMIT` wrappers. Every node carries `estimated_rows`, `estimated_cost`, and a `WHY` rationale.
+  - The executor runs the selected physical plan; `EXPLAIN` no longer describes a path the executor might not take.
+- **Hash join (`src/aaysql/execution.py`)** — hand-written, for `INNER` and `LEFT` joins:
+  - multi-row buckets, so duplicate keys produce every match;
+  - composite keys built from a conjunction of equalities;
+  - `NULL` key columns never match, matching SQL `UNKNOWN` semantics;
+  - the complete `ON` predicate is still evaluated on every candidate, so residual predicates are exact;
+  - non-equi conditions, `OR` conditions, and unsafe key extractions fall back to nested loop;
+  - output order is left-input order then right-input order — identical to the nested-loop implementation, so unordered results and `LIMIT` are unchanged.
+- **Table statistics (`src/aaysql/statistics.py`)** — exact row and `NULL` counts, distinct counts exact up to 4,096 values and bitmap-estimated beyond (fixed memory), and min/max when values are comparable. Statistics are derived from rows, never from indexes. Cached entries are validated against the live `Table` object and a new `Table.revision` counter that is bumped by `INSERT`/`UPDATE`/`DELETE`; snapshots, rollbacks, and reloads replace the whole `Database` (and its cache), so stale statistics cannot survive a mutation.
+- **Safe predicate pushdown** — only top-level `AND` conjuncts, only onto their own source, and:
+  - right-side `WHERE` predicates of a `LEFT JOIN` stay above the join;
+  - right-only `ON` conjuncts are pushed into the right input (a row that fails them can never match);
+  - left-only `ON` conjuncts are never pushed below a `LEFT JOIN`;
+  - multi-relation predicates always stay at the post-join `FILTER`.
+- **Cost model** — documented relative constants for sequential rows, index seek/candidates/table-order restoration (so a very wide range can lose to a sequential scan), hash build/probe/matches, and nested-loop comparisons, calibrated against `benchmarks/benchmark_optimizer.py`. Inputs below `HASH_MIN_INPUT_ROWS` keep the nested-loop reference.
+- **`EXPLAIN` / `EXPLAIN ANALYZE`** — plain `EXPLAIN` no longer executes the statement; it reports the plan and labelled estimates (`~rows`, plus an explicit note that estimates are not measurements). `EXPLAIN ANALYZE` reports real per-operator counters: rows in/out, rows rejected, index candidates, hash build/probe/bucket matches, nested-loop comparisons, aggregate/projection/sort/limit counts, and per-operator timing.
+- **Tests (`tests/test_optimizer.py`, 65 tests)** — equivalence of every optimization against the forceable nested-loop/table-scan reference: duplicates, all-`NULL` keys, composite keys, residual predicates, three-table chains, with and without indexes, empty/one-row/skewed/many-to-many/size-ratio datasets, `GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`, pushdown rules, statistics exactness, invalidation through `INSERT`/`UPDATE`/`DELETE`/`ROLLBACK`/reopen, bounded distinct estimation, cost-model choices in both directions, `EXPLAIN` not executing, and metrics accuracy.
+- **Benchmarks (`benchmarks/benchmark_optimizer.py`)** — stdlib-only, deterministic, warm-up plus median/min/max spread, with the reference path measured where feasible and larger runs explicitly labelled as extrapolation. Results in `BENCHMARKS.md`.
+- **Planner hooks**: `plan_select(..., force_join_algorithm=..., force_access_path=...)` keeps the v0.6.x path forceable for tests and benchmarks. There is no new SQL syntax.
+
+### Changed
+- `SELECT` execution moved from `query.py` to `src/aaysql/execution.py`; `query.py` keeps source binding, three-valued logic, and expression evaluation. `query.execute_select()` remains importable and delegates.
+- Plan rendering now uses operator names (`JOIN: HASH (INNER)`, `JOIN: NESTED LOOP (INNER)`, `AGGREGATE: GROUP BY ...`) while keeping the v0.4.0 plan lines (`TABLE SCAN:`, `INDEX SCAN:`, `TABLE:`, `CONDITION:`, `FILTER:`) that existing output contracts rely on.
+- `ROWS SCANNED` in `EXPLAIN ANALYZE` now counts rows read from every base input, including join inputs; `ROWS FILTERED` counts rows actually rejected by filters.
+
+### Notes
+- The `.aaydb` format remains **version 3**; no migration is required from v0.6.1, and no storage/durability behaviour changed.
+- Join reordering is deliberately not implemented: it would change the documented unordered result order. See the README limitations.
+- Version metadata updated to `0.7.0`.
+
 ## [0.6.1] — 2026-11-11
 
 ### Fixed

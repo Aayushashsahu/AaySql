@@ -1,3 +1,106 @@
+# AayushSQL Benchmarks
+
+## v0.7.0 optimizer and hash-join benchmarks
+
+Produced by `benchmarks/benchmark_optimizer.py`. Nothing here is enforced in CI:
+the script has no timing assertions and CI does not fail on slow or noisy runners.
+
+### Environment
+
+- OS: Windows 10 (10.0.26300), Python 3.11.15 (CPython), Intel64 Family 6 Model 189
+- Engine: in-memory (`Engine()`), so no `.aaydb` write or WAL `fsync` is included
+- Seed: `20261111` (deterministic datasets); repeats: 5 (3 for the nested-loop
+  reference), plus 1 discarded warm-up; reported value is the **median** wall-clock
+  per query, with the observed min/max spread
+- Reference path: forced nested-loop joins over table scans
+  (`plan_select(..., force_join_algorithm="NESTED LOOP", force_access_path="TABLE")`),
+  i.e. the v0.6.x implementation
+- Benchmark tables carry no `PRIMARY KEY`/`UNIQUE` constraints: the engine's existing
+  per-row uniqueness check is linear in table size, so constraints would make dataset
+  creation the bottleneck rather than the query
+
+Reproduce with:
+
+```bash
+python benchmarks/benchmark_optimizer.py
+```
+
+### Join benchmarks
+
+`users` (left, `id`) joins `orders` (right, `user_id`) on `u.id = o.user_id`.
+Every optimized row count was compared with the reference path wherever the
+reference path was measured, and they are identical.
+
+| Scenario | Join | Rows out | Plan | Optimized median | Reference median | Speedup |
+|---|---|---:|---|---:|---:|---:|
+| 1k × 1k | INNER | 1,000 | HASH INNER ← TABLE SCAN ← TABLE SCAN | 7.0 ms | 3,374.8 ms | 480× |
+| 1k × 1k | LEFT | 1,368 | HASH LEFT ← TABLE SCAN ← TABLE SCAN | 9.9 ms | 2,749.2 ms | 277× |
+| 10k × 10k | INNER | 10,000 | HASH INNER | 84.4 ms | not measured (10⁸ comparisons) | — |
+| 10k × 10k | LEFT | 13,624 | HASH LEFT | 108.1 ms | not measured | — |
+| 100k × 10k | INNER | 10,000 | HASH INNER | 184.6 ms | not measured (10⁹ comparisons) | — |
+| 100k × 10k | LEFT | 100,498 | HASH LEFT | 560.6 ms | not measured | — |
+| 10k × 100k | INNER | 100,000 | HASH INNER | 964.1 ms | not measured (10⁹ comparisons) | — |
+| 10k × 100k | LEFT | 100,001 | HASH LEFT | 867.8 ms | not measured | — |
+| 10k × 10k high duplicate (10 keys) | INNER | 10,000 | HASH INNER | 66.9 ms | not measured | — |
+| 10k × 10k high duplicate (10 keys) | LEFT | 19,990 | HASH LEFT | 106.6 ms | not measured | — |
+| 10k × 10k skewed (80% in 25 keys) | INNER | 10,000 | HASH INNER | 78.1 ms | not measured | — |
+| 10k × 10k skewed | LEFT | 18,143 | HASH LEFT | 110.9 ms | not measured | — |
+| 10k × 10k many unmatched | INNER | 0 | HASH INNER | 17.2 ms | not measured | — |
+| 10k × 10k many unmatched | LEFT | 10,000 | HASH LEFT | 48.5 ms | not measured | — |
+
+Observed spread for the measured reference runs: 1k × 1k INNER 2,681.7–4,336.1 ms,
+LEFT 2,624.5–3,611.7 ms. Optimized spreads stay within roughly ±25% of the median
+(e.g. 10k × 100k INNER 876.4–1,149.0 ms).
+
+### Why most reference runs were not measured
+
+The reference nested-loop path performs about **320,000 comparisons/second** on this
+machine (measured: 500 × 500 INNER, 250,000 comparisons, 780.0 ms median). A
+10k × 10k join needs 10⁸ comparisons and 100k × 10k needs 10⁹, so those rows report
+extrapolations instead of measurements:
+
+| Scenario | Comparisons | Extrapolated reference time |
+|---|---:|---:|
+| 10k × 10k | 100,000,000 | ~312 s |
+| 100k × 10k | 1,000,000,000 | ~3,120 s |
+| 10k × 100k | 1,000,000,000 | ~3,120 s |
+
+These are extrapolations from a measured rate, not measurements, and no speedup
+figure is claimed for them.
+
+### Access-path selection (`t` 50,000 rows, index on `k`)
+
+The planner chose as follows; both paths were measured on identical data and returned
+identical rows.
+
+| Predicate | Rows out | Chosen plan | Table scan | Index scan | Chosen time |
+|---|---:|---|---:|---:|---:|
+| `k = 4242` | 1 | INDEX SCAN | 68.89 ms | 0.06 ms | 0.02 ms |
+| `k >= 49990` | 11 | INDEX SCAN | 73.87 ms | 0.04 ms | 0.04 ms |
+| `k >= 25000` | 25,001 | INDEX SCAN | 135.46 ms | 108.20 ms | 105.22 ms |
+| `k >= 0` | 50,000 | TABLE SCAN | 216.47 ms | 217.28 ms | 214.16 ms |
+
+- Narrow lookups are ~1,000× faster with the index, which is why the cost model
+  selects it there.
+- For a half-table range the index is still cheaper (108 ms vs 135 ms) because it
+  avoids evaluating the predicate over 50,000 rows, even though it must restore table
+  order. The model selects the index.
+- For a full-table range the two paths are equal within noise (216 ms vs 217 ms).
+  The model selects the table scan because the index must read every row *and* restore
+  order; the small absolute gap is honestly reported rather than presented as a win.
+
+### Caveats
+
+- One machine and one Python version; absolute timings will vary, and the relative
+  ordering of two in-memory operators this fast is sensitive to cache and GC noise.
+- In-memory execution excludes persistence cost; persistent databases clone the
+  database and rewrite the JSON snapshot per mutating statement, which dominates there.
+- Hash-join timing includes plan construction and statistics computation on the first
+  call only; repeated runs reuse the revision-validated statistics cache.
+- No speedup is claimed where the reference path was not measured.
+
+---
+
 # AayushSQL v0.4.0 Index Benchmarks
 
 Measurements produced by `benchmarks/benchmark_index.py` on the machine below.
