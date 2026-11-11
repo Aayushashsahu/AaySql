@@ -71,6 +71,11 @@ class Engine:
     def needs_recovery(self) -> bool:
         return self._recovery_required
 
+    @property
+    def wal_poisoned(self) -> bool:
+        """True when a failed WAL append left the log in a recovery-only state."""
+        return self.storage is not None and self.storage.wal.poisoned
+
     def _ensure_usable(self) -> None:
         if self._closed:
             raise StorageError("Cannot execute statement on a closed Engine")
