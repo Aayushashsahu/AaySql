@@ -1,0 +1,33 @@
+{
+  "format": "aaysql",
+  "format_version": 3,
+  "engine_version": "0.9.0",
+  "wal_lsn": 0,
+  "tables": {
+    "users": {
+      "name": "users",
+      "columns": [
+        {
+          "name": "id",
+          "type_name": "BLOB",
+          "primary_key": true,
+          "not_null": true,
+          "unique": false,
+          "default": null,
+          "has_default": false
+        }
+      ],
+      "rows": []
+    }
+  },
+  "indexes": {
+    "idx_users_name": {
+      "table": "users",
+      "column": "name"
+    },
+    "idx_users_score": {
+      "table": "users",
+      "column": "score"
+    }
+  }
+}
