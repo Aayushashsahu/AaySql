@@ -1,5 +1,90 @@
 # AayushSQL Benchmarks
 
+## v0.8.0 client/server benchmarks
+
+Produced by `benchmarks/benchmark_server.py`. Nothing here is enforced in CI: the
+script has no timing assertions and CI does not fail on slow or noisy runners.
+
+### Environment
+
+- OS: Windows 10 (10.0.26300), Python 3.11.15 (CPython)
+- Server and client on the same machine, over real TCP on `127.0.0.1` (ephemeral port)
+- Database: on-disk `.aaydb` in a temporary directory, so autocommit `INSERT`
+  numbers include the engine's normal WAL `fsync` durability cost
+- One discarded warm-up per scenario; reported value is the **median** per-request
+  wall clock, with p95 and the observed min/max range
+- Benchmark tables carry no `PRIMARY KEY`/`UNIQUE` constraints (the engine's
+  per-row uniqueness check is linear in table size)
+- 4 clients in the multi-client scenario, 60 requests each; 1,360 requests total
+
+Reproduce with:
+
+```bash
+python benchmarks/benchmark_server.py
+```
+
+### Connection and transport
+
+| Scenario | n | median | p95 | min | max |
+| --- | --- | --- | --- | --- | --- |
+| connect + `hello` handshake | 30 | 1.49 ms | 18.10 ms | 1.14 ms | 22.92 ms |
+| `ping` round trip (no SQL) | 300 | 0.22 ms | 0.46 ms | 0.09 ms | 1.37 ms |
+| connect + ping + close (churn) | 50 | 2.64 ms | 11.06 ms | 1.89 ms | 26.27 ms |
+
+`ping` measures framing plus the TCP round trip and nothing else. Connection
+setup is dominated by socket accept and handshake bookkeeping, and its p95 is
+noisy on Windows.
+
+### SQL execution
+
+| Scenario | n | median | p95 | min | max |
+| --- | --- | --- | --- | --- | --- |
+| point `SELECT`, 1 column (1,000-row table, scan) | 200 | 2.05 ms | 2.65 ms | 1.52 ms | 3.11 ms |
+| point `SELECT`, 3 columns | 200 | 1.92 ms | 2.41 ms | 1.54 ms | 4.65 ms |
+| full scan `SELECT` (1,000 rows) | 50 | 2.55 ms | 3.40 ms | 2.11 ms | 5.49 ms |
+| `INSERT` autocommit (WAL `fsync`) | 100 | 6.03 ms | 50.13 ms | 4.39 ms | 315.44 ms |
+| `BEGIN` + 20 `INSERT` + `COMMIT` | 10 | 15.33 ms | 19.89 ms | 13.45 ms | 19.89 ms |
+
+A single `INSERT` costs roughly 2–3× a `SELECT` because autocommit pays for the
+WAL append and `fsync`; the p95/max outlier is an `fsync` stall on this machine,
+not protocol overhead. An explicit transaction amortizes one commit over 20
+inserts. These numbers are per *statement*; statements execute serially (see
+below).
+
+### Large result transfer
+
+| Scenario | n | median | p95 | min | max |
+| --- | --- | --- | --- | --- | --- |
+| `SELECT` 2,000 rows × 200 chars (~0.46 MB JSON) | 20 | 3.91 ms | 8.34 ms | 3.50 ms | 26.23 ms |
+
+A ~0.46 MB result travels well inside the 1 MiB frame limit; the database file
+was 0.54 MB at that point. The dominant cost is materialising rows and JSON
+encoding, not the socket.
+
+### Multiple simultaneous clients (serialized execution)
+
+| Scenario | n | median | p95 | throughput | failures |
+| --- | --- | --- | --- | --- | --- |
+| 4 clients × 60 `ping` | 240 | 0.44 ms | 0.76 ms | 7,995 requests/s | 0 |
+
+Concurrent clients do **not** scale database work. Every statement passes through
+one execution lock, so aggregate throughput is bounded by serialized execution:
+multiple clients improve accessibility and application integration, not raw
+query throughput. The multi-client scenario uses `ping` deliberately — it shows
+the transport stays correct and correlated under concurrency without implying
+parallel database work. No row corruption, cross-session response mix-up, or
+transaction leakage was observed (`tests/test_client_server.py` asserts this over
+real sockets).
+
+### Caveats
+
+- Loopback only: these numbers say nothing about network latency or bandwidth.
+- Windows timing granularity and antivirus/`fsync` behaviour explain the wide
+  `INSERT` p95 compared with its median; the median is the comparable figure.
+- In-memory mode (`--memory`) removes WAL `fsync` cost from `INSERT` entirely.
+- Absolute numbers will vary by machine; the ratios (SQL ≫ transport, autocommit
+  ≫ transactional insert) are the reproducible part.
+
 ## v0.7.0 optimizer and hash-join benchmarks
 
 Produced by `benchmarks/benchmark_optimizer.py`. Nothing here is enforced in CI:

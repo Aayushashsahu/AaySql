@@ -12,7 +12,9 @@ Every top-level SQL statement must begin with `AAYUSH`. Ordinary SQL without the
 
 ## Current Version
 
-**v0.7.0** — Cost-based query optimizer: a structured logical/physical plan pipeline, hand-written hash joins for `INNER` and `LEFT` joins (duplicate keys, composite keys, `NULL` keys, residual predicates, deterministic row order), bounded-memory table statistics with revision-based invalidation, safe top-level `AND` predicate pushdown, cost-based access-path and join-algorithm selection, and per-operator `EXPLAIN`/`EXPLAIN ANALYZE` output. Correctness is defined by the retained nested-loop/table-scan reference path: every optimization is equivalence-tested against it.
+**v0.8.0** — Client/server architecture: a dedicated server process owns one `Engine`, multiple clients connect over TCP with a versioned length-prefixed JSON protocol, each connection gets a server-generated session, and explicit transactions are owned by exactly one session at a time. Execution against the engine is serialized; a second client's statements receive a retryable `TRANSACTION_BUSY` instead of seeing uncommitted data. Token authentication, TLS with client-side certificate verification, a loopback-by-default bind, a process-level database lock, and a Python client (`AayushSQLClient`) ship with it. Full contract in [`SERVER_ARCHITECTURE.md`](SERVER_ARCHITECTURE.md).
+
+**Multiple connections, one writer.** v0.8.0 adds accessibility, not concurrency: there is no MVCC, no snapshot isolation, and no parallel query execution.
 
 ## Why the `AAYUSH` Prefix Exists
 
@@ -28,7 +30,12 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 
 ## Implemented vs. Planned Features
 
-### Implemented (v0.7.0)
+### Implemented (v0.8.0)
+- **Server** (`src/aaysql/server.py`, entry point `python -m aaysql.server`): owns exactly one `Engine`, one session per connection, all engine access serialized through a single coordinator lock, session-owned transactions with immediate retryable `TRANSACTION_BUSY` for other sessions, automatic rollback when a transaction owner disconnects, and `RECOVERY_REQUIRED` for every session after an ambiguous commit.
+- **Versioned network protocol** (`src/aaysql/protocol.py`, protocol version `1`): 4-byte big-endian length + UTF-8 JSON frames, 1 MiB default frame limit validated before allocation, `hello`/`ping`/`execute` operations, request IDs with duplicate detection, and stable error codes (`INVALID_REQUEST`, `UNSUPPORTED_PROTOCOL_VERSION`, `AUTHENTICATION_FAILED`, `SQL_PARSE_ERROR`, `SQL_EXECUTION_ERROR`, `CONSTRAINT_ERROR`, `TRANSACTION_BUSY`, `TRANSACTION_ERROR`, `REQUEST_TOO_LARGE`, `DATABASE_UNAVAILABLE`, `RECOVERY_REQUIRED`, `CONNECTION_TIMEOUT`, `INTERNAL_ERROR`, `TOO_MANY_CONNECTIONS`, `HELLO_REQUIRED`, `UNKNOWN_OPERATION`). Tracebacks are never sent to clients.
+- **Python client** (`src/aaysql/client.py`): `AayushSQLClient` with `connect`/`execute`/`ping`/`close`, context manager, optional token and TLS, configurable timeouts, a documented exception hierarchy, and **no automatic retries** — an interrupted request reports `outcome_unknown`.
+- **Security**: loopback bind by default; non-loopback binds require both `AAYUSQL_AUTH_TOKEN` and TLS; tokens compared with `hmac.compare_digest` and never logged or stored; TLS certificate and hostname verification on by default; optional client-certificate verification.
+- **Operational**: exclusive per-database process lock released by the OS on crash, connection/ frame/ timeout limits, bounded graceful shutdown that rolls back uncommitted work, and integration tests over real sockets.
 - Mandatory `AAYUSH` top-level statement prefix (rejects missing or duplicate `AAYUSH`).
 - DDL & DML: `CREATE TABLE`, `DROP TABLE`, `INSERT INTO ... VALUES ...`, `SELECT ... FROM ...`, `UPDATE ... SET ...`, `DELETE FROM ...`.
 - Relational joins & source binding:
@@ -154,6 +161,124 @@ python -m aaysql.cli [--db PATH | --memory] [--version] [script]
 - On the first `AayushSQLError`, the CLI prints `ERROR: ...` to `stderr`, halts before subsequent statements, preserves any earlier persisted mutations, and exits with `1`.
 - Interactive REPL mode prints `ERROR: ...` and remains open for further commands.
 
+## Server and Python Client
+
+The embedded engine and the CLI still work exactly as before. The server is an
+optional front end for external applications.
+
+### Start the server
+
+```bash
+python -m aaysql.server --db university.aaydb
+```
+
+Defaults: `127.0.0.1:8765`, in-file database, 32 connections, 1 MiB frames.
+Useful flags: `--host`, `--port`, `--memory`, `--max-clients`, `--max-frame-size`,
+`--idle-timeout`, `--read-timeout`, `--write-timeout`, `--shutdown-timeout`,
+`--tls-cert`, `--tls-key`, `--tls-client-ca`, `--log-level`.
+
+### Connect from Python
+
+```python
+from aaysql.client import AayushSQLClient
+
+with AayushSQLClient("127.0.0.1", 8765) as db:
+    db.execute(
+        "AAYUSH CREATE TABLE students "
+        "(id INT PRIMARY KEY, name TEXT NOT NULL)"
+    )
+
+    db.execute(
+        "AAYUSH INSERT INTO students VALUES "
+        "(1, 'Aayush')"
+    )
+
+    result = db.execute(
+        "AAYUSH SELECT * FROM students"
+    )
+
+    print(result["rows"])  # [{'id': 1, 'name': 'Aayush'}]
+```
+
+`execute()` returns the same result structure as `Engine.execute()`.
+
+### Explicit transaction
+
+```python
+with AayushSQLClient("127.0.0.1", 8765) as db:
+    db.execute("AAYUSH BEGIN")
+
+    try:
+        db.execute(
+            "AAYUSH INSERT INTO students VALUES (2, 'Alex')"
+        )
+        db.execute("AAYUSH COMMIT")
+    except Exception:
+        # Only attempt rollback when the server confirms
+        # the transaction remains active and the outcome
+        # is not ambiguous.
+        raise
+```
+
+### Multiple clients
+
+A connection is not a transaction. Client A may hold an open transaction while
+Client B stays connected; B's statements are rejected with
+`TRANSACTION_BUSY` (`retryable: true`) until A commits or rolls back. B never
+sees A's uncommitted rows, and B's statements are never folded into A's
+transaction. If A disconnects mid-transaction, the server rolls it back
+automatically.
+
+```python
+from aaysql.client import AayushSQLClient, ServerError
+
+with AayushSQLClient("127.0.0.1", 8765) as db:
+    try:
+        db.execute("AAYUSH SELECT * FROM students")
+    except ServerError as exc:
+        if exc.code == "TRANSACTION_BUSY":
+            ...  # someone else owns the transaction; back off and retry
+```
+
+### Authentication and TLS
+
+```bash
+# Token from the environment; never passed on the command line.
+export AAYUSQL_AUTH_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+python -m aaysql.server --db university.aaydb                       # loopback, no TLS needed
+python -m aaysql.server --db university.aaydb --host 0.0.0.0 \
+    --tls-cert server-cert.pem --tls-key server-key.pem             # remote: token + TLS required
+```
+
+```python
+with AayushSQLClient("db.example.com", 8765, token=token,
+                     tls=True, ca_certs="ca.pem",
+                     server_hostname="db.example.com") as db:
+    ...
+```
+
+Binding to a non-loopback address without a token **and** TLS is refused at
+startup. Certificate verification is never disabled. Certificate creation for
+local development is documented in [`SERVER_ARCHITECTURE.md`](SERVER_ARCHITECTURE.md).
+
+### Ambiguous requests are never retried
+
+If the connection breaks or a request times out after the statement was sent,
+the server may already have committed it. The client raises `ConnectionLostError`
+or `RequestTimeoutError` with `outcome_unknown = True` and closes the socket
+instead of replaying the statement. Reconnect and inspect the database to
+determine the real state; never replay mutations or `COMMIT` automatically.
+
+### Current concurrency limits
+
+- Statements execute **serially** against the single engine; there are no
+  concurrent writes, no MVCC, no snapshot isolation, and no parallel queries.
+- Only one session may own a transaction at a time; other sessions are blocked
+  with `TRANSACTION_BUSY` rather than being served stale reads.
+- Only one server process may own a database file; the `.server.lock` enforces
+  it. Stop the server before using the CLI or embedded `Engine` on that file.
+- The `.aaydb` format is unchanged (version 3).
+
 ## Testing & Continuous Integration
 
 Run the full test suite from the project root:
@@ -175,7 +300,7 @@ GitHub Actions CI (`.github/workflows/tests.yml`) runs `python -m pytest -v` on 
 - `RIGHT JOIN`, `FULL JOIN`, `CROSS JOIN`, and qualified wildcards (`u.*`) are not supported.
 - `GROUP BY` supports simple column references (qualified or unqualified), not arbitrary expressions; nested aggregate functions (`SUM(COUNT(*))`) are not supported.
 - No subqueries, `UNION`, `IS NULL` syntax, arithmetic expressions, or `ALTER TABLE`.
-- Single-process, single-writer execution: no nested transactions, savepoints, isolation levels, or concurrent connections.
+- Single-writer execution: no nested transactions, savepoints, isolation levels, MVCC, snapshot isolation, or concurrent writes. The v0.8.0 server accepts many connections but serializes every statement behind one execution lock, and only one session may hold an explicit transaction at a time.
 - WAL durability guarantees target single-process crash recovery; directory `fsync` is executed where supported (POSIX). Windows cannot open directories through the CRT, so directory-entry durability relies on NTFS metadata behaviour; this fallback is selected by platform, not by swallowing errors. Genuine directory `fsync` failures (`EACCES`, `EIO`, `ENOSPC`, ...) are surfaced as `StorageError`. Hardware/firmware write-cache failures or OS filesystem corruption remain outside process-crash guarantees (see [`WAL.md`](WAL.md)).
 - Table and column names are case-sensitive at execution time.
 

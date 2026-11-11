@@ -2,6 +2,46 @@
 
 All notable changes to AayushSQL are documented in this file.
 
+## [0.8.0] — 2026-11-11
+
+### Added
+- **Database server (`src/aaysql/server.py`)** — `python -m aaysql.server --db university.aaydb` serves one `Engine` over TCP:
+  - one engine per server, opened (with normal WAL recovery) before the listening socket is bound;
+  - one thread per connection, but **all** engine access serialized through a single `TransactionCoordinator` lock that is released before responses are written;
+  - server-generated session IDs, per-session request counters, and idle/read/write timeouts;
+  - connection cap (`--max-clients`, default 32) with `TOO_MANY_CONNECTIONS` rejection, 1 MiB frame cap (`--max-frame-size`), and bounded graceful shutdown (`--shutdown-timeout`);
+  - exclusive `<db>.server.lock` via `fcntl.flock` / `msvcrt.locking`, released by the OS if the process dies;
+  - SIGINT/SIGTERM shutdown that stops accepting, unwinds sessions (rolling back uncommitted work), then closes the engine and releases the lock.
+- **Session-owned transactions** — the engine has one `TransactionManager`, so the coordinator decides which session may use it:
+  - `BEGIN` from another session while a transaction is open is rejected with a retryable `TRANSACTION_BUSY` **before** the engine is called;
+  - non-owners cannot execute `SELECT`, `EXPLAIN`, DML or DDL while a transaction is open, so uncommitted rows and schema changes are never observable;
+  - ownership is re-derived from the authoritative `engine.in_transaction` after each statement, never parsed from SQL text;
+  - a transaction owner that disconnects is rolled back automatically and ownership is released;
+  - an ambiguous `COMMIT` (`AmbiguousCommitError`), `needs_recovery`, or poisoned WAL marks the whole service unavailable: every session receives `RECOVERY_REQUIRED`, the ownership tombstone is kept, and the WAL is preserved for reopen recovery — a rollback is never claimed.
+- **Versioned network protocol (`src/aaysql/protocol.py`)** — `PROTOCOL_VERSION = 1`, independent of the package version:
+  - 4-byte big-endian length + UTF-8 JSON frames, with incremental reads across partial headers/payloads and multiple frames per `recv`;
+  - frame lengths validated before allocation; malformed JSON, invalid UTF-8, truncated frames and oversized frames produce structured errors;
+  - `hello`, `ping`, `execute` operations with request-ID validation and per-session duplicate detection;
+  - stable error codes: `INVALID_REQUEST`, `UNSUPPORTED_PROTOCOL_VERSION`, `AUTHENTICATION_FAILED`, `SQL_PARSE_ERROR`, `SQL_EXECUTION_ERROR`, `CONSTRAINT_ERROR`, `TRANSACTION_BUSY`, `TRANSACTION_ERROR`, `REQUEST_TOO_LARGE`, `DATABASE_UNAVAILABLE`, `RECOVERY_REQUIRED`, `CONNECTION_TIMEOUT`, `INTERNAL_ERROR`, plus `UNKNOWN_OPERATION`, `TOO_MANY_CONNECTIONS` and `HELLO_REQUIRED`;
+  - unknown exceptions are logged server-side with a traceback and returned to clients as a generic `INTERNAL_ERROR` — tracebacks are never sent.
+- **Python client (`src/aaysql/client.py`)** — `AayushSQLClient` with `connect`/`execute`/`ping`/`close`, context-manager support, optional token and TLS (CA file, hostname, client certificate), configurable connect/read timeouts and frame limit, and an exception hierarchy (`AayushSQLClientError`, `ConnectionError`, `TLSHandshakeError`, `AuthenticationError`, `ProtocolError`, `ServerError`, `RequestTimeoutError`, `ConnectionLostError`). `execute()` returns the same result structure as `Engine.execute()`.
+- **No automatic retries** — `ConnectionLostError` and `RequestTimeoutError` set `outcome_unknown = True`; the client closes the socket and never replays a mutation or `COMMIT`, because the server may already have committed it.
+- **Authentication and TLS** — optional bearer token from `AAYUSQL_AUTH_TOKEN`, compared with `hmac.compare_digest`, never logged, never in argv, never written to `.aaydb`; repeated failures close the connection. Binding to a non-loopback host is refused unless a token **and** TLS certificate/key are configured. TLS uses the standard `ssl` module with a TLS 1.2 minimum and optional `CERT_REQUIRED` client certificates; the client verifies certificates and hostnames by default.
+- **Tests (`tests/test_client_server.py`, 57 tests)** — real TCP sockets and ephemeral ports: handshake and protocol errors, malformed JSON / invalid UTF-8 / partial frames / oversized frames, request-ID validation, unknown operations, persistent connections and pipelining, client-side timeout, authentication and TLS (certificate generation skipped when `openssl` is unavailable), server lifecycle (new/existing database, interrupted-WAL recovery, second server refused, lock release after clean exit and after `os._exit`, graceful shutdown, shutdown during a request), and transaction scenarios A–G (two autocommit clients, session-owned transaction with `TRANSACTION_BUSY`, rollback visibility, disconnect rollback, competing `BEGIN`, injected ambiguous `COMMIT` with recovery on restart, concurrent correlated requests).
+- **Benchmarks (`benchmarks/benchmark_server.py`)** — stdlib-only, real sockets, warm-up plus median/p95: connection handshake, ping RTT, point and scan `SELECT`, autocommit `INSERT` (includes WAL `fsync`), explicit transaction, connection churn, a ~0.46 MB result transfer, and 4 concurrent clients under serialized execution. Results in `BENCHMARKS.md`.
+- **`Engine.wal_poisoned`** — small public read-only property so the server can detect a poisoned WAL without reaching into private state.
+- **Docs**: new [`SERVER_ARCHITECTURE.md`](SERVER_ARCHITECTURE.md) (ownership model, protocol, security, shutdown, limitations); README server/client examples; architecture cross-reference.
+
+### Changed
+- Version metadata is `0.8.0` (`pyproject.toml`, `aaysql.__version__`, `storage.ENGINE_VERSION`).
+- Transaction-control failures (for example `COMMIT` with no active transaction) now map to `TRANSACTION_ERROR` instead of `SQL_EXECUTION_ERROR` on the wire; other execution errors are unchanged.
+
+### Notes
+- The `.aaydb` format remains **version 3**; no migration and no storage/WAL behaviour change. Server and embedded use share the same engine and the same on-disk format.
+- Concurrency is still single-writer: many connections, serialized statements, at most one open explicit transaction. No MVCC, snapshot isolation, concurrent writes, or parallel query execution.
+- While a server owns a database, using the CLI or an embedded `Engine` on that file from another process is unsupported (the lock only prevents another *server*).
+- TLS tests generate ephemeral self-signed certificates with `openssl` and skip when it is unavailable; no keys or certificates are committed.
+
 ## [0.7.0] — 2026-11-11
 
 ### Added
