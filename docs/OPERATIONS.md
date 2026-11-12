@@ -218,6 +218,17 @@ The server hands its lease to the engine it creates (the engine borrows it) rath
 than locking twice. A server constructed with an injected persistent `Engine`
 borrows that engine's lease and never acquires a second one.
 
+The canonical ownership lock is always `<database>.server.lock`; it is not
+configurable. `ServerConfig.lock_path` is kept for compatibility from v0.8.0, but
+it is **supplemental**: the server acquires the canonical lock first and the
+custom lock in addition, never instead. Both are held for the server's lifetime and
+released in reverse order after in-flight work is drained and the created engine is
+closed. This means a server started with a custom `lock_path` still blocks — and is
+still blocked by — an embedded `Engine`, a backup, a restore, or another server on
+the same database. A custom `lock_path` equal to the canonical path is a no-op, and
+configuring one on an in-memory server (`db_path` unset) is rejected with
+`ServerConfigError` rather than silently ignored.
+
 A conflict raises `DatabaseLockedError` with the stable code `DATABASE_LOCKED`:
 
 ```text

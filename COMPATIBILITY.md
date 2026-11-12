@@ -238,9 +238,19 @@ Stable public surface:
 | `aaysql.errors` | `AayushSQLError` and subclasses: `LexerError`, `ParserError`, `ExecutionError`, `ConstraintError`, `StorageError`, `AmbiguousCommitError`, `DatabaseLockedError` (stable code `DATABASE_LOCKED`). |
 | `aaysql.client` | `AayushSQLClient` and client exceptions: `AayushSQLClientError`, `ConnectionError`, `ConnectionLostError`, `TLSHandshakeError`, `AuthenticationError`, `ProtocolError`, `ServerError`, `RequestTimeoutError`. |
 | `aaysql.server` | `AayushSQLServer`, `ServerConfig`, `ServerConfigError`, `ServerLock` (compatibility wrapper), `LOCK_SUFFIX`. |
-| `aaysql.locking` | `DatabaseLease` (exclusive ownership), `LOCK_SUFFIX`. |
+| `aaysql.locking` | `DatabaseLease` (exclusive ownership), `LOCK_SUFFIX`, `canonical_path`, `canonical_lock_path`. |
 | `aaysql.backup` | `backup_database`, `restore_database`, `verify_backup`, `read_manifest`, `BackupError`. |
 | `aaysql.protocol` | Protocol constants, framing, and error codes. |
+
+Database ownership: for a file-backed database the canonical lock file is always
+`<database>.server.lock`. `Engine`, `AayushSQLServer`, `backup_database` and
+`restore_database` all take that lease, so none of them can bypass another.
+`ServerConfig.lock_path` (v0.8.0) remains accepted but is **supplemental**: the
+server takes the canonical lock first and the custom lock in addition, never
+instead, and a custom path equal to the canonical one is a no-op. A
+`DatabaseLease` built on any other lock path is not canonical and cannot be
+borrowed by an `Engine`; only `DatabaseLease.for_database(db_path)` is.
+`ServerConfig(lock_path=...)` with no `db_path` raises `ServerConfigError`.
 
 `Engine(db_path)` behavior: `None` or `":memory:"` is in-memory; any other path is
 a persistent database. `execute(sql)` returns a dict with `columns`, `rows`,

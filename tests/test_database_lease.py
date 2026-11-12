@@ -22,7 +22,12 @@ from aaysql.backup import BackupError, backup_database, restore_database
 from aaysql.client import AayushSQLClient
 from aaysql.errors import DatabaseLockedError, StorageError
 from aaysql.locking import LOCK_SUFFIX, DatabaseLease
-from aaysql.server import AayushSQLServer, ServerConfig, ServerLock
+from aaysql.server import (
+    AayushSQLServer,
+    ServerConfig,
+    ServerConfigError,
+    ServerLock,
+)
 
 SRC = str(Path(__file__).parents[1] / "src")
 
@@ -627,3 +632,343 @@ def test_backup_failure_releases_the_lease(tmp_path: Path, monkeypatch):
     monkeypatch.undo()
     with Engine(path):
         pass
+
+
+# --- 7.9 canonical ownership versus a custom lock_path --------------------
+#
+# ServerConfig.lock_path is a v0.8.0 compatibility surface. It is a
+# *supplemental* coordination lock: the server still acquires the canonical
+# <db>.server.lock, so no configuration can create a second ownership identity.
+
+
+def _server_with_lock(path: Path, lock: Path | str) -> AayushSQLServer:
+    return AayushSQLServer(ServerConfig(db_path=path, port=0, lock_path=Path(lock)))
+
+
+def _assert_server_usable(server: AayushSQLServer, table: str) -> None:
+    """Prove the server still serves traffic after a rejected open."""
+    with AayushSQLClient(*server.address) as client:
+        client.execute(f"AAYUSH CREATE TABLE {table} (id INT)")
+        rows = client.execute(f"AAYUSH SELECT COUNT(*) AS n FROM {table}")["rows"]
+        assert rows == [{"n": 0}]
+
+
+def _live_server_script(db: Path, lock: Path) -> str:
+    return (
+        "import sys\n"
+        f"sys.path.insert(0, {SRC!r})\n"
+        "from aaysql.server import AayushSQLServer, ServerConfig\n"
+        f"cfg = ServerConfig(db_path={str(db)!r}, port=0, lock_path={str(lock)!r})\n"
+        "server = AayushSQLServer(cfg)\n"
+        "server.start()\n"
+        "print('READY', flush=True)\n"
+        "sys.stdin.readline()\n"
+        "server.shutdown()\n"
+        "print('CLOSED', flush=True)\n"
+    )
+
+
+def _try_server_script(db: Path, lock: Path) -> str:
+    return (
+        "import sys\n"
+        f"sys.path.insert(0, {SRC!r})\n"
+        "from aaysql.errors import DatabaseLockedError\n"
+        "from aaysql.server import AayushSQLServer, ServerConfig\n"
+        f"cfg = ServerConfig(db_path={str(db)!r}, port=0, lock_path={str(lock)!r})\n"
+        "try:\n"
+        "    server = AayushSQLServer(cfg)\n"
+        "    server.start()\n"
+        "except DatabaseLockedError as exc:\n"
+        "    print('CODE', exc.code, flush=True)\n"
+        "    sys.exit(3)\n"
+        "server.shutdown()\n"
+        "print('STARTED', flush=True)\n"
+    )
+
+
+def test_custom_lock_server_blocks_an_embedded_engine(tmp_path: Path):
+    path = tmp_path / "custom.aaydb"
+    lock = tmp_path / "custom.lock"
+    server = _server_with_lock(path, lock)
+    server.start()
+    try:
+        # Both the canonical ownership lock and the supplemental lock exist.
+        assert Path(f"{path}{LOCK_SUFFIX}").exists()
+        assert lock.exists()
+        assert server.started
+
+        with pytest.raises(DatabaseLockedError) as excinfo:
+            Engine(path)
+        assert excinfo.value.code == "DATABASE_LOCKED"
+        assert str(path) in str(excinfo.value)
+
+        # The server is untouched by the rejected open.
+        _assert_server_usable(server, "probe")
+    finally:
+        server.shutdown()
+        server.shutdown()  # repeated shutdown is safe
+
+    with Engine(path) as engine:
+        assert engine.owns_lease is True
+
+
+def test_custom_lock_server_blocks_backup(tmp_path: Path):
+    path = tmp_path / "custom-backup.aaydb"
+    _open_with_rows(path)
+    lock = tmp_path / "custom-backup.lock"
+    server = _server_with_lock(path, lock)
+    server.start()
+    dest = tmp_path / "backup"
+    try:
+        with pytest.raises(BackupError, match="in use"):
+            backup_database(path, dest)
+        # A refused backup leaves no destination and no staging artifact.
+        assert not dest.exists()
+        assert list(tmp_path.glob("backup*")) == []
+    finally:
+        server.shutdown()
+
+    manifest = backup_database(path, dest)
+    assert manifest["tables"] == [{"name": "t", "rows": 1}]
+
+
+@pytest.mark.parametrize("first_is_custom", [True, False])
+def test_default_and_custom_lock_servers_contend(
+    tmp_path: Path, first_is_custom: bool
+):
+    path = tmp_path / "pair.aaydb"
+    lock = tmp_path / "pair.lock"
+    first = _server_with_lock(path, lock) if first_is_custom else _server(path)
+    first.start()
+    try:
+        second = _server(path) if first_is_custom else _server_with_lock(path, lock)
+        with pytest.raises(DatabaseLockedError) as excinfo:
+            second.start()
+        assert excinfo.value.code == "DATABASE_LOCKED"
+        assert second.started is False
+
+        # The failed startup released everything it had acquired.
+        _assert_server_usable(first, "still_serving")
+    finally:
+        first.shutdown()
+
+    with Engine(path):
+        pass
+
+
+def test_custom_lock_server_and_embedded_engine_contend_across_processes(
+    tmp_path: Path,
+):
+    path = tmp_path / "xproc.aaydb"
+    lock = tmp_path / "xproc.lock"
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _live_server_script(path, lock)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "READY"
+        blocked = _run(_try_open_script(path))
+        assert blocked.returncode == 3, blocked.stderr
+        assert "DATABASE_LOCKED" in blocked.stdout
+        assert holder.poll() is None
+    finally:
+        if holder.poll() is None:
+            assert holder.stdin is not None
+            holder.stdin.write("\n")
+            holder.stdin.flush()
+            try:
+                holder.wait(timeout=60)
+            except subprocess.TimeoutExpired:  # pragma: no cover - last resort
+                holder.kill()
+                holder.wait(timeout=60)
+    assert holder.returncode == 0
+    assert "CLOSED" in (holder.stdout.read() if holder.stdout else "")
+
+    opened = _run(_try_open_script(path))
+    assert opened.returncode == 0, opened.stderr
+    assert "OPEN" in opened.stdout
+
+
+def test_custom_lock_server_is_blocked_by_an_embedded_engine_across_processes(
+    tmp_path: Path,
+):
+    path = tmp_path / "xproc-rev.aaydb"
+    lock = tmp_path / "xproc-rev.lock"
+    with Engine(path):
+        blocked = _run(_try_server_script(path, lock))
+        assert blocked.returncode == 3, blocked.stderr
+        assert "DATABASE_LOCKED" in blocked.stdout
+        # The custom lock was never left behind as a stale reservation.
+        assert not lock.exists()
+
+    started = _run(_try_server_script(path, lock))
+    assert started.returncode == 0, started.stderr
+    assert "STARTED" in started.stdout
+
+
+def test_only_the_canonical_lease_can_be_borrowed(tmp_path: Path):
+    path = tmp_path / "borrow-canonical.aaydb"
+    canonical = DatabaseLease.for_database(path)
+    assert canonical.is_canonical
+    canonical.acquire()
+    try:
+        canonical.validate_borrow(path)
+        with Engine(path, _lease=canonical) as engine:
+            engine.execute("AAYUSH CREATE TABLE t (id INT)")
+        assert canonical.active
+    finally:
+        canonical.release()
+
+    with pytest.raises(StorageError, match="already been released"):
+        canonical.validate_borrow(path)
+    with Engine(path):
+        pass
+
+
+def test_supplemental_lease_cannot_impersonate_canonical_ownership(tmp_path: Path):
+    path = tmp_path / "impersonate.aaydb"
+    lease = DatabaseLease.for_database(path, lock_path=tmp_path / "elsewhere.lock")
+    assert lease.db_path == path
+    assert lease.is_canonical is False
+    lease.acquire()
+    try:
+        with pytest.raises(StorageError, match="canonical ownership lock"):
+            lease.validate_borrow(path)
+        with pytest.raises(StorageError, match="canonical ownership lock"):
+            Engine(path, _lease=lease)
+    finally:
+        lease.release()
+
+    # The unrelated lock never blocked real ownership.
+    with Engine(path):
+        pass
+
+
+def test_lock_path_equal_to_canonical_is_not_acquired_twice(tmp_path: Path):
+    path = tmp_path / "same.aaydb"
+    config = ServerConfig(
+        db_path=path, port=0, lock_path=Path(f"{path}{LOCK_SUFFIX}")
+    )
+    assert config.supplemental_lock_path is None
+    server = AayushSQLServer(config)
+    server.start()
+    try:
+        with pytest.raises(DatabaseLockedError):
+            Engine(path)
+        _assert_server_usable(server, "same_lock")
+    finally:
+        server.shutdown()
+    with Engine(path):
+        pass
+
+
+def test_relative_supplemental_lock_path_is_canonicalised(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    path = Path("relative.aaydb")
+    server = _server_with_lock(path, "relative.lock")
+    server.start()
+    try:
+        assert (tmp_path / "relative.lock").exists()
+        with pytest.raises(DatabaseLockedError):
+            Engine(tmp_path / "relative.aaydb")
+    finally:
+        server.shutdown()
+    with Engine(tmp_path / "relative.aaydb"):
+        pass
+
+
+def test_two_databases_cannot_share_a_supplemental_lock(tmp_path: Path):
+    shared = tmp_path / "shared.lock"
+    first_db = tmp_path / "first.aaydb"
+    second_db = tmp_path / "second.aaydb"
+    first = _server_with_lock(first_db, shared)
+    first.start()
+    try:
+        second = _server_with_lock(second_db, shared)
+        with pytest.raises(DatabaseLockedError) as excinfo:
+            second.start()
+        assert excinfo.value.code == "DATABASE_LOCKED"
+        # The failed startup unwound the canonical lock it had already taken.
+        with Engine(second_db):
+            pass
+    finally:
+        first.shutdown()
+
+
+def test_custom_lock_startup_failure_releases_both_leases(tmp_path: Path, monkeypatch):
+    path = tmp_path / "both-fail.aaydb"
+    lock = tmp_path / "both-fail.lock"
+
+    def refuse(self, *args, **kwargs):
+        raise OSError("simulated bind failure")
+
+    monkeypatch.setattr("aaysql.server._ThreadingTCPServer.server_bind", refuse)
+    server = _server_with_lock(path, lock)
+    with pytest.raises(OSError, match="simulated bind failure"):
+        server.start()
+    monkeypatch.undo()
+
+    # No stale reservation and no held lock: both entry points work again.
+    with Engine(path):
+        pass
+    retry = _server_with_lock(path, lock)
+    retry.start()
+    retry.shutdown()
+
+
+def test_supplemental_acquisition_failure_releases_canonical_lease(
+    tmp_path: Path, monkeypatch
+):
+    path = tmp_path / "supp-fail.aaydb"
+    lock = tmp_path / "supp-fail.lock"
+    real_for_database = DatabaseLease.for_database
+
+    def refuse_custom(cls, db_path, *, lock_path=None):
+        if lock_path is not None:
+            raise StorageError("simulated supplemental lock failure")
+        return real_for_database(db_path)
+
+    monkeypatch.setattr(
+        "aaysql.server.DatabaseLease",
+        type(
+            "PatchedLease",
+            (DatabaseLease,),
+            {"for_database": classmethod(refuse_custom)},
+        ),
+    )
+    server = _server_with_lock(path, lock)
+    with pytest.raises(StorageError, match="simulated supplemental"):
+        server.start()
+    monkeypatch.undo()
+
+    with Engine(path):
+        pass
+    assert not lock.exists()
+
+
+def test_lock_path_without_a_database_is_rejected():
+    with pytest.raises(ServerConfigError, match="lock_path requires a file-backed"):
+        AayushSQLServer(ServerConfig(lock_path=Path("irrelevant.lock")))
+
+
+def test_custom_lock_resolves_symlinked_parents(tmp_path: Path):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):  # pragma: no cover - Windows privileges
+        pytest.skip("directory symlinks are not available on this host")
+
+    path = real / "sym.aaydb"
+    server = _server_with_lock(path, link / "custom.lock")
+    server.start()
+    try:
+        with pytest.raises(DatabaseLockedError):
+            Engine(link / "sym.aaydb")
+    finally:
+        server.shutdown()

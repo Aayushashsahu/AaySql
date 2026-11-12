@@ -41,7 +41,7 @@ from .errors import (
     ParserError,
     StorageError,
 )
-from .locking import LOCK_SUFFIX, DatabaseLease
+from .locking import LOCK_SUFFIX, DatabaseLease, canonical_lock_path, canonical_path
 from .protocol import (
     AUTH_TOKEN_ENV,
     AUTHENTICATION_FAILED,
@@ -131,7 +131,30 @@ class ServerConfig:
             return False
 
     @property
+    def canonical_lock_path(self) -> Path | None:
+        """The ownership lock this server's database is always identified by."""
+        if self.in_memory:
+            return None
+        assert self.db_path is not None
+        return canonical_lock_path(self.db_path)
+
+    @property
+    def supplemental_lock_path(self) -> Path | None:
+        """An extra coordination lock, never a replacement for ownership.
+
+        ``lock_path`` is kept for compatibility with the v0.8.0 configuration
+        surface. It is only ever held *in addition to* the canonical database
+        lock, and configuring the canonical path itself is a no-op.
+        """
+        canonical = self.canonical_lock_path
+        if canonical is None or self.lock_path is None:
+            return None
+        candidate = canonical_path(self.lock_path)
+        return None if candidate == canonical else candidate
+
+    @property
     def effective_lock_path(self) -> Path | None:
+        """The lock path named by this configuration (canonical by default)."""
         if self.in_memory:
             return None
         if self.lock_path is not None:
@@ -164,6 +187,11 @@ class ServerConfig:
             raise ServerConfigError("tls_client_ca requires tls_cert and tls_key")
         if self.auth_token is not None and not self.auth_token.strip():
             raise ServerConfigError("auth_token must not be empty when configured")
+        if self.lock_path is not None and self.in_memory:
+            raise ServerConfigError(
+                "lock_path requires a file-backed database (db_path); an in-memory "
+                "server has no database ownership to coordinate"
+            )
         if self.tls_enabled:
             for label, value in (("tls_cert", self.tls_cert), ("tls_key", self.tls_key)):
                 if not value or not Path(value).is_file():
@@ -647,6 +675,7 @@ class AayushSQLServer:
         # The server owns a lease unless it is borrowing an injected engine's
         # lease; only an owned lease is released during shutdown.
         self._lease: DatabaseLease | None = None
+        self._supplemental_lease: DatabaseLease | None = None
         self._owns_lease = False
         self._created_engine = False
         self._coordinator: TransactionCoordinator | None = None
@@ -719,6 +748,7 @@ class AayushSQLServer:
         self.config.validate()
         lease: DatabaseLease | None = None
         owns_lease = False
+        supplemental: DatabaseLease | None = None
         engine = self._injected_engine
         created_engine = False
         try:
@@ -731,21 +761,21 @@ class AayushSQLServer:
                         "injected persistent Engine does not hold a database lease"
                     )
                 lease = borrowed
-            elif self.config.effective_lock_path is not None:
-                if engine is None:
-                    lease = DatabaseLease.for_database(
-                        self.config.db_path,
-                        lock_path=self.config.effective_lock_path,
-                    )
-                else:
-                    # An in-memory engine configured alongside a file path keeps
-                    # v1.0.0 behaviour: the path is reserved for the lifetime of
-                    # the server even though the server serves memory.
-                    lease = DatabaseLease.for_lock_path(
-                        self.config.effective_lock_path
-                    )
+            elif self.config.canonical_lock_path is not None:
+                # Canonical ownership is never configurable: every file-backed
+                # server contends for <db>.server.lock, exactly like Engine,
+                # backup and restore. A configured lock_path is an *additional*
+                # coordination lock, acquired after canonical ownership so the
+                # ordering is always canonical -> supplemental.
+                lease = DatabaseLease.for_database(self.config.db_path)
                 lease.acquire()
                 owns_lease = True
+            supplemental_path = self.config.supplemental_lock_path
+            if supplemental_path is not None:
+                supplemental = DatabaseLease.for_database(
+                    self.config.db_path, lock_path=supplemental_path
+                )
+                supplemental.acquire()
             if engine is None:
                 engine = Engine(self.config.db_path, _lease=lease)
                 created_engine = True
@@ -770,11 +800,16 @@ class AayushSQLServer:
                     engine.close()
                 except Exception as exc:  # noqa: BLE001 - startup is being torn down
                     LOGGER.debug("engine close during failed startup ignored: %s", exc)
+            # Unwind in reverse acquisition order: supplemental first, then the
+            # canonical ownership lease (only if this server acquired it).
+            if supplemental is not None:
+                supplemental.release()
             if owns_lease and lease is not None:
                 lease.release()
             raise
 
         self._lease = lease
+        self._supplemental_lease = supplemental
         self._owns_lease = owns_lease
         self._created_engine = created_engine
         self._engine = engine
@@ -860,8 +895,13 @@ class AayushSQLServer:
                 self._engine.close()
             except Exception as exc:  # noqa: BLE001 - shutdown must finish
                 self._logger.debug("engine close during shutdown ignored: %s", exc)
+        # Reverse acquisition order again, and only after the created engine has
+        # been closed: canonical ownership is handed away last.
+        if self._supplemental_lease is not None:
+            self._supplemental_lease.release()
         if self._owns_lease and self._lease is not None:
             self._lease.release()
+        self._supplemental_lease = None
         self._lease = None
         self._owns_lease = False
         self._started = False

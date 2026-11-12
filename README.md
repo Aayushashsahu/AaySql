@@ -392,8 +392,10 @@ determine the real state; never replay mutations or `COMMIT` automatically.
 - Only one session may own a transaction at a time; other sessions are blocked
   with `TRANSACTION_BUSY` rather than being served stale reads.
 - Only one owner may hold a database file: one server, one embedded `Engine`,
-  one backup, or one restore. The `.server.lock` lease enforces it across
-  processes and within a process. Stop the owner before using the CLI, an
+  one backup, or one restore. The canonical `<database>.server.lock` lease
+  enforces it across processes and within a process, for every entry point. A
+  configured `ServerConfig.lock_path` is an additional coordination lock, never
+  a replacement for canonical ownership. Stop the owner before using the CLI, an
   embedded `Engine`, or `aaysql-backup` on that file. See
   [docs/OPERATIONS.md](docs/OPERATIONS.md#10-database-ownership-and-locking).
 - The `.aaydb` format is version 3; network protocol is version 1.

@@ -23,8 +23,13 @@ Design
   the caller must avoid.
 * **Borrowing** lets an owner hand its lease to an internal component (server
   -> engine, backup -> engine) without re-acquiring it. A borrow validates that
-  the lease is still active and belongs to the same canonical database path.
+  the lease is still active, belongs to the same canonical database path, and
+  uses that database's canonical lock file. A lease built on some other lock
+  path (a *supplemental* lock) can never be borrowed as database ownership.
   Borrowers never release the lease.
+* **Canonical ownership is not configurable.** No caller-supplied lock path can
+  stand in for ``<database>.server.lock``; an extra lock path is only ever an
+  additional coordination lock held *in addition to* canonical ownership.
 
 Ownership is acquired *before* the snapshot is loaded or the WAL is recovered,
 and released on every exit path, including construction failures.
@@ -48,7 +53,7 @@ _REGISTRY: dict[str, DatabaseLease] = {}
 _REGISTRY_LOCK = threading.Lock()
 
 
-def _canonical(path: str | Path) -> Path:
+def canonical_path(path: str | Path) -> Path:
     """Return a stable filesystem identity for ``path`` without requiring it to exist.
 
     The parent directory is resolved (symlinks, ``..``, separators); the final
@@ -69,6 +74,15 @@ def _canonical(path: str | Path) -> Path:
     return canonical
 
 
+def canonical_lock_path(db_path: str | Path) -> Path:
+    """Return the one canonical ownership lock path for ``db_path``.
+
+    This is the only identity that grants database ownership; every file-backed
+    entry point (engine, server, backup, restore) must use it.
+    """
+    return Path(f"{canonical_path(db_path)}{LOCK_SUFFIX}")
+
+
 class DatabaseLease:
     """An exclusive lease over one file-backed database.
 
@@ -85,8 +99,8 @@ class DatabaseLease:
         db_path: str | Path | None = None,
         display_path: str | None = None,
     ) -> None:
-        self.lock_path = _canonical(lock_path)
-        self.db_path = _canonical(db_path) if db_path is not None else None
+        self.lock_path = canonical_path(lock_path)
+        self.db_path = canonical_path(db_path) if db_path is not None else None
         self.display_path = (
             display_path
             if display_path is not None
@@ -101,12 +115,19 @@ class DatabaseLease:
     def for_database(
         cls, db_path: str | Path, *, lock_path: str | Path | None = None
     ) -> DatabaseLease:
-        """Build the lease for ``db_path`` (optionally overriding the lock path)."""
-        canonical_db = _canonical(db_path)
+        """Build the canonical ownership lease for ``db_path``.
+
+        Passing ``lock_path`` produces a *supplemental* lease: it still carries
+        the database identity, but it locks an unrelated file and therefore can
+        never be borrowed by an :class:`~aaysql.engine.Engine`. Canonical
+        ownership is always acquired separately through
+        ``for_database(db_path)``.
+        """
+        canonical_db = canonical_path(db_path)
         lock = (
             Path(lock_path)
             if lock_path is not None
-            else Path(f"{canonical_db}{LOCK_SUFFIX}")
+            else canonical_lock_path(canonical_db)
         )
         return cls(lock, db_path=canonical_db, display_path=str(db_path))
 
@@ -126,6 +147,17 @@ class DatabaseLease:
     def active(self) -> bool:
         """True while this lease holds the OS lock."""
         return self._handle is not None
+
+    @property
+    def is_canonical(self) -> bool:
+        """True when this lease *is* the database's ownership identity.
+
+        A lease over a custom lock file, or one built from a bare lock path, is
+        never canonical and can never stand in for database ownership.
+        """
+        return self.db_path is not None and self.lock_path == canonical_lock_path(
+            self.db_path
+        )
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         state = "active" if self.active else "released"
@@ -233,10 +265,17 @@ class DatabaseLease:
             raise StorageError(
                 "cannot borrow a lock-path-only lease; acquire it as a database lease"
             )
-        expected = _canonical(db_path)
+        expected = canonical_path(db_path)
         if self.db_path != expected:
             raise StorageError(
                 f"database lease belongs to '{self.db_path}', not '{expected}'"
+            )
+        canonical_lock = canonical_lock_path(expected)
+        if self.lock_path != canonical_lock:
+            raise StorageError(
+                f"database lease for '{expected}' uses lock file {self.lock_path}, "
+                f"not the canonical ownership lock {canonical_lock}; only the "
+                "canonical lease can be borrowed"
             )
 
     # -- context manager ------------------------------------------------
