@@ -235,9 +235,10 @@ Stable public surface:
 | Import | Purpose |
 | --- | --- |
 | `from aaysql import Engine, __version__` | Embedded engine. |
-| `aaysql.errors` | `AayushSQLError` and subclasses: `LexerError`, `ParserError`, `ExecutionError`, `ConstraintError`, `StorageError`, `AmbiguousCommitError`. |
+| `aaysql.errors` | `AayushSQLError` and subclasses: `LexerError`, `ParserError`, `ExecutionError`, `ConstraintError`, `StorageError`, `AmbiguousCommitError`, `DatabaseLockedError` (stable code `DATABASE_LOCKED`). |
 | `aaysql.client` | `AayushSQLClient` and client exceptions: `AayushSQLClientError`, `ConnectionError`, `ConnectionLostError`, `TLSHandshakeError`, `AuthenticationError`, `ProtocolError`, `ServerError`, `RequestTimeoutError`. |
-| `aaysql.server` | `AayushSQLServer`, `ServerConfig`, `ServerConfigError`, `ServerLock`, `LOCK_SUFFIX`. |
+| `aaysql.server` | `AayushSQLServer`, `ServerConfig`, `ServerConfigError`, `ServerLock` (compatibility wrapper), `LOCK_SUFFIX`. |
+| `aaysql.locking` | `DatabaseLease` (exclusive ownership), `LOCK_SUFFIX`. |
 | `aaysql.backup` | `backup_database`, `restore_database`, `verify_backup`, `read_manifest`, `BackupError`. |
 | `aaysql.protocol` | Protocol constants, framing, and error codes. |
 
@@ -270,16 +271,22 @@ Considered internal (no stability guarantee): `aaysql.parser`, `aaysql.lexer`,
 - **One writer per database.** The server serializes all engine access; there is no
   MVCC and no concurrent write execution. Other sessions receive `TRANSACTION_BUSY`
   while a transaction is owned elsewhere.
-- **One server per database.** Enforced by an OS-level lock file
-  (`<db>.server.lock`, `fcntl` on POSIX, `msvcrt` on Windows). The OS releases it
-  when the process dies; there are no stale-PID heuristics.
+- **One owner per database file.** An embedded `Engine`, a server, a backup and a
+  restore all take the same exclusive OS-level lease on `<db>.server.lock`
+  (`fcntl` on POSIX, `msvcrt` on Windows) before loading or recovering anything. The
+  OS releases it when the process dies; there are no stale-PID heuristics and a
+  stale lock file does not block a new owner. A conflict raises
+  `DatabaseLockedError` (code `DATABASE_LOCKED`) rather than a raw OS error. This
+  is an ownership rule, not concurrency: it does not add MVCC, multiple writers,
+  shared embedded readers or multi-process access.
 - **Durability scope.** The WAL is fsynced before a transaction is reported as
   committed. Tests prove process-crash (`os._exit`) recovery; power-loss behavior
   is bounded by the platform's fsync semantics (see [WAL.md](WAL.md)) and is not
   claimed beyond that.
-- **Backup is offline only.** `aaysql-backup` refuses to run while a server owns the
-  database. Restore refuses to replace a database that a server owns, and refuses a
-  target with unrecovered WAL data.
+- **Backup is offline only.** `aaysql-backup` refuses to run while any owner (server,
+  embedded `Engine`, or another backup) holds the database. Restore refuses to
+  replace a database another owner holds, holds the target lease through the whole
+  replacement and validation, and refuses a target with unrecovered WAL data.
 - **Non-loopback binding** requires both authentication and TLS; the server refuses
   to start otherwise.
 

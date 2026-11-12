@@ -52,8 +52,8 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .errors import AayushSQLError
-from .server import LOCK_SUFFIX, ServerLock, ServerConfigError
+from .errors import AayushSQLError, DatabaseLockedError, StorageError
+from .locking import LOCK_SUFFIX, DatabaseLease
 from .storage import FORMAT_VERSION
 from .wal import fsync_dir
 
@@ -80,15 +80,19 @@ def _lock_path_for(db_path: Path) -> Path:
     return Path(f"{db_path}{LOCK_SUFFIX}")
 
 
-def _acquire(db_path: Path) -> ServerLock:
-    lock = ServerLock(_lock_path_for(db_path))
+def _acquire(db_path: Path) -> DatabaseLease:
+    """Take exclusive ownership of ``db_path`` for a backup or restore."""
+    lease = DatabaseLease.for_database(db_path)
     try:
-        lock.acquire()
-    except ServerConfigError as exc:
+        lease.acquire()
+    except DatabaseLockedError as exc:
         raise BackupError(
-            f"database '{db_path}' is in use (a server owns it); stop the server first"
+            f"database '{db_path}' is in use (another engine or server owns it); "
+            "stop the existing owner first"
         ) from exc
-    return lock
+    except StorageError as exc:
+        raise BackupError(f"cannot lock database '{db_path}': {exc}") from exc
+    return lease
 
 
 def _read_database_payload(path: Path) -> dict[str, Any]:
@@ -132,12 +136,17 @@ def _fsync_file(path: Path) -> None:
         os.close(fd)
 
 
-def _recover_pending_wal(db_path: Path) -> None:
-    """Load and close the database through the normal path to apply any WAL."""
+def _recover_pending_wal(db_path: Path, *, lease: DatabaseLease | None = None) -> None:
+    """Load and close the database through the normal path to apply any WAL.
+
+    ``lease`` is passed when the caller already owns the database; the engine
+    borrows it instead of self-locking. Without it, the engine acquires its own
+    lease (used for temporary copies during verification and restore).
+    """
     from .engine import Engine  # local import keeps module import cheap
 
     try:
-        engine = Engine(db_path)
+        engine = Engine(db_path, _lease=lease) if lease is not None else Engine(db_path)
     except AayushSQLError as exc:
         raise BackupError(f"database '{db_path}' cannot be opened for backup: {exc}") from exc
     try:
@@ -180,7 +189,7 @@ def backup_database(
     staging: Path | None = None
     previous: Path | None = None
     try:
-        _recover_pending_wal(source)
+        _recover_pending_wal(source, lease=lock)
         try:
             data = source.read_bytes()
         except OSError as exc:
@@ -394,7 +403,9 @@ def restore_database(
                 ) from exc
 
         try:
-            _recover_pending_wal(target)
+            # The target lease is held for the whole operation; borrow it so the
+            # validation engine does not attempt a second, conflicting lock.
+            _recover_pending_wal(target, lease=lock)
         except BackupError:
             if previous is not None and previous.exists():
                 os.replace(previous, target)

@@ -7,8 +7,9 @@ database called `app.aaydb`; substitute your own path.
 
 1. Never delete or truncate a `.wal` file to make an error go away. It may hold the
    only copy of a committed transaction.
-2. Never run two servers against one database file. The lock prevents it; do not
-   work around the lock by deleting the lock file.
+2. Never open one database file from two owners (two servers, a server and an
+   embedded `Engine`, or two engines). The lease prevents it; do not work around it
+   by deleting the lock file.
 3. Never copy a `.aaydb` file while a server is writing it. Use `aaysql-backup`,
    which takes exclusive ownership first.
 
@@ -158,8 +159,10 @@ aaysql-backup restore backups/app-2026-11-11 app-restored.aaydb
 
 Behavior worth knowing:
 
-- Backup takes the server lock. If a server owns the database you get
-  `database '…' is in use (a server owns it); stop the server first`.
+- Backup takes exclusive ownership. If any owner exists — server, embedded
+  `Engine`, CLI process or another backup — you get
+  `database '…' is in use (another engine or server owns it); stop the existing
+  owner first`.
 - Before reading, backup opens the database once so any pending WAL is applied. The
   backup therefore contains the last durably committed state, not a torn snapshot.
 - An existing backup directory is never replaced without `--force`.
@@ -188,16 +191,54 @@ monthly.
 - A `RECOVERY_REQUIRED` state does not grow the WAL; further statements are rejected
   before touching storage.
 
-## 10. Process locking
+## 10. Database ownership and locking
 
-The lock is an OS advisory lock on `app.aaydb.server.lock`, created with `fcntl.flock`
-on POSIX and `msvcrt.locking` on Windows. It is not a PID-file heuristic, so a crashed
-server (even `SIGKILL`) does not block the next start. A second server on the same
-database fails at startup with
-`database is already owned by another AayushSQL server`.
+**One owner per file-backed database.** A `.aaydb` file is owned by exactly one of:
+an embedded `Engine`, a server, an offline backup, or a restore. Opening a database
+can recover the WAL and rewrite the snapshot, so a second owner must never be
+allowed to open it concurrently.
 
-The lock file may stay on disk after a clean shutdown; an unused lock file is
-harmless. Delete it only when you are certain no process uses the database.
+Ownership is an OS advisory lock on `app.aaydb.server.lock`, taken with
+`fcntl.flock` on POSIX and `msvcrt.locking` on Windows. A process-local registry
+additionally makes a second `Engine` in the *same* process fail deterministically.
+Paths are canonicalised (relative vs absolute, `..`, symlinked parent directories,
+Windows case), so two spellings of the same file are the same database.
+
+Every file-backed entry point acquires this lease before loading the database or
+recovering the WAL:
+
+| Entry point | Who owns the lease | Released by |
+| --- | --- | --- |
+| `Engine("app.aaydb")` | the engine | `engine.close()` or process exit |
+| `aaysql-server` / `AayushSQLServer` | the server | `server.shutdown()` or process exit |
+| `aaysql-backup backup` | the backup operation | end of the command, success or failure |
+| `aaysql-backup restore` | the restore operation | end of the command, success or failure |
+
+The server hands its lease to the engine it creates (the engine borrows it) rather
+than locking twice. A server constructed with an injected persistent `Engine`
+borrows that engine's lease and never acquires a second one.
+
+A conflict raises `DatabaseLockedError` with the stable code `DATABASE_LOCKED`:
+
+```text
+DATABASE_LOCKED
+database 'app.aaydb' is already in use by another engine or process
+(lock file /srv/app.aaydb.server.lock); stop the existing owner before opening
+this database
+```
+
+The lock is not a PID-file heuristic: the OS drops it when the owning process dies
+(even `SIGKILL`), so a crashed owner never blocks the next start. The lock file may
+remain on disk after a clean shutdown, and it may contain a stale PID — that text
+is diagnostic only. **A lock file's existence does not mean the database is in use,
+and deleting it does not release the lock.**
+
+To recover from `DATABASE_LOCKED`:
+
+1. Find the owner (`ps`, `lsof app.aaydb.server.lock`, or the PID in the lock file)
+   and stop it cleanly.
+2. Confirm the process is gone. Do not delete the lock file.
+3. Reopen the database; the OS lock is already free and recovery runs normally.
 
 ## 11. Single-writer limitations
 
@@ -213,7 +254,7 @@ harmless. Delete it only when you are certain no process uses the database.
 
 | Symptom | Likely cause | Action |
 | --- | --- | --- |
-| `database is already owned by another AayushSQL server` | Another server (or backup) holds the lock. | Find and stop it. Do not delete the lock file. |
+| `DATABASE_LOCKED` / "already in use" | A server, embedded `Engine`, backup or restore owns the database. | Stop the owner (`§10`). Do not delete the lock file. |
 | `RECOVERY_REQUIRED` | Ambiguous commit or damaged WAL. | §6 and §7. |
 | `StorageError: Corrupted database file …` | Snapshot is not valid JSON or fails validation. | Restore a backup; keep the file for diagnosis. |
 | `StorageError: Corrupted WAL record …` | Mid-log corruption. | Restore a backup; do not truncate the WAL manually. |

@@ -278,8 +278,10 @@ def test_no_temp_files_left_behind(tmp_path: Path):
     with Engine(db_file) as e:
         e.execute("AAYUSH CREATE TABLE t (id INT PRIMARY KEY)")
         e.execute("AAYUSH INSERT INTO t VALUES (1)")
-    files = [p.name for p in tmp_path.iterdir()]
-    assert files == ["clean.aaydb"]
+    files = sorted(p.name for p in tmp_path.iterdir())
+    # The lease file persists by contract (its existence grants nothing; the OS
+    # lock does), but no temporary artifacts may remain.
+    assert files == ["clean.aaydb", "clean.aaydb.server.lock"]
 
 
 def test_v01_query_features_and_null_ordering(tmp_path: Path):

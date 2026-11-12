@@ -275,6 +275,12 @@ with Engine("university.aaydb") as db:
 The embedded engine and the CLI still work exactly as before. The server is an
 optional front end for external applications.
 
+**One owner per database file.** A `.aaydb` file may be opened by exactly one
+owner at a time: an embedded `Engine`, a server, `aaysql-backup`, or a restore.
+Starting a server while an `Engine` holds the file (or the reverse) fails with
+`DatabaseLockedError` / `DATABASE_LOCKED`; stop the existing owner first. Multiple
+processes must never manipulate the same database file directly.
+
 ### Start the server
 
 ```bash
@@ -385,8 +391,11 @@ determine the real state; never replay mutations or `COMMIT` automatically.
   concurrent writes, no MVCC, no snapshot isolation, and no parallel queries.
 - Only one session may own a transaction at a time; other sessions are blocked
   with `TRANSACTION_BUSY` rather than being served stale reads.
-- Only one server process may own a database file; the `.server.lock` enforces
-  it. Stop the server before using the CLI, embedded `Engine`, or `aaysql-backup` on that file.
+- Only one owner may hold a database file: one server, one embedded `Engine`,
+  one backup, or one restore. The `.server.lock` lease enforces it across
+  processes and within a process. Stop the owner before using the CLI, an
+  embedded `Engine`, or `aaysql-backup` on that file. See
+  [docs/OPERATIONS.md](docs/OPERATIONS.md#10-database-ownership-and-locking).
 - The `.aaydb` format is version 3; network protocol is version 1.
 
 ## Offline Backup and Restore
