@@ -81,3 +81,42 @@ Execution across concurrent TCP clients is serialized under `TransactionCoordina
 | 40 repeated TCP connect/ping/disconnect cycles | +66.54 KiB | 221.81 KiB |
 
 Pattern caches (`_LIKE_CACHE`, max 256 entries) and per-session request-ID tracking (`MAX_RECENT_REQUEST_IDS = 256`) remain bounded across repeated queries and connection churn.
+
+---
+
+## 5. Format v4 Storage (Phase 2, development)
+
+Produced by [`benchmarks/benchmark_v4.py`](benchmarks/benchmark_v4.py) on the same
+machine as this document (Windows 10, CPython 3.11.15, 8 cores). The dataset is one
+table with an `INT PRIMARY KEY` and a `TEXT` payload; the measured operation is a
+single-row autocommit `INSERT` followed by an explicit checkpoint. Medians of 5
+runs; no timing assertions exist in CI. The v3 column is the same-machine baseline
+(`benchmark_release.py` seeds a v3 snapshot), where an autocommit commit includes a
+whole-image WAL write and a full snapshot rewrite.
+
+| Rows | v4 commit | v4 WAL bytes | v4 checkpoint | v4 checkpoint bytes | v4 reopen (replay 1 delta) | replayed WAL bytes | v3 commit+checkpoint | v3 snapshot bytes |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 3.25 ms | 675 | 10.07 ms | 1,819 | 36.08 ms | 673 | 10.85 ms | 7,953 |
+| 1,000 | 9.65 ms | 676 | 10.50 ms | 13,488 | 35.98 ms | 674 | 24.80 ms | 74,521 |
+| 10,000 | 17.12 ms | 677 | 24.75 ms | 138,425 | 133.04 ms | 675 | 139.08 ms | 748,457 |
+| 100,000 | 72.13 ms | 678 | 190.64 ms | 1,478,308 | 785.63 ms | 676 | 1,207.32 ms | 7,578,339 |
+
+What this shows:
+
+- **Commit bytes are flat.** A one-row delta costs ~675 bytes of WAL at every size,
+  while the v3 image grows linearly to ~7.6 MB per commit.
+- **Checkpoint bytes scale with the changed table**, not with the transaction: the
+  100,000-row checkpoint writes a ~1.48 MB segment, without rewriting other tables.
+- **The v3 baseline pays both costs per commit.** At 100,000 rows v4 commit plus
+  checkpoint is roughly 263 ms of measured work versus ~1,207 ms for v3, but this is
+  a same-machine observation, not a general speedup claim.
+- **Recovery/reopen remains O(database).** Reopen loads every segment and rebuilds
+  index trees; at 100,000 rows that dominates (786 ms) even though only 676 bytes of
+  WAL were replayed. No O(1) claim is made while `Database.clone()` and full loads
+  remain.
+- **Unchanged tables get zero writes.** In the two-table check, changing and
+  checkpointing `hot` left `cold`'s segment file name and mtime untouched and wrote
+  0 bytes for it; the only new segment file belonged to `hot`.
+- **Noise.** Windows NTFS `fsync` tails dominate single-row commit latency; the
+  100-row and 1,000-row medians moved by several milliseconds between runs. Treat
+  the column as an order-of-magnitude comparison, not a precise ratio.

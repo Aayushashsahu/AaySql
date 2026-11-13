@@ -48,18 +48,18 @@ import sys
 import tempfile
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from . import __version__
+from . import __version__, segments
 from .errors import AayushSQLError, DatabaseLockedError, StorageError
 from .locking import LOCK_SUFFIX, DatabaseLease
-from .storage import FORMAT_VERSION
+from .storage import CURRENT_FORMAT_VERSION, SEGMENTED_FORMAT_VERSION
 from .wal import fsync_dir
 
 BACKUP_FORMAT = "aaysql-backup"
-BACKUP_FORMAT_VERSION = 1
-SUPPORTED_BACKUP_FORMATS = (1,)
+BACKUP_FORMAT_VERSION = 2
+SUPPORTED_BACKUP_FORMATS = (1, 2)
 MANIFEST_NAME = "manifest.json"
 DATABASE_NAME = "database.aaydb"
 
@@ -107,6 +107,33 @@ def _read_database_payload(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise BackupError(f"database file '{path}' is not a database snapshot")
     return payload
+
+
+def _safe_relative_path(value: Any, *, root: Path) -> str:
+    """Validate an inventory path as a safe path inside the backup directory."""
+    if not isinstance(value, str) or not value:
+        raise BackupError("backup manifest has an invalid file path")
+    posix = PurePosixPath(value.replace("\\", "/"))
+    if posix.is_absolute() or any(part in ("", ".", "..") for part in posix.parts):
+        raise BackupError(f"backup manifest path '{value}' escapes the backup directory")
+    resolved = (root / Path(*posix.parts)).resolve()
+    if not resolved.is_relative_to(root.resolve()):
+        raise BackupError(f"backup manifest path '{value}' escapes the backup directory")
+    return value
+
+
+def _summarize_v4(
+    source: Path, payload: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[str], int]:
+    """Return (tables, index names, wal_lsn) for a v4 root manifest."""
+    manifest = segments.validate_manifest(payload)
+    tables: list[dict[str, Any]] = []
+    for name in sorted(manifest["tables"]):
+        table = segments.read_segment(
+            source, manifest["tables"][name], table_name=name
+        )
+        tables.append({"name": name, "rows": len(table.rows)})
+    return tables, sorted(manifest["indexes"]), manifest["checkpoint_lsn"]
 
 
 def _summarize(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str], int]:
@@ -198,23 +225,51 @@ def backup_database(
             raise BackupError(f"database file '{source}' is empty")
 
         payload = _read_database_payload(source)
-        tables, indexes, wal_lsn = _summarize(payload)
+        version = payload.get("format_version")
+        extra_files: list[tuple[str, bytes]] = []
         manifest: dict[str, Any] = {
             "backup_format": BACKUP_FORMAT,
             "backup_format_version": BACKUP_FORMAT_VERSION,
             "engine_version": __version__,
             "created_at": _utc_now(),
             "source_database": source.name,
-            "source_format_version": payload.get("format_version"),
-            "database_format_version": payload.get("format_version"),
+            "source_format_version": version,
+            "database_format_version": version,
             "database_file": DATABASE_NAME,
             "database_size": len(data),
             "database_sha256": _sha256_bytes(data),
-            "wal_lsn": wal_lsn,
-            "tables": tables,
-            "indexes": indexes,
             "consistency": "offline snapshot after WAL recovery",
         }
+        if version == SEGMENTED_FORMAT_VERSION:
+            tables, indexes, wal_lsn = _summarize_v4(source, payload)
+            segment_names = [
+                payload["tables"][name]["segment"] for name in sorted(payload["tables"])
+            ]
+            seg_dir = segments.segment_dir(source)
+            inventory = [
+                {
+                    "path": DATABASE_NAME,
+                    "size": len(data),
+                    "sha256": _sha256_bytes(data),
+                }
+            ]
+            for name in segment_names:
+                blob = (seg_dir / name).read_bytes()
+                inventory.append(
+                    {
+                        "path": f"{DATABASE_NAME}{segments.SEGMENT_DIR_SUFFIX}/{name}",
+                        "size": len(blob),
+                        "sha256": _sha256_bytes(blob),
+                    }
+                )
+                extra_files.append((name, blob))
+            manifest["files"] = inventory
+            manifest["segments"] = segment_names
+        else:
+            tables, indexes, wal_lsn = _summarize(payload)
+        manifest["wal_lsn"] = wal_lsn
+        manifest["tables"] = tables
+        manifest["indexes"] = indexes
 
         dest.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(
@@ -223,6 +278,13 @@ def backup_database(
         db_copy = staging / DATABASE_NAME
         db_copy.write_bytes(data)
         _fsync_file(db_copy)
+        if extra_files:
+            segment_copy_dir = staging / f"{DATABASE_NAME}{segments.SEGMENT_DIR_SUFFIX}"
+            segment_copy_dir.mkdir(parents=True, exist_ok=True)
+            for name, blob in extra_files:
+                (segment_copy_dir / name).write_bytes(blob)
+                _fsync_file(segment_copy_dir / name)
+            fsync_dir(segment_copy_dir)
         manifest_path = staging / MANIFEST_NAME
         manifest_path.write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -277,9 +339,10 @@ def read_manifest(backup_dir: str | Path) -> dict[str, Any]:
     db_version = manifest.get("database_format_version")
     if isinstance(db_version, bool) or not isinstance(db_version, int):
         raise BackupError("backup manifest has no valid database_format_version")
-    if db_version > FORMAT_VERSION:
+    if db_version > CURRENT_FORMAT_VERSION:
         raise BackupError(
-            f"backup was written by a newer database format ({db_version} > {FORMAT_VERSION})"
+            f"backup was written by a newer database format "
+            f"({db_version} > {CURRENT_FORMAT_VERSION})"
         )
     name = manifest.get("database_file")
     if not isinstance(name, str) or not name or Path(name).name != name:
@@ -290,6 +353,54 @@ def read_manifest(backup_dir: str | Path) -> dict[str, Any]:
     size = manifest.get("database_size")
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:
         raise BackupError("backup manifest has no valid database_size")
+
+    raw_files = manifest.get("files")
+    if raw_files is not None:
+        if version < 2:
+            raise BackupError("backup format version 1 cannot carry a file inventory")
+        if not isinstance(raw_files, list) or not raw_files:
+            raise BackupError("backup manifest has an invalid 'files' inventory")
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for entry in raw_files:
+            if not isinstance(entry, dict) or set(entry.keys()) != {
+                "path",
+                "size",
+                "sha256",
+            }:
+                raise BackupError("backup manifest has an invalid file inventory entry")
+            path = _safe_relative_path(entry["path"], root=root)
+            entry_size = entry["size"]
+            entry_digest = entry["sha256"]
+            if (
+                isinstance(entry_size, bool)
+                or not isinstance(entry_size, int)
+                or entry_size < 0
+            ):
+                raise BackupError(f"backup inventory has an invalid size for '{path}'")
+            if not isinstance(entry_digest, str) or len(entry_digest) != 64:
+                raise BackupError(
+                    f"backup inventory has an invalid checksum for '{path}'"
+                )
+            if path in seen:
+                raise BackupError(f"backup inventory lists '{path}' twice")
+            seen.add(path)
+            entries.append({"path": path, "size": entry_size, "sha256": entry_digest})
+        if name not in seen:
+            raise BackupError("backup inventory does not list the database file")
+        manifest["files"] = entries
+    elif db_version == SEGMENTED_FORMAT_VERSION:
+        raise BackupError(
+            "format-v4 backup is missing its file inventory (segments cannot be "
+            "restored from a single file)"
+        )
+
+    raw_segments = manifest.get("segments")
+    if raw_segments is not None:
+        if not isinstance(raw_segments, list):
+            raise BackupError("backup manifest has an invalid 'segments' list")
+        for segment_name in raw_segments:
+            segments.validate_segment_name(segment_name)
     return manifest
 
 
@@ -319,10 +430,193 @@ def verify_backup(backup_dir: str | Path) -> dict[str, Any]:
             f"file hashes to {actual}"
         )
     with tempfile.TemporaryDirectory(prefix="aaysql-backup-verify-") as tmp:
-        candidate = Path(tmp) / "verify.aaydb"
-        candidate.write_bytes(data)
+        if manifest.get("files"):
+            candidate = _stage_inventory(root, manifest, Path(tmp))
+        else:
+            candidate = Path(tmp) / "verify.aaydb"
+            candidate.write_bytes(data)
         _recover_pending_wal(candidate)
     return manifest
+
+
+def _stage_inventory(
+    root: Path, manifest: dict[str, Any], destination: Path
+) -> Path:
+    """Copy and verify every inventory file into ``destination``."""
+    for entry in manifest["files"]:
+        rel = Path(*PurePosixPath(entry["path"]).parts)
+        source = root / rel
+        if not source.is_file():
+            raise BackupError(f"backup is missing '{entry['path']}'")
+        try:
+            blob = source.read_bytes()
+        except OSError as exc:
+            raise BackupError(f"cannot read backup file '{source}': {exc}") from exc
+        if len(blob) != entry["size"]:
+            raise BackupError(
+                f"backup size mismatch for '{entry['path']}': manifest says "
+                f"{entry['size']} bytes, file has {len(blob)}"
+            )
+        actual = _sha256_bytes(blob)
+        if actual != entry["sha256"]:
+            raise BackupError(
+                f"backup checksum mismatch for '{entry['path']}': manifest says "
+                f"{entry['sha256']}, file hashes to {actual}"
+            )
+        target = destination / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(blob)
+        _fsync_file(target)
+        if target.parent != destination:
+            fsync_dir(target.parent)
+    return destination / Path(*PurePosixPath(manifest["database_file"]).parts)
+
+
+def _copy_previous_segments(
+    manifest: dict[str, Any], old_root: Path, preserved_root: Path
+) -> None:
+    """Keep a preserved previous root self-contained by copying its segments.
+
+    Best effort: the restore itself has already succeeded, and the preserved copy
+    is only a convenience rollback artefact.
+    """
+    source_dir = segments.segment_dir(old_root)
+    destination_dir = segments.segment_dir(preserved_root)
+    try:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        for ref in manifest["tables"].values():
+            name = segments.validate_segment_name(ref["segment"])
+            destination = destination_dir / name
+            if destination.exists():
+                continue
+            blob = (source_dir / name).read_bytes()
+            destination.write_bytes(blob)
+            _fsync_file(destination)
+        fsync_dir(destination_dir)
+    except (OSError, StorageError):
+        return
+
+
+def _restore_segmented(
+    root: Path, target: Path, manifest: dict[str, Any]
+) -> dict[str, Any]:
+    """Restore a format-v4 inventory backup.
+
+    Segments are installed into ``<target>.seg`` first and only then is the root
+    manifest atomically replaced, so the target is always either the previous
+    generation or the new one.
+    """
+    lock = _acquire(target)
+    staging: Path | None = None
+    staged_root: Path | None = None
+    previous: Path | None = None
+    try:
+        wal_path = Path(f"{target}.wal")
+        if wal_path.exists() and wal_path.is_file() and wal_path.stat().st_size > 0:
+            raise BackupError(
+                f"restore target '{target}' has unrecovered WAL data; start the "
+                "database once so recovery applies it, then restore"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(
+            tempfile.mkdtemp(
+                prefix=f".{target.name}.restore-", dir=str(target.parent)
+            )
+        )
+        candidate = _stage_inventory(root, manifest, staging)
+        try:
+            _recover_pending_wal(candidate)
+        except BackupError as exc:
+            raise BackupError(f"backup cannot be restored: {exc}") from exc
+
+        segment_dir = segments.segment_dir(target)
+        segment_dir.mkdir(parents=True, exist_ok=True)
+        for entry in manifest["files"]:
+            rel = PurePosixPath(entry["path"])
+            if len(rel.parts) != 2 or not str(rel.parts[0]).endswith(
+                segments.SEGMENT_DIR_SUFFIX
+            ):
+                continue
+            name = segments.validate_segment_name(rel.parts[1])
+            destination = segment_dir / name
+            if destination.exists():
+                existing = destination.read_bytes()
+                if (
+                    len(existing) != entry["size"]
+                    or _sha256_bytes(existing) != entry["sha256"]
+                ):
+                    raise BackupError(
+                        f"target segment '{name}' already exists with different "
+                        "content; refusing to overwrite a content-addressed file"
+                    )
+                continue
+            blob = (staging / Path(*rel.parts)).read_bytes()
+            destination.write_bytes(blob)
+            _fsync_file(destination)
+        fsync_dir(segment_dir)
+
+        fd, raw_path = tempfile.mkstemp(
+            prefix=f".{target.name}.restore-root-",
+            suffix=".tmp",
+            dir=str(target.parent),
+        )
+        os.close(fd)
+        staged_root = Path(raw_path)
+        staged_root.write_bytes(candidate.read_bytes())
+        _fsync_file(staged_root)
+
+        if target.exists():
+            previous = Path(f"{target}.pre-restore-{uuid.uuid4().hex}")
+            old_manifest: dict[str, Any] | None
+            try:
+                old_manifest = segments.read_manifest(target)
+            except StorageError:
+                old_manifest = None
+            os.replace(target, previous)
+            if old_manifest is not None:
+                _copy_previous_segments(old_manifest, target, previous)
+        try:
+            os.replace(staged_root, target)
+            staged_root = None
+        except OSError as exc:
+            if previous is not None and previous.exists():
+                os.replace(previous, target)
+                previous = None
+            raise BackupError(
+                f"cannot install restored database at '{target}': {exc}"
+            ) from exc
+        fsync_dir(target.parent)
+
+        if wal_path.exists() and wal_path.is_file() and wal_path.stat().st_size == 0:
+            try:
+                wal_path.unlink()
+            except OSError as exc:
+                raise BackupError(
+                    f"restored '{target}' but could not remove the empty WAL: {exc}"
+                ) from exc
+
+        try:
+            _recover_pending_wal(target, lease=lock)
+        except BackupError:
+            if previous is not None and previous.exists():
+                os.replace(previous, target)
+                previous = None
+            raise
+        return {
+            "restored": str(target),
+            "backup": str(root),
+            "manifest": manifest,
+            "previous_database": str(previous) if previous is not None else None,
+        }
+    finally:
+        if staged_root is not None and staged_root.exists():
+            try:
+                staged_root.unlink()
+            except OSError:
+                pass
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        lock.release()
 
 
 def restore_database(
@@ -331,6 +625,7 @@ def restore_database(
     *,
     force: bool = False,
 ) -> dict[str, Any]:
+
     """Restore a backup into ``target_path``.
 
     Returns a report with the manifest, the restored path, and the location of the
@@ -347,6 +642,8 @@ def restore_database(
         raise BackupError(
             f"restore target '{target}' already exists; pass force=True to replace it"
         )
+    if manifest.get("files"):
+        return _restore_segmented(root, target, manifest)
 
     lock = _acquire(target)
     staged: Path | None = None

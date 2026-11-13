@@ -15,12 +15,13 @@ from .ast import (
     Rollback,
     Update,
 )
+from .delta import MutationRecorder
 from .errors import AmbiguousCommitError, StorageError
 from .executor import Executor
 from .lexer import Lexer
 from .locking import DatabaseLease
 from .parser import Parser
-from .storage import Database, JsonFileStorage
+from .storage import Database, open_storage
 from .transaction import TransactionManager
 
 _MUTATION_STATEMENTS = (
@@ -58,13 +59,14 @@ class Engine:
         releases that lease. In-memory engines take no lease at all.
         """
         self.lexer = Lexer()
+        self._recorder = MutationRecorder()
         self._lease: DatabaseLease | None = None
         self._owns_lease = False
         if db_path is None or str(db_path) == ":memory:":
             if _lease is not None:
                 raise StorageError("an in-memory Engine cannot borrow a database lease")
             self.db_path: Path | None = None
-            self.storage: JsonFileStorage | None = None
+            self.storage: Any | None = None
             self.db = Database()
         else:
             if isinstance(db_path, str) and not db_path.strip():
@@ -84,14 +86,14 @@ class Engine:
             assert canonical is not None
             self.db_path = canonical
             try:
-                self.storage = JsonFileStorage(self.db_path)
+                self.storage = open_storage(self.db_path)
                 self.db = self.storage.load()
             except BaseException:
                 # Never leave ownership behind when construction fails: opening
                 # the database may already have recovered or checkpointed the WAL.
                 self._release_owned_lease()
                 raise
-        self.executor = Executor(self.db)
+        self.executor = Executor(self.db, recorder=self._recorder)
         self.transactions = TransactionManager()
         self._closed = False
         self._recovery_required = False
@@ -159,13 +161,18 @@ class Engine:
 
         if self.storage is not None and isinstance(stmt, _MUTATION_STATEMENTS):
             snapshot = self.db.clone()
+            self._recorder.clear()
+            self._recorder.start()
             try:
                 result = self.executor.execute(stmt)
-                self.storage.save(self.db)
+                changes = self._recorder.take()
+                self.storage.save(self.db, changes)
             except AmbiguousCommitError:
+                self._recorder.take()
                 self._recovery_required = True
                 raise
             except Exception:
+                self._recorder.take()
                 self._install(snapshot)
                 if self.storage is not None and self.storage.wal.poisoned:
                     self._recovery_required = True
@@ -179,10 +186,12 @@ class Engine:
         # Each statement stays atomic inside the transaction: a failed statement
         # must not leave partial rows or index entries behind.
         before_statement = self.db.clone()
+        mark = self._recorder.mark()
         try:
             result = self.executor.execute(stmt)
         except Exception:
             self._install(before_statement)
+            self._recorder.rollback_to(mark)
             raise
         self.transactions.record_statement()
         return result
@@ -190,14 +199,17 @@ class Engine:
     def begin(self) -> dict[str, Any]:
         self._ensure_usable()
         self.transactions.begin(self.db.clone())
+        self._recorder.clear()
+        self._recorder.start()
         return {"status": "ok", "message": "Transaction started"}
 
     def commit(self) -> dict[str, Any]:
         self._ensure_usable()
         transaction = self.transactions.commit()
         try:
+            changes = self._recorder.take()
             if self.storage is not None:
-                self.storage.save(self.db)
+                self.storage.save(self.db, changes)
         except AmbiguousCommitError:
             self._recovery_required = True
             raise
@@ -205,6 +217,7 @@ class Engine:
             # The commit never became durable before WAL COMMIT fsync, so memory
             # must match the previously durable state captured at BEGIN. If the
             # failed append may have left torn bytes, only a reopen can continue.
+            self._recorder.take()
             self._install(transaction.snapshot)
             if self.storage is not None and self.storage.wal.poisoned:
                 self._recovery_required = True
@@ -214,8 +227,20 @@ class Engine:
     def rollback(self) -> dict[str, Any]:
         self._ensure_usable()
         transaction = self.transactions.rollback()
+        self._recorder.clear()
         self._install(transaction.snapshot)
         return {"status": "ok", "message": "Transaction rolled back"}
+
+    def checkpoint(self) -> None:
+        """Publish an explicit checkpoint of the current state.
+
+        Only format-v4 databases have an explicit checkpoint; version 1-3
+        databases are checkpointed by every commit.
+        """
+        self._ensure_usable()
+        if self.storage is None:
+            return
+        self.storage.checkpoint(self.db)
 
     def close(self) -> None:
         if self._closed:
@@ -227,7 +252,7 @@ class Engine:
                 # An uncommitted transaction must never become durable.
                 self.rollback()
             if self.storage is not None:
-                self.storage.cleanup_if_clean()
+                self.storage.cleanup_if_clean(self.db)
         finally:
             # Release even when rollback or cleanup fails: a leaked lease would
             # block every future owner of this database.

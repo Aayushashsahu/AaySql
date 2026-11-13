@@ -34,10 +34,33 @@ from aaysql.lexer import Lexer
 from aaysql.parser import Parser
 from aaysql.planner import plan_select
 from aaysql.server import AayushSQLServer, ServerConfig
-from aaysql.storage import FORMAT_VERSION
+from aaysql.storage import ENGINE_VERSION, FORMAT_VERSION
 from aaysql.wal import WalManager
 
 SEED = 20261111
+
+
+def _seed_v3_database(path: Path) -> None:
+    """Create an empty format-v3 database so this suite measures the v3 baseline.
+
+    New databases are format v4; the release benchmark documents the legacy
+    whole-image storage path, which is still fully supported.
+    """
+    if path.exists():
+        return
+    path.write_text(
+        json.dumps(
+            {
+                "format": "aaysql",
+                "format_version": FORMAT_VERSION,
+                "engine_version": ENGINE_VERSION,
+                "wal_lsn": 0,
+                "tables": {},
+                "indexes": {},
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _parse(sql: str):
@@ -75,6 +98,7 @@ def run_storage_benchmarks() -> list[dict]:
 
         # Seed a 1,000-row database with an index for open/close/backup/restore.
         seed_db = root / "seed.aaydb"
+        _seed_v3_database(seed_db)
         e = Engine(seed_db)
         e.execute("AAYUSH CREATE TABLE items (id INT PRIMARY KEY, grp INT, title TEXT)")
         e.execute("AAYUSH CREATE INDEX idx_items_grp ON items (grp)")
@@ -118,6 +142,7 @@ def run_storage_benchmarks() -> list[dict]:
 
         # WAL autocommit INSERT & checkpoint
         auto_db = root / "autocommit.aaydb"
+        _seed_v3_database(auto_db)
         auto_engine = Engine(auto_db)
         auto_engine.execute("AAYUSH CREATE TABLE log_rows (id INT PRIMARY KEY, v INT)")
         counter = {"id": 1}
@@ -132,6 +157,7 @@ def run_storage_benchmarks() -> list[dict]:
 
         # Explicit transaction with 50 mutations (single COMMIT)
         tx_db = root / "tx.aaydb"
+        _seed_v3_database(tx_db)
         tx_engine = Engine(tx_db)
         tx_engine.execute("AAYUSH CREATE TABLE tx_rows (id INT PRIMARY KEY, v INT)")
         tx_id = {"n": 0}
@@ -450,7 +476,7 @@ def run_memory_growth_check() -> dict[str, float]:
 
 
 def main() -> None:
-    print(f"AayushSQL {__version__} (format v{FORMAT_VERSION})")
+    print(f"AayushSQL {__version__} (legacy format v{FORMAT_VERSION} baseline)")
     print(
         f"OS: {platform.platform()} | Python: {platform.python_version()} | "
         f"CPU: {platform.processor() or platform.machine()} ({os.cpu_count()} cores)"

@@ -12,7 +12,7 @@ Every top-level SQL statement must begin with `AAYUSH`. Ordinary SQL without the
 
 ## Current Version
 
-**v1.0.0 — First Stable Release** (`.aaydb` format v3, network protocol v1).
+**v1.0.0 — First Stable Release** (`.aaydb` format v4 for new databases with v1–v3 readability, network protocol v1).
 
 AayushSQL v1.0.0 establishes a frozen, documented compatibility contract, security boundary, offline backup and restore (`aaysql-backup`), cross-platform CI (Ubuntu/Windows/macOS across Python 3.10–3.13), and wheel/source packaging on top of the full v0.1.0–v0.9.0 engine: relational queries, expressions (`IS NULL`, `LIKE`, `IN`, `BETWEEN`, arithmetic, `CASE`, `DISTINCT`, `OFFSET`), B+ tree indexes, cost-based optimizer and hash joins, transactions, WAL crash recovery, and TCP server with token auth and TLS.
 
@@ -87,7 +87,12 @@ Everything behind the parser — relational joins, column resolution, grouping, 
   - Mutations inside a transaction are visible to later statements but stay in memory until the single `COMMIT` save; `ROLLBACK` restores the pre-`BEGIN` snapshot, including DDL and index changes.
   - Each statement stays atomic inside a transaction.
   - Closing the engine or exiting the CLI with an active transaction rolls it back and prints a warning to `stderr`.
-- Write-Ahead Log & Crash Recovery (v0.6.0, hardened in v0.6.1 — see [`WAL.md`](WAL.md)):
+- Delta WAL, segmented checkpoints & format v4 (see [`WAL.md`](WAL.md), [`docs/FORMAT_V4.md`](docs/FORMAT_V4.md)):
+  - Commits append only the changed rows (`insert`/`update`/`delete`/DDL), never a whole-database image; the WAL `COMMIT` `fsync` remains the commit point.
+  - Checkpoints publish a root manifest at `<db>` that references one immutable, content-addressed segment per table under `<db>.seg/`. Unchanged tables reuse their existing segment bytes, and unreferenced generations are collected.
+  - Manifest publication is atomic (fsynced temp file, `os.replace`, directory `fsync`). A failed checkpoint after a successful commit is reported as pending, never as a rollback, and the WAL replays on the next open.
+  - New databases are format 4. Format v1–v3 databases stay on the v3 backend until an explicit `aaysql --migrate PATH` (backup → segments → publish → verify → clean up, with automatic restore on failure).
+- Write-Ahead Log & Crash Recovery (legacy format v3, hardened in v0.6.1):
   - Adjacent newline-delimited JSON WAL (`<db>.wal`) with canonical SHA-256 checksums, monotonic LSNs, unique per-transaction IDs, and `BEGIN` / `WRITE` / `COMMIT` / `CHECKPOINT` records.
   - WAL `os.fsync()` commit durability precedes snapshot checkpointing for both explicit transactions and autocommit mutations (`INSERT`, `UPDATE`, `DELETE`, `CREATE/DROP TABLE`, `CREATE/DROP INDEX`).
   - Distinguished error semantics: pre-commit errors roll back cleanly, post-`COMMIT` checkpoint failures preserve the committed state and WAL without misreporting failure, and `COMMIT` `fsync` errors raise `AmbiguousCommitError` and require reopen recovery.
@@ -97,7 +102,7 @@ Everything behind the parser — relational joins, column resolution, grouping, 
   - Partial append hardening (v0.6.1): unbuffered `O_APPEND` writes with a write-all loop, an explicit append state machine, and WAL poisoning. A WAL that may contain torn bytes refuses further appends, and the engine blocks statements until reopen recovery.
   - Ambiguous `COMMIT` semantics (v0.6.1): a failed `COMMIT` `fsync` preserves the WAL, keeps memory unchanged, and raises `AmbiguousCommitError` instead of claiming a rollback; recovery decides from the actual record.
   - Directory `fsync` errors are classified (v0.6.1): unsupported operations (and Windows) fall back deliberately, while `EACCES`/`EIO`/`ENOSPC` propagate as `StorageError` and never silently claim durability.
-  - `.aaydb` format version `3` (`wal_lsn`) with safe read-only compatibility and on-write migration for format v1 and v2 databases.
+  - Format-v3 legacies (`wal_lsn`, v1/v2 on-write migration) remain readable and writable through the v3 backend.
 - Persistent storage:
   - Read-only `SELECT` queries (including joins and aggregations) never modify persisted files.
   - Configurable database file path (`--db`) and in-memory mode (`--memory` / `--db :memory:`).
@@ -398,7 +403,7 @@ determine the real state; never replay mutations or `COMMIT` automatically.
   a replacement for canonical ownership. Stop the owner before using the CLI, an
   embedded `Engine`, or `aaysql-backup` on that file. See
   [docs/OPERATIONS.md](docs/OPERATIONS.md#10-database-ownership-and-locking).
-- The `.aaydb` format is version 3; network protocol is version 1.
+- New databases use the `.aaydb` format version 4 (root manifest + segments + delta WAL); formats 1–3 remain readable and are converted only by explicit migration. Network protocol is version 1.
 
 ## Offline Backup and Restore
 
@@ -410,7 +415,7 @@ aaysql-backup verify backups/university-2026-11-11
 aaysql-backup restore backups/university-2026-11-11 university-restored.aaydb
 ```
 
-- Backups recover any pending WAL before reading, verify and record SHA-256 checksums in `manifest.json`, and stage atomically.
+- Backups recover any pending WAL before reading, verify and record SHA-256 checksums in `manifest.json`, and stage atomically. A format-v4 backup includes a full inventory of the manifest and every segment.
 - Restoring validates the candidate copy before swapping and refuses to overwrite an existing database (or a target with unrecovered WAL data) without `--force`. See [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ## Testing & Continuous Integration
@@ -427,10 +432,11 @@ GitHub Actions CI (`.github/workflows/tests.yml`) runs across **Ubuntu, Windows,
 
 - [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) — End-to-end tutorial (SQL, client/server, backup/restore)
 - [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — Operational runbook, recovery, `RECOVERY_REQUIRED`, locking, troubleshooting
-- [`COMPATIBILITY.md`](COMPATIBILITY.md) — Formal SQL, format v3, protocol v1, and Python API compatibility contract
+- [`COMPATIBILITY.md`](COMPATIBILITY.md) — Formal SQL, database format compatibility, protocol v1, and Python API contract
 - [`LANGUAGE_SPEC.md`](LANGUAGE_SPEC.md) — Full lexical rules and SQL grammar
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — Internal engine architecture
-- [`WAL.md`](WAL.md) — Write-ahead log protocol, checksums, checkpointing, and crash recovery
+- [`WAL.md`](WAL.md) — Write-ahead log protocol, checksums, checkpointing, and crash recovery (v3 and v4)
+- [`docs/FORMAT_V4.md`](docs/FORMAT_V4.md) — Format-v4 root manifest, segment encoding, delta records, and publication order
 - [`SERVER_ARCHITECTURE.md`](SERVER_ARCHITECTURE.md) — TCP server, coordinator lock, and session ownership
 - [`SECURITY.md`](SECURITY.md) & [`THREAT_MODEL.md`](THREAT_MODEL.md) — Security boundary and threat model
 - [`AUDIT.md`](AUDIT.md) — v1.0.0 stabilization audit findings and fixes

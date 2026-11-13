@@ -10,6 +10,7 @@ These tests target three failure modes:
 """
 
 import errno
+import json
 import os
 import subprocess
 import sys
@@ -21,7 +22,7 @@ import pytest
 
 from aaysql import Engine
 from aaysql.errors import AmbiguousCommitError, StorageError
-from aaysql.storage import JsonFileStorage
+from aaysql.storage import ENGINE_VERSION, FORMAT_VERSION, JsonFileStorage
 from aaysql.wal import build_record, fsync_dir, parse_wal, serialize_record
 
 SRC_DIR = str(Path(__file__).parents[1] / "src")
@@ -48,8 +49,36 @@ def _rows(engine: Engine) -> list[dict]:
     )["rows"]
 
 
+def _seed_legacy_database(db_file: Path) -> None:
+    """Create an empty version-3 database when the path is new.
+
+    These tests exercise the legacy whole-image WAL and its repair machinery, so
+    they run on the version-3 backend rather than on a new format-v4 database.
+    """
+    if db_file.exists():
+        return
+    db_file.write_text(
+        json.dumps(
+            {
+                "format": "aaysql",
+                "format_version": FORMAT_VERSION,
+                "engine_version": ENGINE_VERSION,
+                "wal_lsn": 0,
+                "tables": {},
+                "indexes": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _open(db_file: Path) -> Engine:
+    _seed_legacy_database(db_file)
+    return Engine(db_file)
+
+
 def _make_database(db_file: Path) -> None:
-    with Engine(db_file) as engine:
+    with _open(db_file) as engine:
         for stmt in SETUP_SQL:
             engine.execute(stmt)
 
@@ -88,6 +117,7 @@ engine = Engine(db_path)
 engine.close()
 raise AssertionError("expected the child to terminate at the crash point")
 """
+    _seed_legacy_database(db_file)
     env_vars = os.environ.copy()
     env_vars["PYTHONPATH"] = SRC_DIR + (
         os.pathsep + env_vars["PYTHONPATH"] if env_vars.get("PYTHONPATH") else ""
@@ -109,12 +139,12 @@ raise AssertionError("expected the child to terminate at the crash point")
 
 
 def _assert_clean_database(db_file: Path, expected_rows: list[dict]) -> None:
-    with Engine(db_file) as engine:
+    with _open(db_file) as engine:
         assert _rows(engine) == expected_rows
         assert "idx_accounts_owner" in engine.db.indexes
         engine.db.indexes["idx_accounts_owner"].validate()
     # A second recovery pass must be a no-op.
-    with Engine(db_file) as engine:
+    with _open(db_file) as engine:
         assert _rows(engine) == expected_rows
     assert not Path(f"{db_file}.wal").exists() or Path(f"{db_file}.wal").stat().st_size == 0
 
@@ -166,7 +196,7 @@ def test_recovery_repairs_tail_before_checkpoint_and_replays_once(tmp_path: Path
     _append_raw(wal_path, corrupt_tail)
     assert wal_path.read_bytes().endswith(corrupt_tail)
 
-    with Engine(db_file) as engine:
+    with _open(db_file) as engine:
         assert _rows(engine) == BASE_ROWS + [{"id": 3, "owner": "Mika", "balance": 250}]
     # The whole WAL is consumed by the checkpoint after repair.
     assert not wal_path.exists() or wal_path.stat().st_size == 0
@@ -247,7 +277,7 @@ def test_tail_repair_preserves_multiple_valid_committed_records(tmp_path: Path):
     valid_bytes = wal_path.read_bytes()
     _append_raw(wal_path, b"\x00\x01 not json\n")
 
-    with Engine(db_file) as engine:
+    with _open(db_file) as engine:
         assert _rows(engine) == [
             {"id": 1, "owner": "Aayush", "balance": 1111},
             {"id": 2, "owner": "Alex", "balance": 500},
@@ -287,7 +317,7 @@ def test_recovery_discards_uncommitted_transaction_with_corrupt_tail(tmp_path: P
         + b'{"torn":',
     )
 
-    with Engine(db_file) as engine:
+    with _open(db_file) as engine:
         assert _rows(engine) == BASE_ROWS
     assert not wal_path.exists() or wal_path.stat().st_size == 0
 
@@ -307,12 +337,12 @@ def test_mid_log_corruption_after_valid_records_still_refuses_open(tmp_path: Pat
     _append_raw(wal_path, serialize_record(corrupt) + serialize_record(later))
 
     with pytest.raises(StorageError, match="Corrupted WAL record"):
-        Engine(db_file)
+        _open(db_file)
     # The snapshot is untouched, the later record was not applied, and the
     # corruption keeps refusing to open instead of being skipped.
     assert db_file.read_bytes() == snapshot_before
     with pytest.raises(StorageError, match="Corrupted WAL record"):
-        Engine(db_file)
+        _open(db_file)
 
 
 # ------------------------------------------- Phase 2: directory fsync error handling
@@ -386,7 +416,7 @@ def test_fsync_dir_genuine_failure_raises_storage_error(
 def test_checkpoint_dir_fsync_failure_keeps_commit_and_wal(tmp_path: Path, monkeypatch):
     db_file = tmp_path / "dir_fsync_commit.aaydb"
     _make_database(db_file)
-    engine = Engine(db_file)
+    engine = _open(db_file)
 
     def failing_dir_fsync(path):
         raise StorageError("Failed to fsync directory: simulated EIO")
@@ -462,7 +492,7 @@ def test_short_writes_are_completed_by_write_all(tmp_path: Path, monkeypatch):
 def test_short_write_then_error_poisons_wal_and_restores_state(tmp_path: Path, monkeypatch):
     db_file = tmp_path / "partial_fail.aaydb"
     _make_database(db_file)
-    engine = Engine(db_file)
+    engine = _open(db_file)
     real_write = os.write
     budget = {"left": 20}
 
@@ -493,7 +523,7 @@ def test_short_write_then_error_poisons_wal_and_restores_state(tmp_path: Path, m
     engine.close()
 
     # Reopening discards the torn transaction and allows new work.
-    with Engine(db_file) as reopened:
+    with _open(db_file) as reopened:
         assert _rows(reopened) == BASE_ROWS
         reopened.execute("AAYUSH INSERT INTO accounts VALUES (4, 'Fresh', 4)")
     _assert_clean_database(db_file, BASE_ROWS + [{"id": 4, "owner": "Fresh", "balance": 4}])
@@ -502,7 +532,7 @@ def test_short_write_then_error_poisons_wal_and_restores_state(tmp_path: Path, m
 def test_failure_during_begin_append_restores_state_and_poisons(tmp_path: Path, monkeypatch):
     db_file = tmp_path / "begin_fail.aaydb"
     _make_database(db_file)
-    engine = Engine(db_file)
+    engine = _open(db_file)
 
     def immediate_failure(fd, data):
         raise OSError(errno.EIO, "I/O error")
@@ -515,14 +545,14 @@ def test_failure_during_begin_append_restores_state_and_poisons(tmp_path: Path, 
     assert engine.needs_recovery is True
     assert engine.db.tables["accounts"].rows == BASE_ROWS
     engine.close()
-    with Engine(db_file) as reopened:
+    with _open(db_file) as reopened:
         assert _rows(reopened) == BASE_ROWS
 
 
 def test_commit_fsync_failure_is_ambiguous_and_keeps_in_memory_state(tmp_path: Path, monkeypatch):
     db_file = tmp_path / "ambiguous_new.aaydb"
     _make_database(db_file)
-    engine = Engine(db_file)
+    engine = _open(db_file)
 
     def failing_fsync(fd):
         raise OSError(errno.EIO, "I/O error during fsync")
@@ -541,7 +571,7 @@ def test_commit_fsync_failure_is_ambiguous_and_keeps_in_memory_state(tmp_path: P
     engine.close()
 
     # The fully written COMMIT record makes the transaction recoverable.
-    with Engine(db_file) as reopened:
+    with _open(db_file) as reopened:
         assert _rows(reopened) == BASE_ROWS + [{"id": 3, "owner": "Maybe", "balance": 600}]
 
 
@@ -560,7 +590,7 @@ def test_poisoned_manager_refuses_further_appends(tmp_path: Path):
 def test_checkpoint_append_failure_blocks_writes_until_reopen(tmp_path: Path, monkeypatch):
     db_file = tmp_path / "ckpt_append_fail.aaydb"
     _make_database(db_file)
-    engine = Engine(db_file)
+    engine = _open(db_file)
 
     def poisoned_checkpoint(*args, **kwargs):
         engine.storage.wal.poisoned = True
@@ -604,7 +634,7 @@ raise AssertionError("expected crash")
     wal_path = Path(f"{db_file}.wal")
     assert wal_path.stat().st_size > 0
 
-    with Engine(db_file) as engine:
+    with _open(db_file) as engine:
         assert _rows(engine) == BASE_ROWS
         # No valid COMMIT exists, so nothing was applied. The log was repaired,
         # so a new transaction may append safely.
@@ -689,4 +719,4 @@ os._exit(98)
     assert proc.returncode == CRASH_EXIT_CODE, (proc.returncode, proc.stderr)
     assert db_file.read_bytes() == snapshot_before
     with pytest.raises(StorageError, match="Corrupted WAL record"):
-        Engine(db_file)
+        _open(db_file)

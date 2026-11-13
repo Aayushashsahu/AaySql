@@ -186,7 +186,7 @@ def test_commit_persistence_failure_rolls_back_and_reports(tmp_path: Path, monke
     engine.execute("AAYUSH BEGIN")
     engine.execute("AAYUSH INSERT INTO accounts VALUES (3, 'Mika', 250)")
 
-    def broken_save(_db):
+    def broken_save(_db, _changes=None):
         raise StorageError("disk full")
 
     monkeypatch.setattr(engine.storage, "save", broken_save)

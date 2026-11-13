@@ -115,18 +115,20 @@ def test_preserve_column_types_defaults_and_constraints_after_reload(tmp_path: P
             e2.execute("AAYUSH INSERT INTO accounts (id, email) VALUES ('not_int', 'c@example.com')")
 
 
-def test_missing_database_file_starts_empty_without_creating_on_read(tmp_path: Path):
+def test_missing_database_file_starts_empty_and_publishes_a_v4_manifest(tmp_path: Path):
     db_file = tmp_path / "nested" / "new.aaydb"
     assert not db_file.exists()
 
     e = Engine(db_file)
-    assert not db_file.exists()
+    # Format v4 persists its root manifest (database identity) when it opens.
+    assert db_file.exists()
+    assert e.db.tables == {}
     with pytest.raises(ExecutionError, match="does not exist"):
         e.execute("AAYUSH SELECT * FROM users")
-    assert not db_file.exists()
 
     e.execute("AAYUSH CREATE TABLE users (id INT PRIMARY KEY)")
     assert db_file.exists()
+    e.close()
 
 
 @pytest.mark.parametrize(
@@ -262,7 +264,7 @@ def test_save_failure_rolls_back_in_memory_state(tmp_path: Path, monkeypatch):
     e = Engine(db_file)
     e.execute("AAYUSH CREATE TABLE t (id INT PRIMARY KEY)")
 
-    def broken_save(_db):
+    def broken_save(_db, _changes=None):
         raise StorageError("disk full")
 
     monkeypatch.setattr(e.storage, "save", broken_save)
@@ -281,7 +283,11 @@ def test_no_temp_files_left_behind(tmp_path: Path):
     files = sorted(p.name for p in tmp_path.iterdir())
     # The lease file persists by contract (its existence grants nothing; the OS
     # lock does), but no temporary artifacts may remain.
-    assert files == ["clean.aaydb", "clean.aaydb.server.lock"]
+    assert files == [
+        "clean.aaydb",
+        "clean.aaydb.seg",
+        "clean.aaydb.server.lock",
+    ]
 
 
 def test_v01_query_features_and_null_ordering(tmp_path: Path):

@@ -13,7 +13,7 @@ Version identifiers for this release:
 | Component | Version |
 | --- | --- |
 | Package / engine | `1.0.0` |
-| Database file format | `3` |
+| Database file format | `4` (new databases; formats 1–3 remain readable) |
 | Network protocol | `1` |
 
 ---
@@ -137,34 +137,47 @@ misinterpretation:
 
 ## 2. Database file compatibility
 
-A database is a single UTF-8 JSON snapshot `<name>.aaydb`, with an adjacent
-append-only write-ahead log `<name>.aaydb.wal` while a transaction is pending.
+A format-v4 database is a root manifest `<name>.aaydb` plus immutable,
+content-addressed per-table segments in `<name>.aaydb.seg/`, with a delta
+write-ahead log `<name>.aaydb.wal` while commits are pending. The full layout is
+specified in [docs/FORMAT_V4.md](docs/FORMAT_V4.md). Formats v1–v3 remain a single
+UTF-8 JSON snapshot with a whole-image WAL.
 
 | Format | Read | Write / migrate |
 | --- | --- | --- |
 | v1 | Yes | Upgrades to v3 on the next durable write or recovery checkpoint. |
 | v2 | Yes (including persisted index definitions) | Upgrades to v3 on the next durable write or recovery checkpoint. |
-| v3 | Yes (current) | Written by v0.9.0 and v1.0.0. |
+| v3 | Yes (written by v0.9.0 and v1.0.0) | Stays v3 until explicitly migrated with `aaysql --migrate PATH`. |
+| v4 | Yes (current) | New databases are written directly as v4; explicit migration converts v3. |
 | Unknown / newer | No | Rejected with `StorageError`; the file is not modified. |
 
 Verified behavior:
 
-- **Reads do not rewrite.** Opening a v1/v2/v3 file and closing it without a
+- **New databases are v4.** Opening a path that does not exist publishes a root
+  manifest and creates `<name>.aaydb.seg/` immediately.
+- **Reads do not rewrite format.** Opening a v1/v2/v3 file and closing it without a
   mutation leaves the bytes unchanged (`tests/test_format_fixtures.py`,
-  `tests/test_wal_recovery.py`).
-- **Migration moment.** The file is rewritten as format 3 only when a mutation is
-  durably committed (autocommit or `COMMIT`) or when recovery completes with a
-  checkpoint. The rewrite is an atomic `os.replace` of a fsynced temporary file.
-- **WAL interaction.** On open, the snapshot is loaded, then WAL records with
-  `commit_lsn > snapshot.wal_lsn` are replayed from the newest committed image.
-  For a legacy file (`wal_lsn` absent, treated as `0`), a leftover WAL can
-  therefore be replayed too; recovery then checkpoints in format 3.
-- **Migration failure.** The snapshot is only replaced after a successful fsync of
-  the temporary file. A failure raises `StorageError`, removes the temporary file,
-  and leaves the original snapshot (and any WAL) untouched.
-- **Downgrade is not supported.** No earlier application version is tested against
-  a format-3 file written by v1.0.0, so downgrading is explicitly outside the
-  compatibility contract. Keep a backup before upgrading applications.
+  `tests/test_wal_recovery.py`). Legacy files are never converted on open.
+- **v4 commit.** A commit appends one delta transaction (`BEGIN` / `WRITE` with
+  `changes` / `COMMIT`) to the WAL; the `COMMIT` fsync is the commit point. A
+  checkpoint publishes a new root manifest that references one segment per table.
+- **v4 recovery.** On open, the manifest generation is loaded, committed deltas with
+  `commit_lsn > manifest.checkpoint_lsn` are applied in order, and recovery ends with
+  a checkpoint. Replaying is idempotent; re-opening a clean database is a no-op.
+- **Segment safety.** Segment files are re-hashed and length-checked against the
+  manifest on load. A missing, truncated, or modified segment fails closed with
+  `StorageError`; it is never silently skipped or rebuilt from an older generation.
+- **Migration.** `migrate_to_v4()` / `aaysql --migrate PATH` runs under the same
+  canonical `DatabaseLease` as every other path. It copies the v3 snapshot to
+  `<db>.v3.bak`, builds segments, publishes the manifest, reopens and verifies the
+  result, then removes the backup. A failure restores the backup and leaves the v3
+  database usable. The operation is idempotent and finishes an interrupted migration.
+- **Legacy WAL interaction.** For a legacy file (`wal_lsn` absent, treated as `0`), a
+  leftover WAL is replayed before a migration, and the converted generation reflects
+  the recovered state.
+- **Downgrade is not supported.** No earlier application version is tested against a
+  format-v4 database, and v1.0.0 cannot open v4. Keep a backup before upgrading and
+  migrate a copy, not the only copy of your data.
 - Format 3 adds `wal_lsn` as a required field. Format 2 added the `indexes`
   catalog. Both remain readable.
 

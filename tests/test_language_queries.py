@@ -349,9 +349,11 @@ def test_new_expressions_persist_across_reopen(tmp_path):
 
 def test_format_version_and_protocol_version_are_unchanged(tmp_path):
     from aaysql import protocol
-    from aaysql.storage import FORMAT_VERSION
+    from aaysql.storage import FORMAT_VERSION, SEGMENTED_FORMAT_VERSION
 
+    # Version 3 remains the legacy snapshot format; new databases are v4.
     assert FORMAT_VERSION == 3
+    assert SEGMENTED_FORMAT_VERSION == 4
     assert protocol.PROTOCOL_VERSION == 1
 
     path = tmp_path / "fmt.aaydb"
@@ -362,7 +364,8 @@ def test_format_version_and_protocol_version_are_unchanged(tmp_path):
     import json
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["format_version"] == 3
+    assert payload["format_version"] == 4
+    assert payload["tables"]
 
 
 def test_select_through_the_public_expression_entry_point(employees):

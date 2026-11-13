@@ -131,7 +131,7 @@ def test_initialization_failure_releases_the_lease(tmp_path: Path, monkeypatch):
     def explode(self):
         raise StorageError("simulated corrupt snapshot")
 
-    monkeypatch.setattr("aaysql.engine.JsonFileStorage.load", explode)
+    monkeypatch.setattr("aaysql.storage.SegmentedStorage.load", explode)
     with pytest.raises(StorageError, match="simulated corrupt"):
         Engine(path)
     monkeypatch.undo()

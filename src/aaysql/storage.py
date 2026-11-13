@@ -3,23 +3,37 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import segments
 from .ast import ColumnDef
 from .btree import BTreeError
+from .delta import apply_changes
 from .errors import ConstraintError, ExecutionError, StorageError
 from .index import INDEX_NAME_PATTERN, Index
 from .statistics import StatisticsStore
-from .wal import _CRASH_ENV_VAR, WalManager, _maybe_crash, fsync_dir, parse_wal
+from .wal import (
+    _CRASH_ENV_VAR,
+    WalManager,
+    _maybe_crash,
+    fsync_dir,
+    parse_wal,
+    parse_wal_v4,
+)
 
 FORMAT_NAME = "aaysql"
 FORMAT_VERSION = 3
 # Format versions 1 (pre-index) and 2 (pre-WAL) remain readable and upgrade to
 # version 3 on the next write or recovery checkpoint.
 READABLE_FORMAT_VERSIONS = (1, 2, 3)
+# Version 4 stores a root manifest at the database path plus immutable segments.
+SEGMENTED_FORMAT_VERSION = 4
+CURRENT_FORMAT_VERSION = SEGMENTED_FORMAT_VERSION
 ENGINE_VERSION = "1.0.0"
+DEFAULT_CHECKPOINT_BYTES = 1024 * 1024
 
 TYPE_MAP: dict[str, type] = {
     "INT": int,
@@ -537,8 +551,14 @@ class JsonFileStorage:
                 raise
             raise StorageError(f"Failed to serialize database '{self.path}': {exc}") from exc
 
-    def save(self, db: Database) -> None:
-        """Durably commit ``db`` to the WAL, then checkpoint to the main database file."""
+    def save(
+        self, db: Database, changes: list[dict[str, Any]] | None = None
+    ) -> None:
+        """Durably commit ``db`` to the WAL, then checkpoint to the main database file.
+
+        ``changes`` is the v4 delta list; version 3 always writes a full image, so
+        it is accepted and ignored for signature compatibility.
+        """
         if self.path.exists() and self.path.is_dir():
             raise StorageError(f"Database path '{self.path}' is a directory")
         try:
@@ -560,8 +580,415 @@ class JsonFileStorage:
             self.pending_checkpoint = True
             self.last_checkpoint_error = exc
 
-    def cleanup_if_clean(self) -> None:
+    def cleanup_if_clean(self, db: Database | None = None) -> None:
         """Remove an empty 0-byte WAL when no checkpoint is pending."""
         if not self.pending_checkpoint:
             self.wal.remove_if_empty()
+
+    def checkpoint(self, db: Database) -> None:
+        """Explicit checkpoint request (format v3 always checkpoints on save)."""
+        self._checkpoint(db, db.wal_lsn)
+
+
+class SegmentedStorage:
+    """Format v4 persistence: delta WAL plus per-table immutable segments.
+
+    The database path itself is the root manifest. A commit appends one delta
+    transaction to the WAL (whose COMMIT fsync is the commit point) and a
+    checkpoint publishes a new manifest that references one segment per table.
+    Unchanged tables reuse their existing content-addressed segment, so a
+    checkpoint writes only tables whose bytes changed.
+    """
+
+    def __init__(self, path: str | Path, *, checkpoint_bytes: int = DEFAULT_CHECKPOINT_BYTES):
+        if isinstance(checkpoint_bytes, bool) or not isinstance(checkpoint_bytes, int):
+            raise StorageError("checkpoint_bytes must be a positive integer")
+        if checkpoint_bytes <= 0:
+            raise StorageError("checkpoint_bytes must be a positive integer")
+        self.path = Path(path)
+        self.wal = WalManager(self.path)
+        self.checkpoint_bytes = checkpoint_bytes
+        self.db_id: str | None = None
+        self.generation: int = 0
+        self.manifest: dict[str, Any] | None = None
+        self.pending_checkpoint: bool = False
+        self.last_checkpoint_error: Exception | None = None
+
+    def _require_manifest(self) -> dict[str, Any]:
+        if self.manifest is None:  # pragma: no cover - internal invariant
+            raise StorageError("Segmented storage has no loaded manifest")
+        return self.manifest
+
+    def _load_snapshot(self) -> Database:
+        manifest = segments.read_manifest(self.path)
+        self.manifest = manifest
+        self.db_id = manifest["db_id"]
+        self.generation = manifest["generation"]
+        return segments.load_database(self.path, manifest)
+
+    def _initialize(self) -> Database:
+        """Create the durable root manifest for a brand-new database."""
+        db = Database()
+        self.db_id = uuid.uuid4().hex
+        self.generation = 0
+        self._publish(db, checkpoint_lsn=0)
+        return db
+
+    def load(self) -> Database:
+        """Load the manifest generation and replay committed WAL deltas."""
+        if self.path.exists() and self.path.is_dir():
+            raise StorageError(f"Database path '{self.path}' is a directory")
+        self.pending_checkpoint = False
+        self.last_checkpoint_error = None
+
+        if self.path.exists():
+            db = self._load_snapshot()
+        else:
+            parent = self.path.parent if str(self.path.parent) else Path(".")
+            try:
+                parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise StorageError(
+                    f"Failed to create database directory '{parent}': {exc}"
+                ) from exc
+            db = self._initialize()
+
+        wal_path = self.wal.wal_path
+        wal_exists = wal_path.exists() and not wal_path.is_dir()
+        if wal_path.exists() and wal_path.is_dir():
+            raise StorageError(f"WAL path '{wal_path}' is a directory")
+        if not wal_exists or wal_path.stat().st_size == 0:
+            self.wal.last_lsn = db.wal_lsn
+            self._cleanup_stale_tmp_files()
+            return db
+
+        assert self.db_id is not None
+        checkpoint_lsn = self.manifest["checkpoint_lsn"] if self.manifest else 0
+        analysis = parse_wal_v4(wal_path, self.db_id, checkpoint_lsn=checkpoint_lsn)
+        applicable = [txn for txn in analysis.committed if txn.commit_lsn > db.wal_lsn]
+        if not applicable:
+            self.wal.last_lsn = max(db.wal_lsn, analysis.max_lsn)
+            self.wal.truncate()
+            self._cleanup_stale_tmp_files()
+            return db
+
+        if analysis.ignored_trailing:
+            # Repair only the torn tail so the CHECKPOINT appended by recovery
+            # never sits behind a partial record.
+            self.wal.repair_trailing(analysis.valid_bytes_end)
+            _maybe_crash("after_tail_repair")
+        for txn in applicable:
+            apply_changes(db, txn.changes)
+        db.wal_lsn = applicable[-1].commit_lsn
+        self.wal.last_lsn = max(applicable[-1].commit_lsn, analysis.max_lsn)
+        self._checkpoint(db, db.wal_lsn)
+        return db
+
+
+    def _publish(self, db: Database, *, checkpoint_lsn: int) -> dict[str, Any]:
+        """Write segments and atomically publish a new root manifest."""
+        if self.db_id is None:  # pragma: no cover - internal invariant
+            raise StorageError("Segmented storage has no database identity")
+        previous = self.manifest["tables"] if self.manifest else {}
+        tables: dict[str, dict[str, Any]] = {}
+        for name, table in db.tables.items():
+            prior = previous.get(name)
+            generation = int(prior["generation"]) + 1 if prior else 1
+            ref = segments.write_segment(self.path, table, generation=generation)
+            if prior is not None and prior["sha256"] == ref["sha256"]:
+                ref = dict(prior)
+            tables[name] = ref
+        indexes = {
+            name: {"table": index.table, "column": index.column}
+            for name, index in db.indexes.items()
+        }
+        manifest = segments.build_manifest(
+            engine_version=ENGINE_VERSION,
+            db_id=self.db_id,
+            generation=self.generation + 1,
+            checkpoint_lsn=checkpoint_lsn,
+            tables=tables,
+            indexes=indexes,
+        )
+        segments.publish_manifest(self.path, manifest)
+        self.manifest = manifest
+        self.generation += 1
+        return manifest
+
+    def _checkpoint(self, db: Database, commit_lsn: int) -> None:
+        """Publish a manifest generation, then advance the WAL and collect garbage."""
+        if self.path.exists() and self.path.is_dir():
+            raise StorageError(f"Database path '{self.path}' is a directory")
+        db.wal_lsn = commit_lsn
+        try:
+            self._publish(db, checkpoint_lsn=commit_lsn)
+        except StorageError as exc:
+            self.pending_checkpoint = True
+            self.last_checkpoint_error = exc
+            raise
+        try:
+            wal_path = self.wal.wal_path
+            if (
+                wal_path.exists()
+                and not wal_path.is_dir()
+                and wal_path.stat().st_size > 0
+            ):
+                self.wal.append_checkpoint_v4(commit_lsn, db_id=self.db_id or "")
+                self.wal.truncate()
+        except (OSError, StorageError) as exc:
+            self.pending_checkpoint = True
+            self.last_checkpoint_error = exc
+            raise
+        self.pending_checkpoint = False
+        self.last_checkpoint_error = None
+        if self.manifest is not None:
+            segments.collect_garbage(self.path, self.manifest)
+        self._cleanup_stale_tmp_files()
+
+    def save(self, db: Database, changes: list[dict[str, Any]] | None = None) -> None:
+        """Append a delta transaction, then checkpoint when the WAL gets large."""
+        if self.path.exists() and self.path.is_dir():
+            raise StorageError(f"Database path '{self.path}' is a directory")
+        if not changes:
+            return
+        if self.db_id is None:  # pragma: no cover - internal invariant
+            raise StorageError("Segmented storage has no database identity")
+        commit_lsn, _txn_id = self.wal.append_delta_transaction(
+            list(changes), db_id=self.db_id
+        )
+        db.wal_lsn = commit_lsn
+        try:
+            wal_path = self.wal.wal_path
+            if wal_path.stat().st_size >= self.checkpoint_bytes:
+                self._checkpoint(db, commit_lsn)
+        except (OSError, StorageError) as exc:
+            # The commit is already durable in the WAL. Keep the WAL intact and
+            # report a pending checkpoint, never a rollback.
+            self.pending_checkpoint = True
+            self.last_checkpoint_error = exc
+
+    def checkpoint(self, db: Database) -> None:
+        """Explicit checkpoint of the current in-memory state."""
+        self._checkpoint(db, db.wal_lsn)
+
+    def cleanup_if_clean(self, db: Database | None = None) -> None:
+        """Checkpoint pending WAL, then remove an empty WAL on clean close."""
+        wal_path = self.wal.wal_path
+        try:
+            has_pending = (
+                wal_path.exists()
+                and not wal_path.is_dir()
+                and wal_path.stat().st_size > 0
+            )
+        except OSError:
+            has_pending = False
+        if db is not None and has_pending and not self.pending_checkpoint:
+            try:
+                self._checkpoint(db, db.wal_lsn)
+            except (OSError, StorageError) as exc:
+                self.pending_checkpoint = True
+                self.last_checkpoint_error = exc
+        if not self.pending_checkpoint:
+            self.wal.remove_if_empty()
+
+    def _cleanup_stale_tmp_files(self) -> None:
+        parent = self.path.parent if str(self.path.parent) else Path(".")
+        prefix = f".{self.path.name}."
+        try:
+            for candidate in parent.iterdir():
+                if (
+                    candidate.is_file()
+                    and candidate.name.startswith(prefix)
+                    and candidate.name.endswith(".tmp")
+                ):
+                    try:
+                        candidate.unlink()
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+
+
+def peek_format_version(path: str | Path) -> int | None:
+    """Return the on-disk format version, or ``None`` when no file exists."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    if p.is_dir():
+        raise StorageError(f"Database path '{p}' is a directory")
+    try:
+        raw_text = p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise StorageError(f"Failed to read database file '{p}': {exc}") from exc
+    if not raw_text.strip():
+        raise StorageError(f"Corrupted database file '{p}': file is empty")
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise StorageError(
+            f"Corrupted database file '{p}': invalid JSON ({exc})"
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("format") != FORMAT_NAME:
+        raise StorageError(f"Unsupported database format in '{p}'")
+    version = payload.get("format_version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise StorageError(f"Invalid or missing 'format_version' in '{p}'")
+    return version
+
+
+def open_storage(
+    path: str | Path, *, checkpoint_bytes: int = DEFAULT_CHECKPOINT_BYTES
+) -> JsonFileStorage | SegmentedStorage:
+    """Open the right backend for the on-disk format at ``path``.
+
+    A missing file becomes a new format-v4 database. Existing version 1-3 files
+    keep using the version 3 backend; they are only converted by an explicit
+    :func:`migrate_to_v4` call, never silently on open.
+    """
+    version = peek_format_version(path)
+    if version is None:
+        return SegmentedStorage(path, checkpoint_bytes=checkpoint_bytes)
+    if version == SEGMENTED_FORMAT_VERSION:
+        return SegmentedStorage(path, checkpoint_bytes=checkpoint_bytes)
+    if version in READABLE_FORMAT_VERSIONS:
+        return JsonFileStorage(path)
+    raise StorageError(
+        f"Unsupported database format version: {version} (this build reads "
+        f"versions {', '.join(str(v) for v in READABLE_FORMAT_VERSIONS)} and "
+        f"{SEGMENTED_FORMAT_VERSION})"
+    )
+
+
+def _copy_file_durable(source: Path, target: Path) -> None:
+    """Copy ``source`` to ``target`` and fsync both the file and its directory."""
+    data = source.read_bytes()
+    parent = target.parent if str(target.parent) else Path(".")
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=str(parent),
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+        tmp_path = None
+        fsync_dir(parent)
+    except OSError as exc:
+        raise StorageError(f"Failed to write '{target}': {exc}") from exc
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def migrate_to_v4(db_path: str | Path, *, lease: Any | None = None) -> dict[str, Any]:
+    """Convert a format version 1-3 database file to format v4.
+
+    Runs under the canonical :class:`DatabaseLease` (acquired here unless the
+    caller already holds one). The original snapshot is kept as
+    ``<db>.v3.bak`` until the new generation has been published and verified by a
+    fresh open; it is restored if verification fails. Calling this on a v4
+    database only finishes or cleans up an interrupted migration.
+    """
+    from .locking import DatabaseLease
+
+    p = Path(db_path)
+    if not p.exists():
+        raise StorageError(f"Database file '{p}' does not exist")
+    own_lease = False
+    active = lease
+    if active is None:
+        active = DatabaseLease.for_database(db_path)
+        active.acquire()
+        own_lease = True
+    try:
+        if not isinstance(active, DatabaseLease):
+            raise StorageError("migration lease must be a DatabaseLease")
+        if not own_lease:
+            active.validate_borrow(db_path)
+        canonical = active.db_path if active.db_path is not None else p
+        version = peek_format_version(canonical)
+        if version == SEGMENTED_FORMAT_VERSION:
+            SegmentedStorage(canonical).load()
+            _remove_migration_backup(canonical)
+            return {
+                "status": "ok",
+                "message": "Database is already format v4",
+                "migrated": False,
+            }
+        if version not in READABLE_FORMAT_VERSIONS:
+            raise StorageError(
+                f"Unsupported database format version: {version}"
+            )
+        v3 = JsonFileStorage(canonical)
+        db = v3.load()
+        v3.cleanup_if_clean()
+        backup = Path(f"{canonical}.v3.bak")
+        _copy_file_durable(canonical, backup)
+        _maybe_crash("after_migration_backup")
+        storage = SegmentedStorage(canonical)
+        storage.db_id = uuid.uuid4().hex
+        storage.generation = 0
+        storage._publish(db, checkpoint_lsn=db.wal_lsn)
+        _maybe_crash("after_migration_manifest")
+        try:
+            verified = SegmentedStorage(canonical).load()
+            _verify_migration(db, verified)
+        except (StorageError, OSError, ValueError):
+            _copy_file_durable(backup, canonical)
+            raise
+        _remove_migration_backup(canonical)
+        return {
+            "status": "ok",
+            "message": (
+                f"Migrated '{canonical}' to format v4 "
+                f"({len(db.tables)} tables, {len(db.indexes)} indexes)"
+            ),
+            "migrated": True,
+        }
+    finally:
+        if own_lease:
+            active.release()
+
+
+def _verify_migration(before: Database, after: Database) -> None:
+    """Fail a migration when the reopened v4 database does not match the v3 one."""
+    if set(before.tables) != set(after.tables):
+        raise StorageError("Migration verification failed: table set differs")
+    for name, table in before.tables.items():
+        migrated = after.tables[name]
+        if table.column_names != migrated.column_names:
+            raise StorageError(
+                f"Migration verification failed: columns differ for table '{name}'"
+            )
+        if len(table.rows) != len(migrated.rows):
+            raise StorageError(
+                f"Migration verification failed: row count differs for table '{name}'"
+            )
+        if table.rows != migrated.rows:
+            raise StorageError(
+                f"Migration verification failed: rows differ for table '{name}'"
+            )
+    if set(before.indexes) != set(after.indexes):
+        raise StorageError("Migration verification failed: index catalog differs")
+
+
+def _remove_migration_backup(canonical: Path) -> None:
+    backup = Path(f"{canonical}.v3.bak")
+    if not backup.exists():
+        return
+    try:
+        backup.unlink()
+        fsync_dir(backup.parent if str(backup.parent) else Path("."))
+    except OSError:
+        pass
 
