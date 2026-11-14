@@ -31,11 +31,15 @@ from .ast import (
     Between,
     BinaryExpr,
     Case,
+    FunctionCall,
     Identifier,
     InList,
+    IsJsonNull,
+    IsMissing,
     IsNull,
     Like,
     Literal,
+    PathAccess,
     Select,
     UnaryExpr,
 )
@@ -44,6 +48,7 @@ from .expressions import (
     SourceBinding,
     contains_aggregate,
     resolve_identifier,
+    resolve_path_access,
     walk_expr,
 )
 from .statistics import TableStats
@@ -249,7 +254,7 @@ def _expr_precedence(expr: Any) -> int:
         return _ARITHMETIC_PRECEDENCE.get(op, _COMPARISON_PRECEDENCE)
     if isinstance(expr, UnaryExpr):
         return _UNARY_ARITHMETIC_PRECEDENCE if expr.op.upper() in {"+", "-"} else _NOT_PRECEDENCE
-    if isinstance(expr, (IsNull, Like, InList, Between)):
+    if isinstance(expr, (IsNull, IsMissing, IsJsonNull, Like, InList, Between)):
         return _COMPARISON_PRECEDENCE
     return _PRIMARY_PRECEDENCE
 
@@ -264,6 +269,11 @@ def format_expr(expr: Any) -> str:
         return _render_literal(expr.value)
     if isinstance(expr, Identifier):
         return expr.label
+    if isinstance(expr, PathAccess):
+        return expr.label
+    if isinstance(expr, FunctionCall):
+        args = ", ".join(format_expr(a) for a in expr.args)
+        return f"{expr.func}({args})"
     if isinstance(expr, AggregateCall):
         if isinstance(expr.arg, Identifier) and expr.arg.name == "*":
             return f"{expr.func}(*)"
@@ -285,6 +295,12 @@ def format_expr(expr: Any) -> str:
     if isinstance(expr, IsNull):
         inner = _wrap(format_expr(expr.expr), _expr_precedence(expr.expr), _COMPARISON_PRECEDENCE)
         return f"{inner} IS {'NOT ' if expr.negated else ''}NULL"
+    if isinstance(expr, IsMissing):
+        inner = _wrap(format_expr(expr.expr), _expr_precedence(expr.expr), _COMPARISON_PRECEDENCE)
+        return f"{inner} IS {'NOT ' if expr.negated else ''}MISSING"
+    if isinstance(expr, IsJsonNull):
+        inner = _wrap(format_expr(expr.expr), _expr_precedence(expr.expr), _COMPARISON_PRECEDENCE)
+        return f"{inner} IS {'NOT ' if expr.negated else ''}JSON NULL"
     if isinstance(expr, Like):
         inner = _wrap(format_expr(expr.expr), _expr_precedence(expr.expr), _COMPARISON_PRECEDENCE)
         pattern = _wrap(format_expr(expr.pattern), _expr_precedence(expr.pattern), _COMPARISON_PRECEDENCE)
@@ -321,11 +337,22 @@ def _expr_sources(expr: Any, sources: list[SourceBinding]) -> set[str]:
     """
     refs: set[str] = set()
     for node in walk_expr(expr):
+        if isinstance(node, PathAccess):
+            try:
+                ref, _, _ = resolve_path_access(node, sources)
+                refs.add(ref)
+            except ExecutionError:
+                pass
+            continue
         if not isinstance(node, Identifier) or node.name == "*":
             continue
         try:
             ref, _ = resolve_identifier(node, sources)
         except ExecutionError:
+            if node.qualifier is not None:
+                col_matches = [s.ref for s in sources if node.qualifier in s.column_map]
+                if len(col_matches) == 1:
+                    refs.add(col_matches[0])
             continue
         refs.add(ref)
     return refs

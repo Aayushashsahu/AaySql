@@ -352,3 +352,12 @@ point for the whole batch.
 Group commit changes durability throughput, not the visibility rule: the MVCC
 store publishes all batch roots only after `save_batch()` returns. See
 [`MVCC.md`](MVCC.md).
+
+## 14. JSON Values & Sentinel Discipline in Delta WAL
+
+Delta WAL mutation records (`insert`, `update`) store row images. To guarantee durability and crash recovery without schema confusion or format version bumps:
+- **Canonical Serialization**: JSON values are canonicalized to UTF-8 text prior to WAL append (`_serialize_delta_row`). `JSON_NULL` is converted to canonical `"null"`, strings to `"\"str\""`, and scalar JSON values to their canonical representations.
+- **Relational SQL NULL**: Preserved as `None` (standard JSON `null` in the record).
+- **Sentinel Discipline**: The internal `ABSENT` query sentinel is strictly prohibited at persistence boundaries and is rejected with `ConstraintError` if present in any row being recorded.
+- **Recovery Replay**: During WAL replay, `coerce_value()` reconstructs rows according to the target table column definitions, accurately reinstating `JSON_NULL` from `"null"` while preserving relational SQL NULLs and validating document constraints.
+

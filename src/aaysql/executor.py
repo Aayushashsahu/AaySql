@@ -2,6 +2,7 @@ import time
 
 from .ast import *
 from .errors import ConstraintError, ExecutionError
+from .json_value import deep_copy_json, set_path
 from .planner import ESTIMATE_NOTE, format_metrics, format_plan, plan_select
 from .query import (
     SourceBinding,
@@ -10,7 +11,7 @@ from .query import (
     is_sql_true,
     validate_expr_columns,
 )
-from .storage import Database, coerce_value
+from .storage import Database, coerce_value, serialize_row_for_storage
 from .undo import (
     CreateIndexUndo,
     CreateTableUndo,
@@ -45,6 +46,8 @@ class Executor:
     def execute(self, stmt):
         if isinstance(stmt, CreateTable):
             return self.create_table(stmt)
+        if isinstance(stmt, CreateCollection):
+            return self.create_collection(stmt)
         if isinstance(stmt, DropTable):
             return self.drop_table(stmt)
         if isinstance(stmt, Insert):
@@ -62,6 +65,12 @@ class Executor:
         if isinstance(stmt, Explain):
             return self.explain(stmt)
         raise ExecutionError(f"Unsupported statement: {type(stmt).__name__}")
+
+    def create_collection(self, s):
+        self.db.create_collection(s.name)
+        self._record_undo(CreateTableUndo(s.name))
+        self._record_ddl("record_create_table", self.db.tables[s.name])
+        return {"status": "ok", "message": f"Collection '{s.name}' created"}
 
     def create_table(self, s):
         self.db.create_table(s.name, s.columns)
@@ -164,7 +173,8 @@ class Executor:
         for index in self.db.indexes_on(table.name):
             for row in new_rows:
                 index.add(row)
-        self._record_ddl("record_insert", table.name, new_rows)
+        serialized_rows = [serialize_row_for_storage(table.columns, r) for r in new_rows]
+        self._record_ddl("record_insert", table.name, serialized_rows)
         return {"status": "ok", "rows_affected": len(new_rows)}
 
     def _value(self, expr, row, table=None):
@@ -198,14 +208,24 @@ class Executor:
         sources = [SourceBinding.from_table(table.name, table)]
         targets = self._filtered(table, s.where)
         staged = []
-        for col, expr in s.assignments:
+        for item in s.assignments:
+            col = item[0]
+            expr = item[1]
             table.ensure_column(col)
             validate_expr_columns(expr, sources, allow_aggregates=False, context_name="UPDATE assignment")
         for old in targets:
-            new = old.copy()
-            for col, expr in s.assignments:
+            new = deep_copy_json(old)
+            for item in s.assignments:
+                col = item[0]
+                expr = item[1]
+                path = item[2] if len(item) == 3 else ()
                 col_def = next(c for c in table.columns if c.name == col)
-                new[col] = self._coerce(eval_row_expr(expr, {table.name: old}, sources), col_def)
+                if path:
+                    old_doc = new[col]
+                    val = eval_row_expr(expr, {table.name: old}, sources)
+                    new[col] = self._coerce(set_path(old_doc, path, val), col_def)
+                else:
+                    new[col] = self._coerce(eval_row_expr(expr, {table.name: old}, sources), col_def)
             staged.append((old, new))
         target_map = {id(old): new for old, new in staged}
         post_rows = [target_map.get(id(row), row) for row in table.rows]
@@ -218,7 +238,7 @@ class Executor:
         ]
         for old, _new in staged:
             self._record_undo(
-                UpdateUndo(table.name, positions[id(old)], dict(old))
+                UpdateUndo(table.name, positions[id(old)], deep_copy_json(old))
             )
         for old, new in staged:
             old.update(new)
@@ -227,7 +247,10 @@ class Executor:
             if self.recorder is not None:
                 for old, _ in staged:
                     self._record_ddl(
-                        "record_update", table.name, positions[id(old)], old
+                        "record_update",
+                        table.name,
+                        positions[id(old)],
+                        serialize_row_for_storage(table.columns, old),
                     )
         for (old, _), previous in zip(staged, previous_keys):
             for index in indexes:

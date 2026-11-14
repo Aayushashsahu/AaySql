@@ -35,14 +35,27 @@ from .ast import (
     BinaryExpr,
     Case,
     ColumnDef,
+    FunctionCall,
     Identifier,
     InList,
+    IsJsonNull,
+    IsMissing,
     IsNull,
     Like,
     Literal,
+    PathAccess,
     UnaryExpr,
 )
 from .errors import ExecutionError
+from .json_value import (
+    ABSENT,
+    JSON_NULL,
+    extract_path,
+    json_structural_equal,
+    parse_json_path,
+    remove_path,
+    set_path,
+)
 from .storage import Table
 
 NUMERIC_TYPES = frozenset({"INT", "INTEGER", "FLOAT", "DOUBLE"})
@@ -63,6 +76,10 @@ EXPRESSION_TYPES = (
     UnaryExpr,
     BinaryExpr,
     IsNull,
+    IsMissing,
+    IsJsonNull,
+    PathAccess,
+    FunctionCall,
     Like,
     InList,
     Between,
@@ -94,7 +111,7 @@ class SourceBinding:
 
 def to_logic(value: Any) -> bool | None:
     """Normalize a runtime value to a SQL logical state (``None`` means UNKNOWN)."""
-    if value is None:
+    if value is None or value is ABSENT or value is JSON_NULL:
         return None
     return bool(value)
 
@@ -126,10 +143,10 @@ def sql_or(left: Any, right: Any) -> bool | None:
 
 def is_sql_true(value: Any) -> bool:
     """Row filters (WHERE, JOIN ON, HAVING) admit a row only when the result is TRUE."""
-    return value is not None and bool(value)
+    return value is not None and value is not ABSENT and value is not JSON_NULL and bool(value)
 
 
-_TYPE_LABELS = {bool: "BOOL", int: "INT", float: "FLOAT", str: "TEXT"}
+_TYPE_LABELS = {bool: "BOOL", int: "INT", float: "FLOAT", str: "TEXT", dict: "JSON", list: "JSON"}
 
 
 def _type_label(value: Any) -> str:
@@ -137,16 +154,11 @@ def _type_label(value: Any) -> str:
 
 
 def _reject_boolean_comparison(op: str, left: Any, right: Any) -> None:
-    """A BOOL value never compares equal to a number in SQL.
-
-    Python's ``True == 1`` is true, which would silently make ``WHERE flag = 1``
-    match every true row. SQL treats BOOL as its own type, so a mixed BOOL/non-BOOL
-    comparison is rejected rather than coerced.
-    """
+    """A BOOL value never compares equal to a number in SQL."""
     if isinstance(left, bool) == isinstance(right, bool):
         return
     other = right if isinstance(left, bool) else left
-    if other is None:
+    if other is None or other is ABSENT or other is JSON_NULL:
         return
     raise ExecutionError(
         f"Cannot compare BOOL with {_type_label(other)} using operator '{op}'; "
@@ -155,20 +167,19 @@ def _reject_boolean_comparison(op: str, left: Any, right: Any) -> None:
 
 
 def compare_values(op: str, left: Any, right: Any) -> bool | None:
-    """Compare two runtime values using SQL comparison semantics.
-
-    Returns ``None`` (UNKNOWN) when either operand is NULL, because a NULL
-    comparison is neither TRUE nor FALSE in SQL. BOOL operands only compare with
-    other BOOL operands; numbers compare numerically across INT/FLOAT; a TEXT and
-    a numeric operand are unrelated and compare unequal (never an unevaluated
-    exception).
-    """
+    """Compare two runtime values using SQL comparison semantics."""
     normalized = op.upper()
     if normalized not in COMPARISON_OPS:
         raise ExecutionError(f"Unsupported operator '{op}'")
-    if left is None or right is None:
+    if left is None or right is None or left is ABSENT or right is ABSENT or left is JSON_NULL or right is JSON_NULL:
         return None
     _reject_boolean_comparison(normalized, left, right)
+    if isinstance(left, (dict, list)) or isinstance(right, (dict, list)):
+        if normalized == "=":
+            return json_structural_equal(left, right)
+        if normalized in {"!=", "<>"}:
+            return not json_structural_equal(left, right)
+        raise ExecutionError(f"Cannot compare document values with relational operator '{op}'")
     if normalized == "=":
         return left == right
     if normalized in {"!=", "<>"}:
@@ -211,6 +222,37 @@ def resolve_identifier(ident: Identifier, sources: list[SourceBinding]) -> tuple
     return matches[0]
 
 
+def resolve_path_access(
+    node: PathAccess, sources: list[SourceBinding]
+) -> tuple[str, ColumnDef, tuple[str | int, ...]]:
+    """Resolve a PathAccess against sources, disambiguating table qualifier vs column name.
+
+    Returns (source_ref, column_def, remaining_json_path).
+    """
+    if isinstance(node.expr, Identifier):
+        ident = node.expr
+        segments = node.path
+        if ident.qualifier is not None:
+            source_ref, col_def = resolve_identifier(ident, sources)
+            return source_ref, col_def, segments
+
+        matching_source = next((s for s in sources if s.ref == ident.name), None)
+        if matching_source is not None and segments and isinstance(segments[0], str):
+            col_name = segments[0]
+            col_def = matching_source.column_map.get(col_name)
+            if col_def is not None:
+                return matching_source.ref, col_def, segments[1:]
+
+        source_ref, col_def = resolve_identifier(ident, sources)
+        return source_ref, col_def, segments
+
+    if isinstance(node.expr, PathAccess):
+        ref, col_def, inner_path = resolve_path_access(node.expr, sources)
+        return ref, col_def, inner_path + node.path
+
+    raise ExecutionError(f"Cannot resolve path access on {type(node.expr).__name__}")
+
+
 # --- shared AST traversal -------------------------------------------------
 
 
@@ -226,8 +268,13 @@ def iter_expr_children(expr: Any) -> Iterator[Any]:
         yield expr.expr
     elif isinstance(expr, AggregateCall):
         yield expr.arg
-    elif isinstance(expr, IsNull):
+    elif isinstance(expr, (IsNull, IsMissing, IsJsonNull)):
         yield expr.expr
+    elif isinstance(expr, PathAccess):
+        if not isinstance(expr.expr, Identifier):
+            yield expr.expr
+    elif isinstance(expr, FunctionCall):
+        yield from expr.args
     elif isinstance(expr, Like):
         yield expr.expr
         yield expr.pattern
@@ -299,7 +346,14 @@ def eval_arithmetic(op: str, left: Any, right: Any) -> Any:
     ``FLOAT`` operand) produces a float. Division and modulo by zero, non-numeric
     or BOOL operands, and non-finite results raise :class:`ExecutionError`.
     """
-    if left is None or right is None:
+    if (
+        left is None
+        or right is None
+        or left is ABSENT
+        or right is ABSENT
+        or left is JSON_NULL
+        or right is JSON_NULL
+    ):
         return None
     _require_numeric(left, op)
     _require_numeric(right, op)
@@ -324,7 +378,7 @@ def eval_arithmetic(op: str, left: Any, right: Any) -> Any:
 
 def eval_unary_arithmetic(op: str, value: Any) -> Any:
     """Evaluate unary ``+`` / ``-`` with NULL propagation."""
-    if value is None:
+    if value is None or value is ABSENT or value is JSON_NULL:
         return None
     _require_numeric(value, op)
     return _require_finite(-value if op == "-" else +value, op)
@@ -415,6 +469,27 @@ def eval_expr(
     if isinstance(expr, Identifier):
         if row_ctx is None:
             return None
+        if expr.qualifier is not None:
+            source = next((s for s in sources if s.ref == expr.qualifier), None)
+            if source is None:
+                col_matches = [
+                    (s.ref, s.column_map[expr.qualifier])
+                    for s in sources
+                    if expr.qualifier in s.column_map
+                ]
+                if len(col_matches) == 1:
+                    source_ref, col_def = col_matches[0]
+                    base_val = row_ctx[source_ref][col_def.name]
+                    if base_val is None or base_val is ABSENT or base_val is JSON_NULL:
+                        return ABSENT
+                    return extract_path(base_val, (expr.name,))
+                if len(col_matches) > 1:
+                    raise ExecutionError(f"Ambiguous column reference '{expr.qualifier}'")
+                raise ExecutionError(f"Unknown table or alias '{expr.qualifier}'")
+            col_def = source.column_map.get(expr.name)
+            if col_def is None:
+                raise ExecutionError(f"Unknown column '{expr.label}'")
+            return row_ctx[source.ref][col_def.name]
         ref, col_def = resolve_identifier(expr, sources)
         return row_ctx[ref][col_def.name]
     if isinstance(expr, UnaryExpr):
@@ -437,7 +512,74 @@ def eval_expr(
         return compare_values(op, left, right)
     if isinstance(expr, IsNull):
         value = eval_expr(expr.expr, row_ctx, sources, aggregate_eval)
-        return (value is not None) if expr.negated else (value is None)
+        is_null = (value is None or value is JSON_NULL or value is ABSENT)
+        return not is_null if expr.negated else is_null
+    if isinstance(expr, IsMissing):
+        value = eval_expr(expr.expr, row_ctx, sources, aggregate_eval)
+        is_missing = (value is ABSENT)
+        return not is_missing if expr.negated else is_missing
+    if isinstance(expr, IsJsonNull):
+        value = eval_expr(expr.expr, row_ctx, sources, aggregate_eval)
+        is_jnull = (value is JSON_NULL)
+        return not is_jnull if expr.negated else is_jnull
+    if isinstance(expr, PathAccess):
+        if row_ctx is None:
+            return None
+        ref, col_def, path = resolve_path_access(expr, sources)
+        base_val = row_ctx[ref][col_def.name]
+        if not path:
+            return base_val
+        return extract_path(base_val, path)
+    if isinstance(expr, FunctionCall):
+        func = expr.func.upper()
+        args = [eval_expr(a, row_ctx, sources, aggregate_eval) for a in expr.args]
+        if func == "JSON_EXTRACT":
+            if len(args) != 2:
+                raise ExecutionError("JSON_EXTRACT() requires exactly 2 arguments (doc, path)")
+            doc, path = args[0], args[1]
+            if doc is None or doc is ABSENT:
+                return None
+            if path is None or path is ABSENT:
+                return None
+            res = extract_path(doc, parse_json_path(path))
+            return None if res is ABSENT else res
+        if func == "JSON_VALUE":
+            if len(args) != 2:
+                raise ExecutionError("JSON_VALUE() requires exactly 2 arguments (doc, path)")
+            doc, path = args[0], args[1]
+            if doc is None or doc is ABSENT:
+                return None
+            if path is None or path is ABSENT:
+                return None
+            res = extract_path(doc, parse_json_path(path))
+            if res is ABSENT or res is JSON_NULL or isinstance(res, (dict, list)):
+                return None
+            return res
+        if func == "JSON_EXISTS":
+            if len(args) != 2:
+                raise ExecutionError("JSON_EXISTS() requires exactly 2 arguments (doc, path)")
+            doc, path = args[0], args[1]
+            if doc is None or doc is ABSENT:
+                return False
+            if path is None or path is ABSENT:
+                return False
+            res = extract_path(doc, parse_json_path(path))
+            return res is not ABSENT
+        if func == "JSON_SET":
+            if len(args) != 3:
+                raise ExecutionError("JSON_SET() requires exactly 3 arguments (doc, path, val)")
+            doc, path, val = args[0], args[1], args[2]
+            if doc is None or doc is ABSENT:
+                return None
+            return set_path(doc, parse_json_path(path), val)
+        if func == "JSON_REMOVE":
+            if len(args) != 2:
+                raise ExecutionError("JSON_REMOVE() requires exactly 2 arguments (doc, path)")
+            doc, path = args[0], args[1]
+            if doc is None or doc is ABSENT:
+                return None
+            return remove_path(doc, parse_json_path(path))
+        raise ExecutionError(f"Unsupported function '{expr.func}'")
     if isinstance(expr, Like):
         value = eval_expr(expr.expr, row_ctx, sources, aggregate_eval)
         pattern = eval_expr(expr.pattern, row_ctx, sources, aggregate_eval)

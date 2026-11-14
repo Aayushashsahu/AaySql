@@ -132,11 +132,14 @@ def _column_payload(column: Any) -> dict[str, Any]:
 
 def encode_segment(table: Table) -> dict[str, Any]:
     """Build the logical payload for one table (rows stored positionally)."""
+    from .storage import serialize_row_for_storage
+
     column_names = [column.name for column in table.columns]
     rows: list[list[Any]] = []
     for row in table.rows:
         try:
-            rows.append([row[name] for name in column_names])
+            serialized_row = serialize_row_for_storage(table.columns, row)
+            rows.append([serialized_row[name] for name in column_names])
         except KeyError as exc:  # pragma: no cover - defensive
             raise StorageError(
                 f"Row in table '{table.name}' is missing column {exc.args[0]!r}"

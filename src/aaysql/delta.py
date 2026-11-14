@@ -22,7 +22,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
-from .errors import ExecutionError, StorageError
+from .errors import ConstraintError, ExecutionError, StorageError
+from .json_value import ABSENT, JSON_NULL, canonical_json_text
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .storage import ColumnDef, Database, Table
@@ -48,6 +49,20 @@ CHANGE_KEYS: dict[str, frozenset[str]] = {
     "drop_index": frozenset({"t", "index"}),
 }
 _SCALAR_TYPES = (str, int, float, bool, type(None))
+
+
+def _serialize_delta_row(row: dict[str, Any]) -> dict[str, Any]:
+    serialized: dict[str, Any] = {}
+    for k, v in row.items():
+        if v is ABSENT:
+            raise StorageError(f"ABSENT sentinel cannot be persisted for column '{k}'")
+        if v is JSON_NULL:
+            serialized[k] = "null"
+        elif isinstance(v, (dict, list)):
+            serialized[k] = canonical_json_text(v)
+        else:
+            serialized[k] = v
+    return serialized
 
 
 class MutationRecorder:
@@ -100,7 +115,7 @@ class MutationRecorder:
     def record_insert(self, table_name: str, rows: Iterable[dict[str, Any]]) -> None:
         if not self._recording:
             return
-        copied = [dict(row) for row in rows]
+        copied = [_serialize_delta_row(row) for row in rows]
         if copied:
             self._changes.append({"t": "insert", "table": table_name, "rows": copied})
 
@@ -110,7 +125,12 @@ class MutationRecorder:
         if not self._recording:
             return
         self._changes.append(
-            {"t": "update", "table": table_name, "index": index, "row": dict(row)}
+            {
+                "t": "update",
+                "table": table_name,
+                "index": index,
+                "row": _serialize_delta_row(row),
+            }
         )
 
     def record_delete(self, table_name: str, indices: Iterable[int]) -> None:
@@ -182,10 +202,15 @@ def _is_index(value: Any) -> bool:
     return not isinstance(value, bool) and isinstance(value, int) and value >= 0
 
 
+def _is_valid_row_val(value: Any) -> bool:
+    if isinstance(value, _SCALAR_TYPES) and not isinstance(value, bytes):
+        return True
+    return bool(isinstance(value, (dict, list)))
+
+
 def _is_scalar_row(payload: Any) -> bool:
     return isinstance(payload, dict) and all(
-        isinstance(value, _SCALAR_TYPES) and not isinstance(value, bytes)
-        for value in payload.values()
+        _is_valid_row_val(value) for value in payload.values()
     )
 
 
@@ -267,7 +292,7 @@ def _materialize_row(
     for column in table.columns:
         try:
             row[column.name] = coerce_value(payload[column.name], column)
-        except (ExecutionError, StorageError) as exc:
+        except (ExecutionError, StorageError, ConstraintError) as exc:
             raise StorageError(
                 f"Invalid value for '{column.name}' in {context}: {exc}"
             ) from exc

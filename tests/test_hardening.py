@@ -101,7 +101,7 @@ def test_create_table_all_supported_types_and_defaults(tmp_path: Path, type_sql:
         assert type(row["val"]) is type(expected_val)
 
 
-@pytest.mark.parametrize("bad_type", ["UNKNOWN_TYPE", "DATE", "BLOB", "CHAR", "JSON"])
+@pytest.mark.parametrize("bad_type", ["UNKNOWN_TYPE", "DATE", "BLOB", "CHAR", "XML"])
 def test_create_table_rejects_unsupported_types(bad_type: str):
     e = Engine()
     with pytest.raises(ParserError, match="Unsupported data type"):

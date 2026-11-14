@@ -56,8 +56,11 @@ class _DistinctCounter:
         self._exact_mode = True
 
     def add(self, value: Any) -> None:
-        if self._exact_mode:
+        if isinstance(value, (dict, list)):
+            key = (type(value).__name__, repr(value))
+        else:
             key = (type(value).__name__, value)
+        if self._exact_mode:
             if key in self._exact:
                 return
             self._exact.add(key)
@@ -66,7 +69,7 @@ class _DistinctCounter:
                 self._switch_to_bitmap()
             return
         assert self._bits is not None
-        index = _bit_index(value)
+        index = _bit_index(key[1])
         self._bits[index >> 3] |= 1 << (index & 7)
 
     def _switch_to_bitmap(self) -> None:

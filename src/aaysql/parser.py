@@ -22,6 +22,7 @@ _CLAUSE_KEYWORDS = {
 }
 _COMPARISON_OPS = {TokenType.EQ, TokenType.NE, TokenType.LT, TokenType.LE, TokenType.GT, TokenType.GE}
 _PREDICATE_KEYWORDS = {"IN", "BETWEEN", "LIKE"}
+_JSON_FUNCTIONS = {"JSON_EXTRACT", "JSON_VALUE", "JSON_EXISTS", "JSON_SET", "JSON_REMOVE"}
 
 
 class Parser:
@@ -134,6 +135,10 @@ class Parser:
         self.expect_kw("CREATE")
         if self.keyword("INDEX"):
             return self.parse_create_index()
+        if self.keyword("COLLECTION"):
+            self.advance()
+            name = self.ident()
+            return CreateCollection(name=name)
         self.expect_kw("TABLE")
         name = self.ident()
         self.expect(TokenType.LPAREN)
@@ -362,9 +367,18 @@ class Parser:
         return Update(table, assignments, where)
 
     def parse_assignment(self):
-        col = self.ident()
+        col_expr = self.parse_path_or_ident()
         self.expect(TokenType.EQ, "=")
-        return col, self.parse_assignment_value()
+        val = self.parse_assignment_value()
+        if isinstance(col_expr, Identifier):
+            if col_expr.qualifier is not None:
+                return col_expr.qualifier, val, (col_expr.name,)
+            return col_expr.name, val, ()
+        if isinstance(col_expr, PathAccess):
+            if isinstance(col_expr.expr, Identifier) and col_expr.expr.qualifier is None:
+                return col_expr.expr.name, val, col_expr.path
+            raise ParserError(f"Invalid target in UPDATE SET: '{col_expr.label}'")
+        raise ParserError(f"Invalid assignment target at position {self.current().position}")
 
     def parse_assignment_value(self):
         tok = self.current()
@@ -440,14 +454,21 @@ class Parser:
             if self.keyword("NOT"):
                 self.advance()
                 negated = True
-            if not self.keyword("NULL"):
-                got = self.current().value if self.current().value is not None else self.current().type.name
-                raise ParserError(
-                    f"Expected NULL after IS at position {pos}, got {got!r}; "
-                    f"only IS NULL and IS NOT NULL are supported"
-                )
-            self.advance()
-            return IsNull(left, negated)
+            if self.keyword("NULL"):
+                self.advance()
+                return IsNull(left, negated)
+            if self.keyword("MISSING"):
+                self.advance()
+                return IsMissing(left, negated)
+            if self.keyword("JSON"):
+                self.advance()
+                self.expect_kw("NULL")
+                return IsJsonNull(left, negated)
+            got = self.current().value if self.current().value is not None else self.current().type.name
+            raise ParserError(
+                f"Expected NULL, MISSING, or JSON NULL after IS at position {pos}, got {got!r}; "
+                f"only IS NULL and IS NOT NULL (or IS MISSING / IS JSON NULL) are supported"
+            )
 
         negated = False
         if self.keyword("NOT") and self._next_is_predicate():
@@ -555,19 +576,24 @@ class Parser:
 
     def parse_primary(self):
         if self.match(TokenType.LPAREN):
-            self.advance(); expr = self.parse_expr(); self.expect(TokenType.RPAREN); return expr
+            self.advance(); expr = self.parse_expr(); self.expect(TokenType.RPAREN)
+            return self._parse_postfix_access(expr)
         if self.keyword("CASE"):
             return self.parse_case()
         tok = self.current()
         if tok.type == TokenType.IDENT:
             if self.peek(1).type == TokenType.LPAREN:
-                return self.parse_aggregate()
+                func_name = str(tok.value).upper()
+                if func_name in _AGGREGATE_FUNCTIONS:
+                    return self.parse_aggregate()
+                expr = self.parse_function_call()
+                return self._parse_postfix_access(expr)
             if self.keyword("NULL"):
                 return self.parse_literal()
             if self.keyword("TRUE") or self.keyword("FALSE"):
                 self.advance()
                 return Literal(str(tok.value).upper() == "TRUE")
-            return self.parse_qualified_ident()
+            return self.parse_path_or_ident()
         return self.parse_literal()
 
     def parse_case(self) -> Case:
@@ -597,17 +623,91 @@ class Parser:
         self.advance()
         return Case(base, tuple(whens), else_expr)
 
-    def parse_qualified_ident(self) -> Identifier:
+    def parse_function_call(self) -> FunctionCall:
+        func_tok = self.expect(TokenType.IDENT)
+        func_name = str(func_tok.value).upper()
+        if func_name not in _JSON_FUNCTIONS:
+            raise ParserError(f"Unsupported function '{func_tok.value}' at position {func_tok.position}")
+        self.expect(TokenType.LPAREN)
+        args: list[Any] = []
+        if not self.match(TokenType.RPAREN):
+            args.append(self.parse_expr())
+            while self.match(TokenType.COMMA):
+                self.advance()
+                args.append(self.parse_expr())
+        self.expect(TokenType.RPAREN)
+        return FunctionCall(func=func_name, args=tuple(args))
+
+    def _parse_postfix_access(self, base: Any) -> Any:
+        segments: list[str | int] = []
+        while self.match(TokenType.DOT) or self.match(TokenType.LBRACKET):
+            if self.match(TokenType.DOT):
+                self.advance()
+                if self.current().type == TokenType.IDENT:
+                    segments.append(self.ident())
+                elif self.current().type == TokenType.STRING:
+                    segments.append(self.advance().value)
+                else:
+                    raise ParserError(f"Expected property name after '.' at position {self.current().position}")
+            elif self.match(TokenType.LBRACKET):
+                self.advance()
+                if self.match(TokenType.NUMBER):
+                    num = self.advance().value
+                    if not isinstance(num, int) or num < 0:
+                        raise ParserError(f"Array index must be non-negative integer at position {self.current().position}")
+                    segments.append(num)
+                elif self.match(TokenType.STRING):
+                    segments.append(self.advance().value)
+                else:
+                    raise ParserError(f"Expected index or key inside brackets at position {self.current().position}")
+                self.expect(TokenType.RBRACKET)
+        if not segments:
+            return base
+        return PathAccess(base, tuple(segments))
+
+    def parse_path_or_ident(self) -> Any:
+        pos = self.current().position
         first = self.ident()
-        if self.match(TokenType.DOT):
-            self.advance()
-            if self.match(TokenType.STAR):
-                raise ParserError(
-                    f"Qualified wildcard '{first}.*' is not supported at position {self.current().position}"
-                )
-            second = self.ident()
-            return Identifier(name=second, qualifier=first)
-        return Identifier(name=first)
+        segments: list[str | int] = []
+        had_bracket = False
+
+        while self.match(TokenType.DOT) or self.match(TokenType.LBRACKET):
+            if self.match(TokenType.DOT):
+                self.advance()
+                if self.match(TokenType.STAR):
+                    if segments:
+                        raise ParserError(f"Unexpected '*' in path at position {self.current().position}")
+                    raise ParserError(
+                        f"Qualified wildcard '{first}.*' is not supported at position {self.current().position}"
+                    )
+                if self.current().type == TokenType.IDENT:
+                    segments.append(self.ident())
+                elif self.current().type == TokenType.STRING:
+                    segments.append(self.advance().value)
+                else:
+                    raise ParserError(f"Expected property name after '.' at position {self.current().position}")
+            elif self.match(TokenType.LBRACKET):
+                had_bracket = True
+                self.advance()
+                if self.match(TokenType.NUMBER):
+                    num = self.advance().value
+                    if not isinstance(num, int) or num < 0:
+                        raise ParserError(f"Array index must be non-negative integer at position {pos}")
+                    segments.append(num)
+                elif self.match(TokenType.STRING):
+                    segments.append(self.advance().value)
+                else:
+                    raise ParserError(f"Expected index or key inside brackets at position {self.current().position}")
+                self.expect(TokenType.RBRACKET)
+
+        if not segments:
+            return Identifier(name=first)
+        if len(segments) == 1 and isinstance(segments[0], str) and not had_bracket:
+            return Identifier(name=segments[0], qualifier=first)
+        return PathAccess(Identifier(name=first), tuple(segments))
+
+    def parse_qualified_ident(self) -> Any:
+        return self.parse_path_or_ident()
 
     def parse_aggregate(self) -> AggregateCall:
         func_tok = self.expect(TokenType.IDENT)

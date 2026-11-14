@@ -26,6 +26,10 @@ class Lexer:
         (?P<COMMA>,)|
         (?P<LPAREN>\()|
         (?P<RPAREN>\))|
+        (?P<LBRACKET>\[)|
+        (?P<RBRACKET>\])|
+        (?P<LBRACE>\{)|
+        (?P<RBRACE>\})|
         (?P<SEMICOLON>;)|
         (?P<DOT>\.)|
         (?P<IDENT>[A-Za-z_][A-Za-z0-9_]*)
@@ -82,6 +86,10 @@ class Lexer:
                     "COMMA": TokenType.COMMA,
                     "LPAREN": TokenType.LPAREN,
                     "RPAREN": TokenType.RPAREN,
+                    "LBRACKET": TokenType.LBRACKET,
+                    "RBRACKET": TokenType.RBRACKET,
+                    "LBRACE": TokenType.LBRACE,
+                    "RBRACE": TokenType.RBRACE,
                     "SEMICOLON": TokenType.SEMICOLON,
                     "DOT": TokenType.DOT,
                 }

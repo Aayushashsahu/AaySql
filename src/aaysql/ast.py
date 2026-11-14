@@ -65,6 +65,53 @@ class IsNull:
 
 
 @dataclass(frozen=True)
+class IsMissing:
+    """``expr IS MISSING`` / ``expr IS NOT MISSING``: checks ABSENT sentinel."""
+
+    expr: Any
+    negated: bool = False
+
+
+@dataclass(frozen=True)
+class IsJsonNull:
+    """``expr IS JSON NULL`` / ``expr IS NOT JSON NULL``: checks explicit JSON null."""
+
+    expr: Any
+    negated: bool = False
+
+
+@dataclass(frozen=True)
+class PathAccess:
+    """Path navigation into a JSON document: expr.path or expr[index]."""
+
+    expr: Any
+    path: tuple[str | int, ...]
+
+    @property
+    def label(self) -> str:
+        base = self.expr.label if hasattr(self.expr, "label") else str(self.expr)
+        segs = []
+        for seg in self.path:
+            if isinstance(seg, int):
+                segs.append(f"[{seg}]")
+            else:
+                segs.append(f".{seg}")
+        return f"{base}{''.join(segs)}"
+
+
+@dataclass(frozen=True)
+class FunctionCall:
+    """SQL function call, e.g. JSON_EXTRACT(doc, path), JSON_SET(doc, path, val)."""
+
+    func: str
+    args: tuple[Any, ...]
+
+    @property
+    def label(self) -> str:
+        return f"{self.func}(...)"
+
+
+@dataclass(frozen=True)
 class Like:
     """``expr LIKE pattern`` / ``expr NOT LIKE pattern`` (``%`` and ``_``)."""
 
@@ -127,6 +174,11 @@ class JoinClause:
 class CreateTable:
     name: str
     columns: list[ColumnDef]
+
+
+@dataclass(frozen=True)
+class CreateCollection:
+    name: str
 
 
 @dataclass(frozen=True)
