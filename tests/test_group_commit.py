@@ -10,7 +10,10 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from aaysql import Engine
+from aaysql.errors import AmbiguousCommitError
 
 SRC_DIR = str(Path(__file__).parents[1] / "src")
 
@@ -80,11 +83,26 @@ def test_group_commit_uses_one_real_fsync_per_batch(tmp_path):
     path = tmp_path / "group.aaydb"
     engine = Engine(path)
     engine.execute("AAYUSH CREATE TABLE g (id INT PRIMARY KEY)")
+    storage = engine.storage
+    assert storage is not None
+    real_save_batch = storage.save_batch
+    batch_sizes: list[int] = []
+
+    def recording_save_batch(entries):
+        batch_sizes.append(len(entries))
+        return real_save_batch(entries)
+
+    storage.save_batch = recording_save_batch
     _run_insert_workers(engine, workers=8, per_worker=5)
     metrics = engine.mvcc.metrics()
     assert metrics["commits"] == 40
     assert metrics["fsyncs"] == metrics["batches"]
     assert metrics["fsyncs"] < metrics["commits"]
+    # Actual WAL batch membership: every transaction appears exactly once and
+    # at least one durability operation carries more than one transaction.
+    assert len(batch_sizes) == metrics["fsyncs"]
+    assert sum(batch_sizes) == 40
+    assert max(batch_sizes) > 1
     engine.close()
 
     reopened = Engine(path)
@@ -166,11 +184,23 @@ def test_writer_admission_is_released_before_the_fsync_barrier(tmp_path):
         return real_save_batch(entries)
 
     storage.save_batch = blocked_save_batch
+    real_submit = engine.mvcc.submit
+    commit_results: list[dict] = []
+
+    def recording_submit(*args, **kwargs):
+        result = real_submit(*args, **kwargs)
+        commit_results.append(result)
+        return result
+
+    engine.mvcc.submit = recording_submit
     first_error: list[BaseException] = []
+    first_result: list[dict] = []
 
     def first_writer():
         try:
-            engine.connect().execute("AAYUSH INSERT INTO g VALUES (1)")
+            first_result.append(
+                engine.connect().execute("AAYUSH INSERT INTO g VALUES (1)")
+            )
         except BaseException as exc:  # noqa: BLE001
             first_error.append(exc)
 
@@ -182,19 +212,37 @@ def test_writer_admission_is_released_before_the_fsync_barrier(tmp_path):
     # must still get through writer admission and enqueue rather than block on a
     # lock held across durability.
     second_error: list[BaseException] = []
+    second_result: list[dict] = []
 
     def second_writer():
         try:
-            engine.connect().execute("AAYUSH INSERT INTO g VALUES (2)")
+            second_result.append(
+                engine.connect().execute("AAYUSH INSERT INTO g VALUES (2)")
+            )
         except BaseException as exc:  # noqa: BLE001
             second_error.append(exc)
 
     second = threading.Thread(target=second_writer)
     second.start()
     deadline = time.monotonic() + 10
-    while engine.mvcc.metrics()["admissions"] < 2 and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        metrics = engine.mvcc.metrics()
+        if (
+            metrics["admissions"] >= 2
+            and metrics["queue_depth"] >= 1
+            and metrics["commit_wait_timeouts"] >= 1
+        ):
+            break
         time.sleep(0.005)
-    assert engine.mvcc.metrics()["admissions"] >= 2
+    metrics = engine.mvcc.metrics()
+    assert metrics["admissions"] >= 2
+    # The first flusher has already drained its batch into save_batch, so a
+    # non-empty queue proves the second writer reached the commit queue rather
+    # than merely incrementing the admission counter before blocking.
+    assert metrics["queue_depth"] >= 1
+    # The second writer also entered its completion wait and survived a timeout
+    # cycle. Python 3.10 raises a distinct concurrent.futures.TimeoutError here.
+    assert metrics["commit_wait_timeouts"] >= 1
     assert first.is_alive(), "first commit unexpectedly returned before fsync completed"
 
     release.set()
@@ -202,5 +250,39 @@ def test_writer_admission_is_released_before_the_fsync_barrier(tmp_path):
     second.join(timeout=20)
     assert first_error == []
     assert second_error == []
+    assert len(first_result) == len(second_result) == 1
+    # Distinct batches must receive monotonically increasing LSNs and versions.
+    assert len(commit_results) == 2
+    lsns = sorted(result["commit_lsn"] for result in commit_results)
+    versions = sorted(result["version"] for result in commit_results)
+    assert lsns[0] < lsns[1]
+    assert versions[0] < versions[1]
     assert engine.execute("AAYUSH SELECT COUNT(*) AS n FROM g")["rows"] == [{"n": 2}]
+    engine.close()
+
+    reopened = Engine(path)
+    assert reopened.execute("AAYUSH SELECT id FROM g ORDER BY id")["rows"] == [
+        {"id": 1},
+        {"id": 2},
+    ]
+    reopened.close()
+
+
+def test_group_batch_ambiguous_durability_failure_is_not_published(tmp_path):
+    path = tmp_path / "ambiguous.aaydb"
+    engine = Engine(path)
+    engine.execute("AAYUSH CREATE TABLE g (id INT PRIMARY KEY)")
+    storage = engine.storage
+    assert storage is not None
+
+    def ambiguous_save_batch(_entries):
+        raise AmbiguousCommitError("group fsync outcome unknown")
+
+    storage.save_batch = ambiguous_save_batch
+    with pytest.raises(AmbiguousCommitError):
+        engine.connect().execute("AAYUSH INSERT INTO g VALUES (1)")
+
+    # The root must not publish a transaction whose durability is unknown.
+    assert engine.mvcc.current.table("g").rows == []
+    assert isinstance(engine.mvcc.failed, AmbiguousCommitError)
     engine.close()

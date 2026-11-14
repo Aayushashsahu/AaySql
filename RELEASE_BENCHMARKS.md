@@ -207,3 +207,19 @@ fsyncs from 80 to 10. All 80 rows were present after commit; the v4 WAL replay
 was exercised independently by `tests/test_group_commit.py` and the subprocess
 crash test. These are local single-host numbers, not a hardware-independent
 claim.
+
+## Phase 4.1 — Python 3.10 stabilization recheck
+
+Same workload and command as Phase 4: `python benchmarks/benchmark_concurrency.py
+--workers 8 --per-worker 10`, Windows 11, local NTFS, Python 3.11.15, 80 durable
+autocommit INSERT transactions on format v4.
+
+| Mode | Throughput | Transactions | WAL fsyncs | Batches |
+| --- | ---: | ---: | ---: | ---: |
+| Serial | 142.3 txn/s | 80 | 80 | 80 |
+| Grouped | 805.5 txn/s | 80 | 10 | 10 |
+| Reader while writer is open | 0.08 ms median | — | — | max 0.39 ms |
+
+This is a 5.7× grouped-commit improvement and confirms the Python 3.10 fix did
+not serialize work across the fsync. The Phase 4 run measured 130.2 / 785.8
+txn/s (6.0×); the difference is normal single-host run-to-run variance.

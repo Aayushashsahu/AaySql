@@ -26,6 +26,7 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -159,6 +160,7 @@ class MvccStore:
         self.snapshots_captured = 0
         self.snapshots_released = 0
         self.admissions = 0
+        self.commit_wait_timeouts = 0
 
     # --- publication state -------------------------------------------------
 
@@ -234,6 +236,7 @@ class MvccStore:
                 "commits": self.commits,
                 "admissions": self.admissions,
                 "queue_depth": len(self._queue),
+                "commit_wait_timeouts": self.commit_wait_timeouts,
                 "retained_snapshots": len(self._snapshots),
                 "version": self._version.number,
             }
@@ -333,7 +336,11 @@ class MvccStore:
                 if not future.done():
                     try:
                         future.result(timeout=0.05)
-                    except TimeoutError:
+                    except FutureTimeoutError:
+                        # Python 3.10 keeps concurrent.futures.TimeoutError
+                        # distinct from the built-in TimeoutError.
+                        with self._lock:
+                            self.commit_wait_timeouts += 1
                         continue
             return future.result()
         except BaseException:

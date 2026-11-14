@@ -142,7 +142,9 @@ normal Python reference counting. Sessions release their snapshot on `COMMIT`,
 
 `engine.mvcc.snapshot_stats()` reports `retained`, `captured`, `released`, and
 the current version. `engine.mvcc.metrics()` reports fsyncs, batches, commits,
-admissions, queue depth, and retained snapshots.
+admissions, queue depth, retained snapshots, and completion-wait timeout cycles.
+The last counter is operationally normal: a waiting writer polls its own
+completion future in short intervals while another writer owns the fsync.
 
 ## 8. Server behavior
 
