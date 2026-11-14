@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from .errors import AmbiguousCommitError, StorageError
 from .executor import Executor
 from .lexer import Lexer
 from .locking import DatabaseLease
+from .mvcc import DatabaseSession, IsolationLevel, MvccStore
 from .parser import Parser
 from .storage import Database, open_storage
 from .transaction import TransactionManager
@@ -101,6 +103,11 @@ class Engine:
         self.transactions = TransactionManager()
         self._closed = False
         self._recovery_required = False
+        self._legacy_dirty = False
+        self._sessions: weakref.WeakSet[DatabaseSession] = weakref.WeakSet()
+        self._default_session: DatabaseSession | None = None
+        self.mvcc = MvccStore(self.db, self.storage)
+        self.mvcc.set_publish_hook(self._publish_root)
 
     @property
     def is_persistent(self) -> bool:
@@ -122,12 +129,14 @@ class Engine:
 
     @property
     def needs_recovery(self) -> bool:
-        return self._recovery_required
+        return self._recovery_required or self.mvcc.failed is not None
 
     @property
     def wal_poisoned(self) -> bool:
         """True when a failed WAL append left the log in a recovery-only state."""
-        return self.storage is not None and self.storage.wal.poisoned
+        return (self.storage is not None and self.storage.wal.poisoned) or (
+            self.mvcc.failed is not None
+        )
 
     def _ensure_usable(self) -> None:
         if self._closed:
@@ -143,6 +152,29 @@ class Engine:
                 "reopen the database to recover"
             )
 
+    def connect(
+        self, isolation: IsolationLevel | str | None = None
+    ) -> DatabaseSession:
+        """Open an independent MVCC session on this engine.
+
+        Sessions may read while another session writes. Each session owns its
+        transaction state; only one writer is admitted at a time, and commits are
+        durably ordered by the group-commit queue.
+        """
+        self._ensure_usable()
+        if self._legacy_dirty:
+            self.mvcc.sync_legacy(self.db)
+            self._legacy_dirty = False
+        session = DatabaseSession(self.mvcc, isolation=isolation, lexer=self.lexer)
+        self._sessions.add(session)
+        return session
+
+    def _publish_root(self, db: Database) -> None:
+        """Make a session-published root the engine's current database view."""
+        self.db = db
+        self.executor.db = db
+        self._legacy_dirty = False
+
     @property
     def undo_entries(self) -> int:
         """Number of pending inverse entries (inspection/tests only)."""
@@ -150,10 +182,21 @@ class Engine:
 
     def execute(self, sql: str) -> dict[str, Any]:
         self._ensure_usable()
+        if self._default_session is not None:
+            result = self._default_session.execute(sql)
+            if not self._default_session.in_transaction:
+                self._default_session.close()
+                self._default_session = None
+            return result
         tokens = self.lexer.tokenize(sql)
         stmt = Parser(tokens).parse()
 
         if isinstance(stmt, Begin):
+            if stmt.isolation is not None:
+                # Explicit isolation levels need a snapshot-owning session; the
+                # legacy mutable engine remains the default READ COMMITTED path.
+                self._default_session = self.connect(stmt.isolation)
+                return self._default_session.execute(sql)
             return self.begin()
         if isinstance(stmt, Commit):
             return self.commit()
@@ -201,6 +244,7 @@ class Engine:
                 self._recovery_required = True
             raise
         self._journal.discard_to(mark)
+        self._legacy_dirty = True
         return result
 
     def _execute_in_transaction(self, stmt: Any) -> dict[str, Any]:
@@ -251,6 +295,7 @@ class Engine:
             raise
         # Durable (or in-memory) commit: inverse entries are no longer needed.
         self._journal.discard_to(marker)
+        self._legacy_dirty = True
         return {"status": "ok", "message": "Transaction committed"}
 
     def rollback(self) -> dict[str, Any]:
@@ -275,6 +320,11 @@ class Engine:
         if self._closed:
             return
         try:
+            if self._default_session is not None:
+                self._default_session.close()
+                self._default_session = None
+            for session in self._sessions:
+                session.close()
             if self._recovery_required:
                 return
             if self.transactions.in_transaction:

@@ -189,7 +189,7 @@ class Explain:
 
 @dataclass(frozen=True)
 class Begin:
-    pass
+    isolation: str | None = None
 
 
 @dataclass(frozen=True)

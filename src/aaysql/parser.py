@@ -89,7 +89,25 @@ class Parser:
     def parse_statement(self):
         if self.keyword("BEGIN"):
             self.advance()
-            return Begin()
+            if self.keyword("TRANSACTION"):
+                self.advance()
+            isolation = None
+            if self.keyword("SNAPSHOT"):
+                self.advance()
+                isolation = "SNAPSHOT"
+            elif self.keyword("ISOLATION"):
+                self.advance()
+                self.expect_kw("LEVEL")
+                if self.keyword("SNAPSHOT"):
+                    self.advance()
+                    isolation = "SNAPSHOT"
+                elif self.keyword("READ"):
+                    self.advance()
+                    self.expect_kw("COMMITTED")
+                    isolation = "READ COMMITTED"
+                else:
+                    raise ParserError("Expected SNAPSHOT or READ COMMITTED isolation level")
+            return Begin(isolation=isolation)
         if self.keyword("COMMIT"):
             self.advance()
             return Commit()

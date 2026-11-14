@@ -89,10 +89,12 @@ guarantees are not claimed beyond platform fsync semantics.
 
 ### T7 — Transaction isolation violations
 Uncommitted data visible to another session, or two writers at once.
-**Controls:** one engine, one execution lock, session-owned transactions,
-`TRANSACTION_BUSY` for non-owners, rollback on owner disconnect, `RECOVERY_REQUIRED`
-for everyone after an ambiguous commit.
-**Residual risk:** no MVCC; long transactions block all other statements.
+**Controls:** immutable published MVCC roots, one writer admitted at a time,
+per-session snapshots and rollback on disconnect, `WRITE_CONFLICT` for stale
+writes, `RECOVERY_REQUIRED` for everyone after an ambiguous commit.
+**Residual risk:** table-level first-updater-wins conflicts abort stale writers;
+there is no SERIALIZABLE isolation, row-level version chain, or multi-writer
+execution.
 
 ### T8 — Two processes on one database
 A second server or a backup racing the server corrupts state.

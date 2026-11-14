@@ -1050,12 +1050,10 @@ def test_scenario_b_transaction_is_owned_and_invisible(server):
         alice.execute("AAYUSH CREATE TABLE t (id INT PRIMARY KEY)")
         alice.execute("AAYUSH BEGIN")
         alice.execute("AAYUSH INSERT INTO t VALUES (1)")
-        with pytest.raises(ServerError) as excinfo:
-            bob.execute("AAYUSH SELECT * FROM t")
-        assert excinfo.value.code == TRANSACTION_BUSY
-        assert excinfo.value.retryable is True
-        # Bob never observes the uncommitted row, even through the engine object.
-        assert server.engine.db.table("t").rows[0]["id"] == 1
+        # Bob reads the last committed version concurrently; he is not blocked
+        # and never observes Alice's uncommitted row.
+        assert bob.execute("AAYUSH SELECT * FROM t")["rows"] == []
+        assert server.engine.db.table("t").rows == []
         alice.execute("AAYUSH COMMIT")
         assert bob.execute("AAYUSH SELECT * FROM t")["rows"] == [{"id": 1}]
     finally:
@@ -1070,9 +1068,7 @@ def test_scenario_c_rollback_is_invisible(server):
         alice.execute("AAYUSH CREATE TABLE t (id INT PRIMARY KEY)")
         alice.execute("AAYUSH BEGIN")
         alice.execute("AAYUSH INSERT INTO t VALUES (1)")
-        with pytest.raises(ServerError) as excinfo:
-            bob.execute("AAYUSH SELECT * FROM t")
-        assert excinfo.value.code == TRANSACTION_BUSY
+        assert bob.execute("AAYUSH SELECT * FROM t")["rows"] == []
         alice.execute("AAYUSH ROLLBACK")
         assert bob.execute("AAYUSH SELECT * FROM t")["rows"] == []
     finally:
@@ -1105,13 +1101,14 @@ def test_scenario_e_competing_begin_cannot_hijack_the_transaction(server):
         alice.execute("AAYUSH CREATE TABLE t (id INT PRIMARY KEY)")
         alice.execute("AAYUSH BEGIN")
         alice.execute("AAYUSH INSERT INTO t VALUES (1)")
-        with pytest.raises(ServerError) as excinfo:
-            bob.execute("AAYUSH BEGIN")
-        assert excinfo.value.code == TRANSACTION_BUSY
-        # Alice's transaction is intact and still hers.
-        alice.execute("AAYUSH INSERT INTO t VALUES (2)")
+        # Bob gets his own independent transaction instead of hijacking Alice's.
+        bob.execute("AAYUSH BEGIN")
+        bob.execute("AAYUSH INSERT INTO t VALUES (2)")
+        bob.execute("AAYUSH COMMIT")
+        assert alice.execute("AAYUSH SELECT * FROM t")["rows"] == [{"id": 1}]
+        alice.execute("AAYUSH INSERT INTO t VALUES (3)")
         alice.execute("AAYUSH COMMIT")
-        assert bob.execute("AAYUSH SELECT * FROM t")["row_count"] == 2
+        assert bob.execute("AAYUSH SELECT * FROM t")["row_count"] == 3
     finally:
         alice.close()
         bob.close()

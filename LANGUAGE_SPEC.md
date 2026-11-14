@@ -368,16 +368,21 @@ AAYUSH BEGIN;
 AAYUSH INSERT INTO accounts VALUES (1, 'Aayush', 1000);
 AAYUSH UPDATE accounts SET balance = balance - 100 WHERE id = 1;
 AAYUSH COMMIT;
+
+AAYUSH BEGIN SNAPSHOT;
+AAYUSH SELECT * FROM accounts;
+AAYUSH COMMIT;
 ```
 
-- `BEGIN` starts an explicit transaction. Mutations are visible to later statements from the same engine but are **not** written to the `.aaydb` file until `COMMIT`.
+- `BEGIN` starts an explicit READ COMMITTED transaction. Mutations are visible to later statements from the same session but are **not** written to the `.aaydb` file until `COMMIT`. Each statement reads the latest committed snapshot until the transaction writes, after which it keeps that transaction's snapshot.
+- `BEGIN SNAPSHOT` (or `BEGIN ISOLATION LEVEL SNAPSHOT`) pins the read view at `BEGIN`, so repeated reads see the same committed version and no later commits or phantoms. `BEGIN ISOLATION LEVEL READ COMMITTED` is the explicit default. There is no `SERIALIZABLE` level.
 - `ROLLBACK` discards every change since `BEGIN`, including DDL (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`).
 - Each statement inside a transaction is atomic: a statement that fails validation, a constraint, or expression evaluation (for example division by zero in an `UPDATE`) leaves no partial changes, and the transaction remains usable.
 - `COMMIT` is the durability point. Persistent mutations and explicit `COMMIT` append `begin`, `write`, and `commit` WAL records with SHA-256 checksums and call `os.fsync()` before atomically checkpointing `.aaydb` (format v3). Failures before `COMMIT` restore the pre-`BEGIN` state; failures during post-commit checkpointing preserve the committed state and WAL; `COMMIT` `fsync` errors raise `AmbiguousCommitError` and require reopen recovery.
-- Nested `BEGIN`, and `COMMIT` / `ROLLBACK` without an active transaction, raise `ExecutionError`.
+- Nested `BEGIN`, and `COMMIT` / `ROLLBACK` without an active transaction, raise `ExecutionError`. A stale write at `COMMIT` raises `WriteConflictError` (protocol code `WRITE_CONFLICT`).
 - Closing the engine or exiting the CLI with an active transaction rolls it back. The CLI prints `WARNING: rolling back uncommitted transaction on exit` to `stderr`.
 - Autocommit behavior outside explicit transactions persists every mutating statement through the WAL before returning.
-- The model is single-process and single-writer. There are no savepoints, isolation levels, or concurrent writers.
+- The model is single-process and single-commit-generator. There are no savepoints, `SERIALIZABLE` isolation, row-level version chains, or multi-writer execution. Independent sessions read concurrently; writers may be rejected at commit with `WriteConflictError` and must retry the whole transaction.
 
 ### `UPDATE` & `DELETE`
 ```sql

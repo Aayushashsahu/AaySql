@@ -325,3 +325,30 @@ durable and immediately before the WAL is truncated.
 Coverage lives in `tests/test_delta_v4.py`, `tests/test_checkpoints_v4.py`,
 `tests/test_migration_v4.py`, `tests/test_backup_v4.py`, and
 `tests/test_crash_v4.py`.
+
+## 13. Group commit batching
+
+`WalManager.append_commit_batch()` (formats v1–v3) and
+`append_delta_batch()` (format v4) write several independent transactions as
+ordinary, consecutive `BEGIN` / `WRITE` / `COMMIT` triples with monotonically
+increasing LSNs. One `os.fsync()` after the final `COMMIT` is the shared commit
+point for the whole batch.
+
+- The batch is invisible until that fsync returns. Recovery does not need to
+  know that transactions were batched: each triple is a normal independent
+  transaction.
+- Failure before any `COMMIT` bytes are written poisons the WAL and raises
+  `StorageError`; no transaction in the batch is reported committed.
+- Failure after any `COMMIT` bytes are written raises `AmbiguousCommitError` for
+  every transaction in the batch. The WAL is preserved and the database requires
+  reopen recovery.
+- A new WAL file still receives the directory-entry fsync before success, so the
+  same ambiguity classification applies.
+- Crash hooks for a single transaction (`after_begin`,
+  `after_write_before_commit`, `partial_commit_record`, `after_commit_fsync`)
+  continue to describe one transaction triple. A crash after the shared fsync
+  recovers every transaction whose `COMMIT` record is present and durable.
+
+Group commit changes durability throughput, not the visibility rule: the MVCC
+store publishes all batch roots only after `save_batch()` returns. See
+[`MVCC.md`](MVCC.md).

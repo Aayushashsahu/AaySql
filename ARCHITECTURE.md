@@ -73,14 +73,17 @@ Lexing note: numbers are lexed unsigned so `1-2` is `number, minus, number`. The
 
 `DISTINCT` deduplicates projected rows (type-tagged keys, `NULL`s equal, first occurrence kept) before ordering. Because ordering then refers to the projected row, a `DISTINCT` query requires `ORDER BY` keys to be a unique alias, a selected expression, or a selected column for `DISTINCT *`. `OFFSET` runs after ordering and before limiting, and `EXPLAIN ANALYZE` reports `duplicates_removed`, `rows_discarded`, and post-`LIMIT` counts from the real run.
 
-## Transactions (`src/aaysql/transaction.py`, `src/aaysql/engine.py`)
+## Transactions (`src/aaysql/transaction.py`, `src/aaysql/engine.py`, `src/aaysql/mvcc.py`)
 
-- `TransactionManager` tracks the single optional transaction of an engine instance by undo-journal marker. `BEGIN` is O(1) (no `Database.clone()`); statements mutate memory only and append inverse entries; `COMMIT` delegates to durable WAL commit + checkpoint; `ROLLBACK` applies the inverse entries down to the `BEGIN` marker.
+- `TransactionManager` tracks one optional transaction per session by undo-journal marker. `BEGIN` is O(1) (no `Database.clone()`); statements mutate the session's private copy-on-write workspace and append inverse entries; `COMMIT` delegates to durable WAL commit + checkpoint; `ROLLBACK` applies the inverse entries down to the `BEGIN` marker.
+- `Engine.connect(isolation=...)` creates independent `DatabaseSession` objects. A session captures an immutable published root and uses READ COMMITTED by default, or a pinned root with `BEGIN SNAPSHOT`. Readers never block writers and never observe uncommitted rows.
+- Commits are first-updater-wins. A changed table whose revision moved after the snapshot raises `WriteConflictError`; insert-only transactions may append concurrently subject to UNIQUE/PRIMARY KEY reservation.
+- The MVCC commit queue batches independent transactions into one WAL fsync and releases writer admission before that fsync. See [`docs/MVCC.md`](docs/MVCC.md).
 - The journal in `undo.py` is an append-only list of inverse operations: inserted rows are removed, deleted rows are reinserted as the same row objects at their original positions, updates restore before-images in place (preserving row identity), and DDL restores detached tables/indexes. Index maintenance uses exact inverse add/remove operations and original positions rather than rebuilding index trees. Journal memory is proportional to the mutations made, not to the database size.
 - Each mutating statement inside a transaction records an additional marker. A failed statement is rolled back to that marker, so it never leaves partial rows or index entries while earlier statements remain. Undo is recorded before mutation and is idempotent for the partially applied states AayushSQL can produce.
 - Pre-commit persistence errors apply the journal and raise `StorageError`. The journal is retained until commit durability is classified: it is discarded on success, and on an ambiguous `fsync` it is discarded **without** applying it, so memory still reflects the possibly-durable transaction and `needs_recovery` blocks further work. Once WAL `COMMIT` `os.fsync()` succeeds, the commit is durable even if later checkpointing fails.
 - Closing the engine (or exiting the CLI) with an active transaction rolls it back; the CLI warns on `stderr`, so uncommitted work is never silently persisted or discarded.
-- Deliberately single-process and single-writer: no nested transactions, savepoints, isolation levels, or concurrent writers.
+- Deliberately single-process and single-writer: one commit generator is admitted at a time. There are no nested transactions, savepoints, SERIALIZABLE isolation, row-version chains, or multi-writer execution.
 
 ## Indexing (`src/aaysql/index.py`, `src/aaysql/btree.py`)
 
@@ -102,17 +105,16 @@ Lexing note: numbers are lexed unsigned so `1-2` is `number, minus, number`. The
 - **One engine per server.** `AayushSQLServer` opens the `Engine` before binding
   the socket, so WAL recovery completes before any request can arrive, and it
   never creates an engine per connection.
-- **Connection threads, serialized execution.** `socketserver.ThreadingTCPServer`
-  runs one thread per connection, but every statement is executed under the
-  single `TransactionCoordinator` lock, released before the response is written.
-- **Session-owned transactions.** The coordinator tracks the one session allowed
-  to use the engine's single `TransactionManager`. Non-owners are rejected with a
-  retryable `TRANSACTION_BUSY` before the engine is touched, so uncommitted rows
-  are never observable and statements are never absorbed into another session's
-  transaction. Ownership is re-derived from `engine.in_transaction` after each
-  statement — the engine stays authoritative.
-- **Disconnect rollback.** Session cleanup rolls back an active transaction and
-  releases ownership. An ambiguous `COMMIT` instead marks the whole service
+- **Connection threads with concurrent readers.** `socketserver.ThreadingTCPServer`
+  runs one thread per connection. The coordinator tracks in-flight work for
+  shutdown and availability, but readers do not take a global execution lock.
+- **Session-owned transactions.** Every connection owns its own
+  `DatabaseSession` and transaction. Other sessions read the last committed
+  snapshot while a writer is active, so uncommitted rows are never observable
+  and statements are never absorbed into another session's transaction.
+  Transaction state is re-derived from the session after each statement.
+- **Disconnect rollback.** Session cleanup rolls back that session's active
+  transaction and releases its snapshot. An ambiguous `COMMIT` instead marks the whole service
   `RECOVERY_REQUIRED`, keeps the ownership tombstone, and preserves the WAL for
   reopen recovery; no rollback is ever claimed.
 - **Process lock.** `<db>.server.lock` is held with `fcntl.flock` (POSIX) or
@@ -142,6 +144,7 @@ The complete contract, framing details, error codes and limitations are in
 - **`execution.py`**: Runs the physical plan tree: scans, hash/nested-loop joins, post-join filters, aggregation, projection, `DISTINCT`, sort, `OFFSET`, `LIMIT`, and per-operator metrics.
 - **`index.py` / `btree.py`**: Secondary index maintenance, lookups, range scans, and B+ tree invariants.
 - **`executor.py`**: Executes DDL/DML and `EXPLAIN`, maintains indexes on mutations, records inverse operations before each mutation, and delegates `SELECT` to the query pipeline.
+- **`mvcc.py`**: Published roots, pinned snapshots, READ COMMITTED/SNAPSHOT sessions, copy-on-write workspaces, revision conflict detection, snapshot accounting, and the group-commit queue.
 - **`undo.py`**: The in-memory inverse journal: markers, inverse entries for rows and DDL, reverse-order replay, and discard-after-durable-commit. It is not serialized and is not a second WAL.
 - **`wal.py`**: WAL record schema, SHA-256 checksums, strict validation, byte-accurate tail parsing and repair, the append state machine with write-all/poisoning, directory fsync error classification, checkpoint/truncation helpers, and internal crash-test hooks.
 - **`storage.py`**: Schema/type/constraint validation, `Table`/`Database` models, v1/v2->v3 migration, crash-safe checkpointing, and startup WAL recovery.
