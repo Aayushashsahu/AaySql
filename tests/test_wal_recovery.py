@@ -164,8 +164,12 @@ def test_subprocess_crash_after_commit_recovers_transaction(tmp_path: Path, cras
         {"id": 3, "owner": "Mika", "balance": 250},
     ]
     _verify_reopen_idempotency(db_file, expected)
-    # Stale temp files and non-empty WAL must be cleaned up after recovery.
-    assert [p.name for p in tmp_path.iterdir()] == [db_file.name]
+    # Stale temp files and non-empty WAL must be cleaned up after recovery; the
+    # persistent lease file is expected to remain and grants nothing by itself.
+    leftovers = sorted(
+        p.name for p in tmp_path.iterdir() if not p.name.endswith(".server.lock")
+    )
+    assert leftovers == [db_file.name]
 
 
 def test_subprocess_crash_on_brand_new_database_before_first_snapshot(tmp_path: Path):

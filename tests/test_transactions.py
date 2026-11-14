@@ -6,8 +6,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 import pytest
+
 from aaysql import Engine
-from aaysql.errors import ConstraintError, ExecutionError, ParserError, StorageError
+from aaysql.errors import (
+    ConstraintError,
+    DatabaseLockedError,
+    ExecutionError,
+    ParserError,
+    StorageError,
+)
 
 
 def _create(db_path: Path | None = None) -> Engine:
@@ -234,16 +241,16 @@ def test_select_visibility_inside_and_outside_transaction(tmp_path: Path):
         {"id": 3, "balance": 250},
     ]
 
-    # A second process-level reader sees only the committed file.
-    other = Engine(db_file)
-    assert len(_balances(other)) == 2
-    other.close()
+    # A second engine may not open the file while this one owns it: opening can
+    # recover the WAL, and this transaction is still in memory.
+    with pytest.raises(DatabaseLockedError):
+        Engine(db_file)
 
     engine.execute("AAYUSH COMMIT")
-    reader = Engine(db_file)
-    assert len(_balances(reader)) == 3
-    reader.close()
     engine.close()
+    # A separate owner now sees only the committed file.
+    with Engine(db_file) as reader:
+        assert len(_balances(reader)) == 3
 
 
 def test_close_with_active_transaction_rolls_back(tmp_path: Path):
@@ -262,10 +269,12 @@ def test_autocommit_outside_transactions_is_unchanged(tmp_path: Path):
     engine = _create(db_file)
     engine.execute("AAYUSH INSERT INTO accounts VALUES (3, 'Mika', 250)")
 
-    other = Engine(db_file)
-    assert len(_balances(other)) == 3
-    other.close()
+    with pytest.raises(DatabaseLockedError):
+        Engine(db_file)
     engine.close()
+
+    with Engine(db_file) as other:
+        assert len(_balances(other)) == 3
 
 
 def test_in_memory_transactions_work():

@@ -31,6 +31,7 @@ from aaysql.client import (
     ServerError,
     TLSHandshakeError,
 )
+from aaysql.errors import DatabaseLockedError
 from aaysql.protocol import (
     AUTHENTICATION_FAILED,
     CONNECTION_TIMEOUT,
@@ -779,7 +780,8 @@ def test_second_server_on_the_same_database_is_refused(tmp_path):
     first.start()
     try:
         second = AayushSQLServer(ServerConfig(db_path=db_path, port=0))
-        with pytest.raises(ServerConfigError, match="already owned"):
+        # Ownership conflicts are a typed error now, not a generic config error.
+        with pytest.raises(DatabaseLockedError, match="already in use"):
             second.start()
         # The first server is unaffected.
         with AayushSQLClient(*first.address) as client:

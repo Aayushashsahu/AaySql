@@ -41,6 +41,7 @@ from .errors import (
     ParserError,
     StorageError,
 )
+from .locking import LOCK_SUFFIX, DatabaseLease, canonical_lock_path, canonical_path
 from .protocol import (
     AUTH_TOKEN_ENV,
     AUTHENTICATION_FAILED,
@@ -73,8 +74,8 @@ from .protocol import (
 
 LOGGER = logging.getLogger("aaysql.server")
 
-#: Suffix of the OS-level lock file that marks "this database has a server".
-LOCK_SUFFIX = ".server.lock"
+# LOCK_SUFFIX is imported from :mod:`aaysql.locking` and re-exported here for
+# compatibility with callers that imported it from this module.
 DEFAULT_DB_PATH = "aaysql.aaydb"
 RECV_CHUNK = 65536
 MAX_RECENT_REQUEST_IDS = 256
@@ -130,7 +131,30 @@ class ServerConfig:
             return False
 
     @property
+    def canonical_lock_path(self) -> Path | None:
+        """The ownership lock this server's database is always identified by."""
+        if self.in_memory:
+            return None
+        assert self.db_path is not None
+        return canonical_lock_path(self.db_path)
+
+    @property
+    def supplemental_lock_path(self) -> Path | None:
+        """An extra coordination lock, never a replacement for ownership.
+
+        ``lock_path`` is kept for compatibility with the v0.8.0 configuration
+        surface. It is only ever held *in addition to* the canonical database
+        lock, and configuring the canonical path itself is a no-op.
+        """
+        canonical = self.canonical_lock_path
+        if canonical is None or self.lock_path is None:
+            return None
+        candidate = canonical_path(self.lock_path)
+        return None if candidate == canonical else candidate
+
+    @property
     def effective_lock_path(self) -> Path | None:
+        """The lock path named by this configuration (canonical by default)."""
         if self.in_memory:
             return None
         if self.lock_path is not None:
@@ -163,6 +187,11 @@ class ServerConfig:
             raise ServerConfigError("tls_client_ca requires tls_cert and tls_key")
         if self.auth_token is not None and not self.auth_token.strip():
             raise ServerConfigError("auth_token must not be empty when configured")
+        if self.lock_path is not None and self.in_memory:
+            raise ServerConfigError(
+                "lock_path requires a file-backed database (db_path); an in-memory "
+                "server has no database ownership to coordinate"
+            )
         if self.tls_enabled:
             for label, value in (("tls_cert", self.tls_cert), ("tls_key", self.tls_key)):
                 if not value or not Path(value).is_file():
@@ -202,76 +231,27 @@ class ServerConfig:
 
 
 class ServerLock:
-    """Exclusive per-database lock, released by the OS if the process dies.
+    """Compatibility wrapper around :class:`DatabaseLease`, keyed by lock file.
 
-    POSIX uses ``fcntl.flock``; Windows uses ``msvcrt.locking`` on one byte.
-    No stale-PID heuristics are involved: the operating system drops the lock
-    when the owning process terminates, so a crashed server never blocks a
-    restart.
+    New code should use :class:`aaysql.locking.DatabaseLease`. This wrapper is
+    kept because it is part of the v1.0.0 surface and existing diagnostics and
+    tests use it; it delegates every operation to the single lease
+    implementation, so there is still only one lock system.
     """
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
-        self._handle: Any = None
+        self._lease = DatabaseLease.for_lock_path(self.path)
+
+    @property
+    def active(self) -> bool:
+        return self._lease.active
 
     def acquire(self) -> None:
-        if self._handle is not None:
-            return
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            handle = open(self.path, "a+b")  # noqa: SIM115 - lifetime is the lock
-        except OSError as exc:
-            raise ServerConfigError(f"cannot open server lock file {self.path}: {exc}") from exc
-        try:
-            # Take the OS lock before touching the file contents: on Windows the
-            # holding process owns the locked byte range, so a second server may
-            # not write (or even truncate) it.
-            handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            handle.close()
-            raise ServerConfigError(
-                f"database is already owned by another AayushSQL server "
-                f"(lock file {self.path}): {exc}"
-            ) from exc
-        # The pid is diagnostic only; the lock itself is the authority.
-        try:
-            handle.seek(0)
-            handle.truncate(0)
-            handle.write(f"{os.getpid()}\n".encode("ascii"))
-            handle.flush()
-        except OSError:
-            pass
-        self._handle = handle
+        self._lease.acquire()
 
     def release(self) -> None:
-        handle, self._handle = self._handle, None
-        if handle is None:
-            return
-        try:
-            handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        finally:
-            try:
-                handle.close()
-            except OSError:
-                pass
+        self._lease.release()
 
     def __enter__(self) -> ServerLock:
         self.acquire()
@@ -692,7 +672,12 @@ class AayushSQLServer:
         self._logger = logger or LOGGER
         self._injected_engine = engine
         self._engine: Engine | None = None
-        self._lock: ServerLock | None = None
+        # The server owns a lease unless it is borrowing an injected engine's
+        # lease; only an owned lease is released during shutdown.
+        self._lease: DatabaseLease | None = None
+        self._supplemental_lease: DatabaseLease | None = None
+        self._owns_lease = False
+        self._created_engine = False
         self._coordinator: TransactionCoordinator | None = None
         self._tcp: _ThreadingTCPServer | None = None
         self._thread: threading.Thread | None = None
@@ -761,15 +746,38 @@ class AayushSQLServer:
         if self._started:
             return self.address
         self.config.validate()
-        lock = None
+        lease: DatabaseLease | None = None
+        owns_lease = False
+        supplemental: DatabaseLease | None = None
         engine = self._injected_engine
         created_engine = False
         try:
-            if self.config.effective_lock_path is not None:
-                lock = ServerLock(self.config.effective_lock_path)
-                lock.acquire()
+            if engine is not None and engine.is_persistent:
+                # The injected engine already owns the database. Borrow its
+                # lease: acquiring a second one would self-lock.
+                borrowed = engine.lease
+                if borrowed is None or not borrowed.active:
+                    raise StorageError(
+                        "injected persistent Engine does not hold a database lease"
+                    )
+                lease = borrowed
+            elif self.config.canonical_lock_path is not None:
+                # Canonical ownership is never configurable: every file-backed
+                # server contends for <db>.server.lock, exactly like Engine,
+                # backup and restore. A configured lock_path is an *additional*
+                # coordination lock, acquired after canonical ownership so the
+                # ordering is always canonical -> supplemental.
+                lease = DatabaseLease.for_database(self.config.db_path)
+                lease.acquire()
+                owns_lease = True
+            supplemental_path = self.config.supplemental_lock_path
+            if supplemental_path is not None:
+                supplemental = DatabaseLease.for_database(
+                    self.config.db_path, lock_path=supplemental_path
+                )
+                supplemental.acquire()
             if engine is None:
-                engine = Engine(self.config.db_path)
+                engine = Engine(self.config.db_path, _lease=lease)
                 created_engine = True
             coordinator = TransactionCoordinator(engine, logger=self._logger)
             tcp = _ThreadingTCPServer(
@@ -785,16 +793,25 @@ class AayushSQLServer:
                 )
             tcp.server_activate()
         except BaseException:
-            if lock is not None:
-                lock.release()
+            # Close first (the created engine only *borrows* the lease), then
+            # release ownership if this server acquired it.
             if created_engine and engine is not None:
                 try:
                     engine.close()
                 except Exception as exc:  # noqa: BLE001 - startup is being torn down
                     LOGGER.debug("engine close during failed startup ignored: %s", exc)
+            # Unwind in reverse acquisition order: supplemental first, then the
+            # canonical ownership lease (only if this server acquired it).
+            if supplemental is not None:
+                supplemental.release()
+            if owns_lease and lease is not None:
+                lease.release()
             raise
 
-        self._lock = lock
+        self._lease = lease
+        self._supplemental_lease = supplemental
+        self._owns_lease = owns_lease
+        self._created_engine = created_engine
         self._engine = engine
         self._coordinator = coordinator
         self._tcp = tcp
@@ -871,9 +888,22 @@ class AayushSQLServer:
             drained = self._coordinator.shutdown(remaining)
         if self._thread is not None:
             self._thread.join(timeout=max(deadline - time.monotonic(), 0.0))
-        if self._lock is not None:
-            self._lock.release()
-            self._lock = None
+        # Release the engine before the lease: an engine still holding the lease
+        # would otherwise stay usable after ownership is handed away.
+        if self._created_engine and self._engine is not None:
+            try:
+                self._engine.close()
+            except Exception as exc:  # noqa: BLE001 - shutdown must finish
+                self._logger.debug("engine close during shutdown ignored: %s", exc)
+        # Reverse acquisition order again, and only after the created engine has
+        # been closed: canonical ownership is handed away last.
+        if self._supplemental_lease is not None:
+            self._supplemental_lease.release()
+        if self._owns_lease and self._lease is not None:
+            self._lease.release()
+        self._supplemental_lease = None
+        self._lease = None
+        self._owns_lease = False
         self._started = False
         if drained:
             self._logger.info(

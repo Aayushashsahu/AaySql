@@ -28,3 +28,15 @@ class AmbiguousCommitError(StorageError):
     pass
 
 
+class DatabaseLockedError(StorageError):
+    """A file-backed database is already owned by another engine or process.
+
+    ``code`` is stable and machine-readable; callers should branch on it rather
+    than on the message text. Ownership is enforced by an OS-level lock plus a
+    process-local registry, so this error is also raised for a second engine in
+    the *same* process.
+    """
+
+    code = "DATABASE_LOCKED"
+
+
