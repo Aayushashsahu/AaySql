@@ -562,6 +562,172 @@ class WalManager:
         _maybe_crash("after_commit_fsync")
         return commit_lsn, txn_id
 
+    def append_delta_transaction(
+        self, changes: list[dict[str, Any]], *, db_id: str
+    ) -> tuple[int, str]:
+        """Write a format-v4 BEGIN/WRITE/COMMIT delta transaction.
+
+        Same durability contract as :meth:`append_commit_transaction`: the
+        ``fsync`` of the COMMIT record is the commit point, a failure before it
+        poisons the WAL and raises ``StorageError``, and an uncertain COMMIT
+        fsync raises ``AmbiguousCommitError`` instead of guessing.
+        """
+        from .delta import validate_changes  # local import avoids a module cycle
+
+        ops = validate_changes(changes)
+        self._ensure_writable()
+        if self.wal_path.exists() and self.wal_path.is_dir():
+            raise StorageError(f"WAL path '{self.wal_path}' is a directory")
+
+        txn_id = f"txn-{uuid.uuid4().hex}"
+        begin_lsn = self.last_lsn + 1
+        write_lsn = self.last_lsn + 2
+        commit_lsn = self.last_lsn + 3
+
+        try:
+            begin_bytes = serialize_record(
+                build_record_v4(begin_lsn, txn_id, "begin", db_id=db_id)
+            )
+            write_bytes = serialize_record(
+                build_record_v4(
+                    write_lsn, txn_id, "write", db_id=db_id, changes=ops
+                )
+            )
+            commit_bytes = serialize_record(
+                build_record_v4(
+                    commit_lsn, txn_id, "commit", db_id=db_id, write_lsn=write_lsn
+                )
+            )
+        except Exception as exc:
+            raise StorageError(
+                f"Failed to serialize WAL records for '{self.wal_path}': {exc}"
+            ) from exc
+
+        parent = self.wal_path.parent
+        created_new = not self.wal_path.exists()
+        try:
+            if str(parent):
+                parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise StorageError(
+                f"Failed to create WAL directory '{parent}': {exc}"
+            ) from exc
+
+        fd: int | None = None
+        try:
+            fd = self._open_append()
+
+            self.state = "begin_appended"
+            _write_all(fd, begin_bytes)
+            self.last_lsn = begin_lsn
+            _maybe_crash("after_begin")
+
+            self.state = "write_appended"
+            _write_all(fd, write_bytes)
+            self.last_lsn = write_lsn
+            if os.environ.get(_CRASH_ENV_VAR) == "after_write_before_commit":
+                os.fsync(fd)
+                if created_new:
+                    fsync_dir(parent)
+                os._exit(99)
+
+            if os.environ.get(_CRASH_ENV_VAR) == "partial_commit_record":
+                partial_len = max(1, len(commit_bytes) // 2)
+                partial = commit_bytes[:partial_len].rstrip(b"\n")
+                if not partial:
+                    partial = b"{"
+                _write_all(fd, partial)
+                os.fsync(fd)
+                if created_new:
+                    fsync_dir(parent)
+                os._exit(99)
+
+            self.state = "commit_attempted"
+            _write_all(fd, commit_bytes)
+            os.fsync(fd)
+            self.state = "commit_durable"
+            self.last_lsn = commit_lsn
+        except OSError as exc:
+            self.poisoned = True
+            if self.state == "commit_attempted":
+                self.state = "ambiguous"
+                raise AmbiguousCommitError(
+                    f"Commit durability is ambiguous because WAL fsync failed on "
+                    f"'{self.wal_path}': {exc}; reopen the database to recover"
+                ) from exc
+            self.state = "damaged"
+            raise StorageError(
+                f"Failed to append WAL records to '{self.wal_path}': {exc}; "
+                "the WAL may contain an incomplete record and is blocked until recovery"
+            ) from exc
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        if created_new:
+            try:
+                fsync_dir(parent)
+            except StorageError as exc:
+                self.poisoned = True
+                self.state = "ambiguous"
+                raise AmbiguousCommitError(
+                    f"Commit durability is ambiguous because the WAL directory entry "
+                    f"could not be made durable for '{self.wal_path}': {exc}; "
+                    "reopen the database to recover"
+                ) from exc
+
+        self.state = "idle"
+        _maybe_crash("after_commit_fsync")
+        return commit_lsn, txn_id
+
+    def append_checkpoint_v4(
+        self, commit_lsn: int, *, db_id: str, txn_id: str | None = None
+    ) -> int:
+        """Append and fsync a format-v4 CHECKPOINT record."""
+        self._ensure_writable()
+        ckpt_lsn = max(self.last_lsn, commit_lsn) + 1
+        txn = txn_id or f"ckpt-{commit_lsn}"
+        rec_bytes = serialize_record(
+            build_record_v4(
+                ckpt_lsn, txn, "checkpoint", db_id=db_id, commit_lsn=commit_lsn
+            )
+        )
+        created_new = not self.wal_path.exists()
+        fd: int | None = None
+        try:
+            fd = self._open_append()
+            self.state = "checkpoint_append"
+            _write_all(fd, rec_bytes)
+            os.fsync(fd)
+            self.last_lsn = ckpt_lsn
+            self.state = "checkpoint_durable"
+        except OSError as exc:
+            self.poisoned = True
+            self.state = "damaged"
+            raise StorageError(
+                f"Failed to append CHECKPOINT to '{self.wal_path}': {exc}"
+            ) from exc
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        if created_new:
+            try:
+                fsync_dir(self.wal_path.parent)
+            except StorageError:
+                self.poisoned = True
+                self.state = "damaged"
+                raise
+        _maybe_crash("after_checkpoint_before_truncate")
+        self.state = "idle"
+        return ckpt_lsn
+
     def append_checkpoint(self, commit_lsn: int, txn_id: str | None = None) -> int:
         """Append and fsync a CHECKPOINT record referencing ``commit_lsn``."""
         self._ensure_writable()
@@ -678,3 +844,287 @@ class WalManager:
             # Best-effort cleanup of an already-empty, fully checkpointed WAL.
             # Failure here cannot affect committed data.
             pass
+
+
+# ---------------------------------------------------------------------------
+# Format v4: delta transactions
+# ---------------------------------------------------------------------------
+
+WAL_FORMAT_VERSION = 4
+_ALLOWED_KEYS_V4: dict[str, frozenset[str]] = {
+    "begin": frozenset({"lsn", "txn", "type", "v", "db", "checksum"}),
+    "write": frozenset(
+        {"lsn", "txn", "type", "v", "db", "changes", "checksum"}
+    ),
+    "commit": frozenset(
+        {"lsn", "txn", "type", "v", "db", "write_lsn", "checksum"}
+    ),
+    "checkpoint": frozenset(
+        {"lsn", "txn", "type", "v", "db", "commit_lsn", "checksum"}
+    ),
+}
+
+
+def build_record_v4(
+    lsn: int, txn: str, rec_type: str, *, db_id: str, **extra: Any
+) -> dict[str, Any]:
+    """Build a checksummed format-v4 WAL record carrying the database identity."""
+    record: dict[str, Any] = {
+        "lsn": lsn,
+        "txn": txn,
+        "type": rec_type,
+        "v": WAL_FORMAT_VERSION,
+        "db": db_id,
+        **extra,
+    }
+    record["checksum"] = compute_checksum(record)
+    return record
+
+
+@dataclass(frozen=True)
+class CommittedDelta:
+    txn: str
+    begin_lsn: int
+    write_lsn: int
+    commit_lsn: int
+    changes: list[dict[str, Any]]
+
+
+@dataclass
+class Wal4Analysis:
+    records: list[dict[str, Any]]
+    committed: list[CommittedDelta]
+    max_lsn: int
+    ignored_trailing: bool
+    discarded_uncommitted: int
+    valid_bytes_end: int = 0
+    # Committed transactions whose commit_lsn is at or below the checkpoint LSN:
+    # already included in the root manifest, so replay skips them.
+    already_checkpointed: int = 0
+
+
+@dataclass
+class _DeltaTxnEntry:
+    txn: str
+    begin_lsn: int
+    write_lsn: int | None = None
+    commit_lsn: int | None = None
+    changes: list[dict[str, Any]] | None = None
+    state: str = "begun"  # begun -> written -> committed
+
+
+def parse_wal_v4(
+    wal_path: Path, db_id: str, checkpoint_lsn: int = 0
+) -> Wal4Analysis:
+    """Read and analyze a format-v4 delta WAL.
+
+    Same torn-tail versus mid-log distinction as :func:`parse_wal`: an invalid
+    final record is treated as a crash-torn write, while any invalid record that
+    is followed by more data fails closed. Records that belong to another
+    database are never tolerated, because appending a foreign WAL is not a crash
+    artefact.
+    """
+    from .delta import validate_changes  # local import avoids a module cycle
+
+    if not isinstance(db_id, str) or not db_id:
+        raise StorageError("A format-v4 WAL requires a database identity")
+    if (
+        isinstance(checkpoint_lsn, bool)
+        or not isinstance(checkpoint_lsn, int)
+        or checkpoint_lsn < 0
+    ):
+        raise StorageError("Invalid checkpoint LSN for format-v4 WAL recovery")
+    if wal_path.is_dir():
+        raise StorageError(f"WAL path '{wal_path}' is a directory")
+    try:
+        raw_bytes = wal_path.read_bytes()
+    except OSError as exc:
+        raise StorageError(f"Failed to read WAL file '{wal_path}': {exc}") from exc
+
+    if not raw_bytes:
+        return Wal4Analysis(
+            records=[],
+            committed=[],
+            max_lsn=0,
+            ignored_trailing=False,
+            discarded_uncommitted=0,
+            valid_bytes_end=0,
+        )
+
+    terminated = raw_bytes.endswith(b"\n")
+    segments = raw_bytes.split(b"\n")
+    if terminated and segments and segments[-1] == b"":
+        segments = segments[:-1]
+
+    prev_lsn = 0
+    seen_txns: dict[str, _DeltaTxnEntry] = {}
+    records: list[dict[str, Any]] = []
+    committed: list[CommittedDelta] = []
+    ignored_trailing = False
+    valid_bytes_end = 0
+    offset = 0
+
+    for idx, raw_segment in enumerate(segments):
+        is_last = idx == len(segments) - 1
+        has_newline = not (is_last and not terminated)
+        record_end = offset + len(raw_segment) + (1 if has_newline else 0)
+
+        def handle_invalid(reason: str, *, _is_last: bool = is_last, _idx: int = idx) -> None:
+            nonlocal ignored_trailing
+            if _is_last:
+                ignored_trailing = True
+                return
+            raise StorageError(
+                f"Corrupted WAL record at line {_idx + 1} in '{wal_path}': {reason}"
+            )
+
+        if not has_newline:
+            handle_invalid("incomplete record missing trailing newline")
+            break
+        try:
+            rec = json.loads(
+                raw_segment.decode("utf-8", errors="strict"),
+                parse_constant=_reject_non_finite,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            handle_invalid(f"malformed JSON ({exc})")
+            break
+        if not isinstance(rec, dict):
+            handle_invalid("WAL record must be a JSON object")
+            break
+        if not verify_record_checksum(rec):
+            handle_invalid("checksum verification failed")
+            break
+
+        rec_type = rec.get("type")
+        if not isinstance(rec_type, str) or rec_type not in WAL_RECORD_TYPES:
+            raise StorageError(
+                f"Corrupted WAL record at line {idx + 1} in '{wal_path}': "
+                f"unknown record type {rec_type!r}"
+            )
+        if rec.get("v") != WAL_FORMAT_VERSION:
+            raise StorageError(
+                f"Corrupted WAL record at line {idx + 1} in '{wal_path}': "
+                f"expected format version {WAL_FORMAT_VERSION}, got {rec.get('v')!r}"
+            )
+        if rec.get("db") != db_id:
+            raise StorageError(
+                f"Corrupted WAL record at line {idx + 1} in '{wal_path}': "
+                "record belongs to a different database"
+            )
+        if set(rec.keys()) != _ALLOWED_KEYS_V4[rec_type]:
+            raise StorageError(
+                f"Corrupted WAL record at line {idx + 1} in '{wal_path}': "
+                f"unexpected or missing fields for '{rec_type}' record"
+            )
+
+        lsn = rec.get("lsn")
+        if isinstance(lsn, bool) or not isinstance(lsn, int) or lsn <= 0:
+            raise StorageError(
+                f"Corrupted WAL record at line {idx + 1} in '{wal_path}': invalid LSN"
+            )
+        if lsn <= prev_lsn:
+            raise StorageError(
+                f"Corrupted WAL record at line {idx + 1} in '{wal_path}': "
+                f"non-monotonic LSN {lsn} after {prev_lsn}"
+            )
+        txn = rec.get("txn")
+        if not isinstance(txn, str) or not txn:
+            raise StorageError(
+                f"Corrupted WAL record at line {idx + 1} in '{wal_path}': "
+                "invalid transaction identifier"
+            )
+
+        if rec_type == "begin":
+            if txn in seen_txns:
+                raise StorageError(
+                    f"Corrupted WAL record at line {idx + 1} in '{wal_path}': "
+                    f"duplicate BEGIN for transaction '{txn}'"
+                )
+            seen_txns[txn] = _DeltaTxnEntry(txn=txn, begin_lsn=lsn)
+        elif rec_type == "write":
+            entry = seen_txns.get(txn)
+            if entry is None or entry.state != "begun":
+                raise StorageError(
+                    f"Corrupted WAL record at line {idx + 1} in '{wal_path}': "
+                    f"WRITE without matching active BEGIN for transaction '{txn}'"
+                )
+            try:
+                changes = validate_changes(rec.get("changes"))
+            except StorageError as exc:
+                raise StorageError(
+                    f"Corrupted WAL record at line {idx + 1} in '{wal_path}': {exc}"
+                ) from exc
+            entry.write_lsn = lsn
+            entry.changes = changes
+            entry.state = "written"
+        elif rec_type == "commit":
+            entry = seen_txns.get(txn)
+            if (
+                entry is None
+                or entry.state != "written"
+                or entry.write_lsn is None
+                or entry.changes is None
+            ):
+                raise StorageError(
+                    f"Corrupted WAL record at line {idx + 1} in '{wal_path}': "
+                    f"COMMIT without matching WRITE for transaction '{txn}'"
+                )
+            write_lsn = rec.get("write_lsn")
+            if (
+                isinstance(write_lsn, bool)
+                or not isinstance(write_lsn, int)
+                or write_lsn != entry.write_lsn
+            ):
+                raise StorageError(
+                    f"Corrupted WAL record at line {idx + 1} in '{wal_path}': "
+                    f"COMMIT write_lsn {write_lsn!r} does not match "
+                    f"WRITE LSN {entry.write_lsn}"
+                )
+            entry.commit_lsn = lsn
+            entry.state = "committed"
+            committed.append(
+                CommittedDelta(
+                    txn=txn,
+                    begin_lsn=entry.begin_lsn,
+                    write_lsn=entry.write_lsn,
+                    commit_lsn=lsn,
+                    changes=entry.changes,
+                )
+            )
+        elif rec_type == "checkpoint":
+            commit_lsn = rec.get("commit_lsn")
+            if (
+                isinstance(commit_lsn, bool)
+                or not isinstance(commit_lsn, int)
+                or commit_lsn <= 0
+            ):
+                raise StorageError(
+                    f"Corrupted WAL record at line {idx + 1} in '{wal_path}': "
+                    "invalid commit_lsn in CHECKPOINT record"
+                )
+            known = any(c.commit_lsn == commit_lsn for c in committed)
+            if not known and commit_lsn > checkpoint_lsn:
+                raise StorageError(
+                    f"Corrupted WAL record at line {idx + 1} in '{wal_path}': "
+                    f"CHECKPOINT references unknown or uncommitted LSN {commit_lsn}"
+                )
+
+        prev_lsn = rec["lsn"]
+        records.append(rec)
+        valid_bytes_end = record_end
+        offset = record_end
+
+    discarded = sum(
+        1 for entry in seen_txns.values() if entry.state != "committed"
+    )
+    already = sum(1 for c in committed if c.commit_lsn <= checkpoint_lsn)
+    return Wal4Analysis(
+        records=records,
+        committed=committed,
+        max_lsn=prev_lsn,
+        ignored_trailing=ignored_trailing,
+        discarded_uncommitted=discarded,
+        valid_bytes_end=valid_bytes_end,
+        already_checkpointed=already,
+    )

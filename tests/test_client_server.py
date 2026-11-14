@@ -633,6 +633,8 @@ def test_token_is_never_written_to_disk_or_logged(tmp_path, caplog, monkeypatch)
 
     assert token not in caplog.text
     for path in tmp_path.iterdir():
+        if not path.is_file():
+            continue
         data = path.read_bytes()
         assert token.encode() not in data, f"token leaked into {path}"
 

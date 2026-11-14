@@ -165,6 +165,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Run in temporary in-memory mode without writing to disk.",
     )
     parser.add_argument(
+        "--migrate",
+        metavar="PATH",
+        help="Convert a format version 1-3 database to format v4 and exit.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"aaysql {__version__}",
@@ -180,6 +185,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    if args.migrate:
+        if args.memory or args.db == ":memory:":
+            print("ERROR: --migrate requires a persistent database path", file=sys.stderr)
+            return 1
+        from .storage import migrate_to_v4
+
+        try:
+            report = migrate_to_v4(args.migrate)
+        except AayushSQLError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(report["message"])
+        return 0
 
     if args.memory or args.db == ":memory:":
         db_path: str | None = None

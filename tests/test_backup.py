@@ -26,8 +26,9 @@ from aaysql.backup import (
     restore_database,
     verify_backup,
 )
+from aaysql import segments
 from aaysql.server import LOCK_SUFFIX, ServerLock
-from aaysql.storage import FORMAT_VERSION
+from aaysql.storage import CURRENT_FORMAT_VERSION
 from aaysql.wal import WalManager
 
 SCHEMA = """
@@ -76,7 +77,7 @@ def test_backup_of_clean_database_preserves_rows_and_indexes(tmp_path: Path):
     manifest = backup_database(db, dest)
 
     assert manifest["backup_format_version"] == BACKUP_FORMAT_VERSION
-    assert manifest["database_format_version"] == FORMAT_VERSION
+    assert manifest["database_format_version"] == CURRENT_FORMAT_VERSION
     assert manifest["tables"] == [{"name": "users", "rows": 3}]
     assert manifest["indexes"] == ["idx_users_name"]
     assert (dest / "database.aaydb").is_file()
@@ -111,13 +112,21 @@ def test_backup_recovers_pending_wal_before_snapshot(tmp_path: Path):
     engine.close()
 
     # Simulate a committed transaction whose checkpoint never completed.
-    payload = json.loads(db.read_text(encoding="utf-8"))
-    payload["tables"]["users"]["rows"].append(
-        {"id": 4, "name": "edsger", "score": 40, "active": True}
-    )
+    manifest = segments.read_manifest(db)
     manager = WalManager(db)
-    manager.last_lsn = payload["wal_lsn"]
-    manager.append_commit_transaction(payload)
+    manager.last_lsn = manifest["checkpoint_lsn"]
+    manager.append_delta_transaction(
+        [
+            {
+                "t": "insert",
+                "table": "users",
+                "rows": [
+                    {"id": 4, "name": "edsger", "score": 40, "active": True}
+                ],
+            }
+        ],
+        db_id=manifest["db_id"],
+    )
     assert Path(f"{db}.wal").stat().st_size > 0
 
     dest = tmp_path / "backup"
@@ -217,7 +226,7 @@ def test_verify_rejects_future_format(tmp_path: Path):
             {
                 "backup_format": "aaysql-backup",
                 "backup_format_version": 1,
-                "database_format_version": FORMAT_VERSION + 1,
+                "database_format_version": CURRENT_FORMAT_VERSION + 1,
                 "database_file": "database.aaydb",
                 "database_sha256": "0" * 64,
                 "database_size": 0,

@@ -143,7 +143,7 @@ def test_save_failure_rolls_back_indexes_with_the_rows(tmp_path: Path, monkeypat
     e = _seed(db_file)
     e.execute("AAYUSH CREATE INDEX idx_users_age ON users (age)")
 
-    def broken_save(_db):
+    def broken_save(_db, _changes=None):
         raise StorageError("disk full")
 
     monkeypatch.setattr(e.storage, "save", broken_save)

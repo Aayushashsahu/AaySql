@@ -2,6 +2,20 @@
 
 All notable changes to AayushSQL are documented in this file.
 
+## [Unreleased] — format v4 (delta WAL + segmented checkpoints)
+
+### Added
+- **Delta WAL (`src/aaysql/wal.py`, `src/aaysql/delta.py`)**: commits append only the changed rows and schema objects (`insert` / `update` / `delete` / DDL) instead of a whole-database image. Framing, checksums, LSNs, the `COMMIT` fsync commit point, torn-tail repair, mid-log corruption failure, and ambiguous-commit handling are preserved. Every record carries the database identity; a foreign `db_id` is rejected.
+- **Segmented checkpoints (`src/aaysql/segments.py`, `src/aaysql/storage.py`)**: the database path is now a root manifest referencing immutable, content-addressed per-table segments in `<db>.seg/`. Checkpoints write only changed tables, reuse unchanged segment bytes, publish the manifest atomically, then append `CHECKPOINT` and truncate the WAL. Unreferenced segments are garbage-collected. Missing, truncated, modified, or path-traversing segment references fail closed.
+- **Format v4 and explicit migration**: new databases are v4; formats v1–v3 remain readable and stay on the v3 backend until `migrate_to_v4()` / `aaysql --migrate PATH` runs under the canonical `DatabaseLease` (backup to `<db>.v3.bak`, segments, publish, verify, cleanup; restore on failure). The operation is idempotent and finishes an interrupted migration.
+- **Backup format v2**: v4 backups record a full file inventory (manifest plus every segment) with per-file size and SHA-256; verification and restore validate it. Restore installs segments first and replaces the root manifest atomically, preserving the previous generation as `<target>.pre-restore-<id>` with its segments.
+- **`Engine.checkpoint()`**, a WAL-size checkpoint threshold (1 MiB default), and recovery checkpoints, all without a background thread or group commit.
+- **Documentation**: [`docs/FORMAT_V4.md`](docs/FORMAT_V4.md) plus updates to [`COMPATIBILITY.md`](COMPATIBILITY.md), [`WAL.md`](WAL.md), [`docs/OPERATIONS.md`](docs/OPERATIONS.md), [`README.md`](README.md), and [`RELEASE_BENCHMARKS.md`](RELEASE_BENCHMARKS.md).
+- **Tests and benchmark**: `test_delta_v4.py`, `test_checkpoints_v4.py`, `test_migration_v4.py`, `test_backup_v4.py`, `test_crash_v4.py` (including real subprocess crash points), and `benchmarks/benchmark_v4.py` (100 / 1k / 10k / 100k rows, commit vs checkpoint vs recovery, bytes written, unchanged tables).
+
+### Notes
+- `.aaydb` format v4 is **not** readable by the v1.0.0 package. Package version remains `1.0.0` and tag `v1.0.0` is unchanged. `Database.clone()` and load remain O(database), so no O(1) claim is made.
+
 ## [1.0.0] — 2026-11-11
 
 ### Added

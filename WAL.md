@@ -1,4 +1,4 @@
-# AayushSQL Write-Ahead Log (WAL) & Crash Recovery Design (v0.6.1)
+# AayushSQL Write-Ahead Log (WAL) & Crash Recovery Design (v0.6.1, format v4 in §12)
 
 This document specifies the Write-Ahead Log (WAL) protocol, durability semantics, checkpoint ordering, format v3 migration, and recovery guarantees implemented in AayushSQL `v0.6.1` (`src/aaysql/wal.py`, `src/aaysql/storage.py`, `src/aaysql/engine.py`). Section 11 describes the v0.6.1 hardening of tail repair, partial appends, and directory fsync error handling.
 
@@ -262,3 +262,65 @@ Run the entire test suite (including all regression tests):
 ```bash
 python -m pytest -v
 ```
+
+## 12. Format v4 Delta WAL
+
+Format v4 replaces the whole-image `WRITE` record with a list of changes. Framing,
+checksums, LSN assignment, append hardening, and the `COMMIT`-fsync durability rule
+are unchanged from Sections 2–5; only the record payload and checkpoint target differ.
+
+### 12.1 Records
+
+A v4 transaction is still `BEGIN`, one `WRITE`, `COMMIT`, all tagged with `"v":4`
+and the database identity `"db": "<32 hex>"`:
+
+```json
+{"checksum":"...","changes":[{"t":"insert","table":"t","rows":[{"id":1}]}],"db":"…","lsn":2,"txn":"txn-…","type":"write","v":4}
+```
+
+`changes` is an ordered list applied exactly once, in order:
+
+| `t` | Payload |
+| --- | --- |
+| `insert` | `table`, `rows` (full post-image row objects, appended in order) |
+| `update` | `table`, `index` (current row position), `row` (full post-image) |
+| `delete` | `table`, `index` (current row position) |
+| `create_table` | `table`, `columns` |
+| `drop_table` | `table` |
+| `create_index` / `drop_index` | `index`, `table`, `column` for create |
+
+Updates and deletes address rows positionally, so replay depends on applying every
+prior change in the same order. Deletes are recorded in descending index order so a
+single statement's positions remain valid as rows are removed. A `CHECKPOINT` record
+then carries `commit_lsn`; it is appended only after the new manifest generation is
+durable and immediately before the WAL is truncated.
+
+### 12.2 Recovery
+
+1. Load the root manifest generation (segments are verified by length and SHA-256).
+2. Parse the WAL in full before applying anything: torn tail is dropped, mid-log
+   corruption fails closed, foreign `db_id` is rejected, and change payloads are
+   validated (`validate_change`).
+3. Apply committed transactions with `commit_lsn > manifest.checkpoint_lsn` in LSN
+   order. Transactions at or below the checkpoint are skipped, which makes replay
+   idempotent after a crash between manifest publication and WAL truncation.
+4. Publish a new manifest generation, append `CHECKPOINT`, truncate the WAL, and
+   collect unreferenced segments.
+
+### 12.3 Crash guarantees
+
+- Crash before `COMMIT` fsync: the transaction is discarded, the manifest and
+  segments are untouched.
+- Crash after `COMMIT` fsync, before or during checkpoint: the delta is replayed on
+  the next open. Segment or manifest publication failing never rolls back the commit.
+- Crash after segment rename or manifest replace: the previous or new complete
+  generation loads; content-addressed segments are never overwritten with different
+  bytes, and temp files are removed on the next load.
+- Crash during WAL truncation: the remaining committed prefix is either skipped as
+  already checkpointed or replayed; rows are never duplicated.
+- Recovery itself crashing after tail repair: the repaired WAL still contains the
+  committed delta, so the next open applies it once.
+
+Coverage lives in `tests/test_delta_v4.py`, `tests/test_checkpoints_v4.py`,
+`tests/test_migration_v4.py`, `tests/test_backup_v4.py`, and
+`tests/test_crash_v4.py`.

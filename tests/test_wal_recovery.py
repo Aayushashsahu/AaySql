@@ -24,6 +24,7 @@ def _run_crash_subprocess(
     target_sql: list[str],
     *,
     timeout: float = 15.0,
+    seed_legacy: bool = True,
 ) -> subprocess.CompletedProcess:
     """Run a child Python process that sets up committed state, arms a crash hook, and executes target_sql."""
     script = """
@@ -48,6 +49,8 @@ for stmt in target_sql:
 
 raise AssertionError(f"Expected process to terminate at crash point {crash_point!r}")
 """
+    if seed_legacy:
+        _seed_legacy_database(db_file)
     env = os.environ.copy()
     env["PYTHONPATH"] = SRC_DIR + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     env.pop("_AAYSQL_TEST_CRASH_POINT", None)
@@ -78,19 +81,47 @@ def _baseline_setup() -> list[str]:
     ]
 
 
+def _seed_legacy_database(db_file: Path) -> None:
+    """Create an empty version-3 database when the path is new.
+
+    These tests exercise the legacy whole-image WAL; seeding a v3 snapshot keeps
+    them on the version-3 backend because new databases are format v4.
+    """
+    if db_file.exists():
+        return
+    db_file.write_text(
+        json.dumps(
+            {
+                "format": "aaysql",
+                "format_version": FORMAT_VERSION,
+                "engine_version": ENGINE_VERSION,
+                "wal_lsn": 0,
+                "tables": {},
+                "indexes": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _open(db_file: Path) -> Engine:
+    _seed_legacy_database(db_file)
+    return Engine(db_file)
+
+
 def _rows(engine: Engine) -> list[dict]:
     return engine.execute("AAYUSH SELECT id, owner, balance FROM accounts ORDER BY id ASC")["rows"]
 
 
 def _verify_reopen_idempotency(db_file: Path, expected_rows: list[dict]) -> None:
     """Open, verify state, close, reopen, and verify identical state again."""
-    with Engine(db_file) as e1:
+    with _open(db_file) as e1:
         assert _rows(e1) == expected_rows
         assert "idx_accounts_owner" in e1.db.indexes
         e1.db.indexes["idx_accounts_owner"].validate()
 
     # Second reopen after recovery must produce identical state and clean directory.
-    with Engine(db_file) as e2:
+    with _open(db_file) as e2:
         assert _rows(e2) == expected_rows
         assert "idx_accounts_owner" in e2.db.indexes
         e2.db.indexes["idx_accounts_owner"].validate()
@@ -172,22 +203,27 @@ def test_subprocess_crash_after_commit_recovers_transaction(tmp_path: Path, cras
     assert leftovers == [db_file.name]
 
 
-def test_subprocess_crash_on_brand_new_database_before_first_snapshot(tmp_path: Path):
+def test_subprocess_crash_on_brand_new_v4_database_keeps_committed_schema(
+    tmp_path: Path,
+):
+    """A crash after the COMMIT fsync on a brand-new v4 database keeps the commit."""
     db_file = tmp_path / "brand_new.aaydb"
     proc = _run_crash_subprocess(
         db_file,
         "after_commit_fsync",
         [],
         ["AAYUSH CREATE TABLE items (id INT PRIMARY KEY, label TEXT NOT NULL)"],
+        seed_legacy=False,
     )
     assert proc.returncode == CRASH_EXIT_CODE, proc.stderr
-    assert not db_file.exists()
+    # Format v4 publishes its root manifest when the database is opened.
+    assert db_file.exists()
     assert Path(f"{db_file}.wal").exists()
 
-    with Engine(db_file) as reopened:
+    with _open(db_file) as reopened:
         assert "items" in reopened.db.tables
         reopened.execute("AAYUSH INSERT INTO items VALUES (1, 'Pen')")
-    with Engine(db_file) as reopened_again:
+    with _open(db_file) as reopened_again:
         assert reopened_again.execute("AAYUSH SELECT * FROM items")["rows"] == [
             {"id": 1, "label": "Pen"}
         ]
@@ -220,7 +256,7 @@ def test_subprocess_crash_autocommit_and_ddl_inside_transaction(tmp_path: Path):
     )
     assert proc2.returncode == CRASH_EXIT_CODE
 
-    with Engine(db_file) as e:
+    with _open(db_file) as e:
         assert _rows(e) == [
             {"id": 1, "owner": "Aayush", "balance": 1000},
             {"id": 3, "owner": "Neha", "balance": 750},
@@ -242,7 +278,7 @@ def test_subprocess_crash_autocommit_and_ddl_inside_transaction(tmp_path: Path):
 def test_trailing_partial_and_checksum_corrupt_records_are_safely_ignored(tmp_path: Path):
     # Case A: trailing partial JSON record after valid committed txn
     db_partial = tmp_path / "partial.aaydb"
-    with Engine(db_partial) as e:
+    with _open(db_partial) as e:
         for s in _baseline_setup():
             e.execute(s)
 
@@ -265,7 +301,7 @@ def test_trailing_partial_and_checksum_corrupt_records_are_safely_ignored(tmp_pa
 
     # Case B: trailing checksum-corrupt record (valid JSON, wrong checksum) after committed txn
     db_bad_sum = tmp_path / "bad_checksum.aaydb"
-    with Engine(db_bad_sum) as e:
+    with _open(db_bad_sum) as e:
         for s in _baseline_setup():
             e.execute(s)
 
@@ -290,7 +326,7 @@ def test_trailing_partial_and_checksum_corrupt_records_are_safely_ignored(tmp_pa
 
 def test_corrupt_record_before_later_valid_record_stops_and_never_skips_forward(tmp_path: Path):
     db_file = tmp_path / "mid_corrupt.aaydb"
-    with Engine(db_file) as e:
+    with _open(db_file) as e:
         for s in _baseline_setup():
             e.execute(s)
 
@@ -331,7 +367,7 @@ def test_corrupt_record_before_later_valid_record_stops_and_never_skips_forward(
     # Opening the database must stop at the corrupt record, raise StorageError,
     # and never apply the later transaction or overwrite the snapshot.
     with pytest.raises(StorageError, match="Corrupted WAL record"):
-        Engine(db_file)
+        _open(db_file)
     assert db_file.read_bytes() == base_snapshot_bytes
 
 
@@ -359,7 +395,7 @@ def test_wal_rejects_non_monotonic_lsn_and_mismatched_txn_records(tmp_path: Path
 
 def test_multiple_committed_txns_and_trailing_uncommitted_in_one_wal(tmp_path: Path):
     db_file = tmp_path / "multi_wal.aaydb"
-    with Engine(db_file) as e:
+    with _open(db_file) as e:
         for s in _baseline_setup():
             e.execute(s)
 
@@ -394,7 +430,7 @@ def test_multiple_committed_txns_and_trailing_uncommitted_in_one_wal(tmp_path: P
 
 def test_recovery_idempotency_on_identical_pre_recovery_state(tmp_path: Path):
     db_file = tmp_path / "idempotent.aaydb"
-    with Engine(db_file) as e:
+    with _open(db_file) as e:
         for s in _baseline_setup():
             e.execute(s)
 
@@ -405,14 +441,14 @@ def test_recovery_idempotency_on_identical_pre_recovery_state(tmp_path: Path):
     # Also simulate checkpoint already written to .aaydb, WAL not truncated yet
     saved_wal = storage.wal.wal_path.read_bytes()
 
-    with Engine(db_file) as r1:
+    with _open(db_file) as r1:
         rows1 = _rows(r1)
         lsn1 = r1.db.wal_lsn
         assert lsn1 == commit_lsn
 
     # Restore identical WAL on top of already-checkpointed snapshot -> must NOT replay or duplicate
     storage.wal.wal_path.write_bytes(saved_wal)
-    with Engine(db_file) as r2:
+    with _open(db_file) as r2:
         assert _rows(r2) == rows1
         assert r2.db.wal_lsn == lsn1
 
@@ -424,7 +460,7 @@ def test_checkpoint_failure_after_durable_commit_keeps_commit_and_preserves_wal(
     tmp_path: Path, monkeypatch
 ):
     db_file = tmp_path / "ckpt_fail.aaydb"
-    engine = Engine(db_file)
+    engine = _open(db_file)
     for s in _baseline_setup():
         engine.execute(s)
 
@@ -460,7 +496,7 @@ def test_ambiguous_commit_fsync_failure_blocks_writes_and_requires_reopen(
     tmp_path: Path, monkeypatch
 ):
     db_file = tmp_path / "ambiguous.aaydb"
-    engine = Engine(db_file)
+    engine = _open(db_file)
     for s in _baseline_setup():
         engine.execute(s)
 
@@ -488,14 +524,14 @@ def test_ambiguous_commit_fsync_failure_blocks_writes_and_requires_reopen(
     engine.close()
 
     # Reopening resolves the WAL deterministically (records were flushed before fsync failed).
-    with Engine(db_file) as reopened:
+    with _open(db_file) as reopened:
         rows = _rows(reopened)
         assert len(rows) in (2, 3)
 
 
 def test_multi_row_updates_deletes_and_rollback_with_indexes(tmp_path: Path):
     db_file = tmp_path / "multi_ops.aaydb"
-    with Engine(db_file) as e:
+    with _open(db_file) as e:
         for s in _baseline_setup():
             e.execute(s)
         e.execute("AAYUSH INSERT INTO accounts VALUES (3, 'Alex', 300), (4, 'Neha', 200)")
@@ -514,7 +550,7 @@ def test_multi_row_updates_deletes_and_rollback_with_indexes(tmp_path: Path):
             e.execute("AAYUSH UPDATE accounts SET id = 1")
         e.execute("AAYUSH COMMIT")
 
-    with Engine(db_file) as reopened:
+    with _open(db_file) as reopened:
         assert reopened.execute(
             "AAYUSH SELECT id, balance FROM accounts WHERE owner = 'Alex' ORDER BY id ASC"
         )["rows"] == [{"id": 2, "balance": 999}, {"id": 3, "balance": 999}]
@@ -560,13 +596,13 @@ def test_v1_and_v2_migrations_preserve_data_on_write_and_never_overwrite_on_read
     v1_raw = json.dumps(v1_payload)
     v1_file.write_text(v1_raw, encoding="utf-8")
 
-    with Engine(v1_file) as e1:
+    with _open(v1_file) as e1:
         assert e1.db.wal_lsn == 0
         assert e1.execute("AAYUSH SELECT * FROM users")["rows"] == [{"id": 1, "name": "Aayush"}]
     # Read-only open/SELECT must not modify legacy v1 file.
     assert v1_file.read_text(encoding="utf-8") == v1_raw
 
-    with Engine(v1_file) as e1_write:
+    with _open(v1_file) as e1_write:
         e1_write.execute("AAYUSH INSERT INTO users VALUES (2, 'Alex')")
     migrated_v1 = json.loads(v1_file.read_text(encoding="utf-8"))
     assert migrated_v1["format_version"] == FORMAT_VERSION == 3
@@ -585,19 +621,19 @@ def test_v1_and_v2_migrations_preserve_data_on_write_and_never_overwrite_on_read
     v2_raw = json.dumps(v2_payload)
     v2_file.write_text(v2_raw, encoding="utf-8")
 
-    with Engine(v2_file) as e2:
+    with _open(v2_file) as e2:
         assert e2.db.wal_lsn == 0
         assert e2.execute("AAYUSH SELECT id FROM users WHERE name = 'Aayush'")["rows"] == [{"id": 1}]
     assert v2_file.read_text(encoding="utf-8") == v2_raw
 
-    with Engine(v2_file) as e2_write:
+    with _open(v2_file) as e2_write:
         e2_write.execute("AAYUSH INSERT INTO users VALUES (2, 'Alex')")
     migrated_v2 = json.loads(v2_file.read_text(encoding="utf-8"))
     assert migrated_v2["format_version"] == 3
     assert migrated_v2["indexes"] == {"idx_users_name": {"table": "users", "column": "name"}}
     assert migrated_v2["wal_lsn"] > 0
 
-    with Engine(v2_file) as e2_verify:
+    with _open(v2_file) as e2_verify:
         assert e2_verify.execute("AAYUSH SELECT id FROM users WHERE name = 'Alex'")["rows"] == [{"id": 2}]
 
 
@@ -619,7 +655,7 @@ def test_v3_requires_valid_wal_lsn():
 
 def test_failed_commit_before_durable_wal_commit_restores_state(tmp_path: Path, monkeypatch):
     db_file = tmp_path / "pre_commit_fail.aaydb"
-    engine = Engine(db_file)
+    engine = _open(db_file)
     for s in _baseline_setup():
         engine.execute(s)
 
@@ -640,7 +676,7 @@ def test_failed_commit_before_durable_wal_commit_restores_state(tmp_path: Path, 
     ]
     engine.close()
 
-    with Engine(db_file) as reopened:
+    with _open(db_file) as reopened:
         assert len(_rows(reopened)) == 2
 
 
@@ -658,7 +694,7 @@ def test_subprocess_crash_index_create_before_commit_and_drop_ddl_after_commit(t
         ],
     )
     assert proc1.returncode == CRASH_EXIT_CODE
-    with Engine(db_file) as e1:
+    with _open(db_file) as e1:
         assert "idx_accounts_balance" not in e1.db.indexes
         assert "idx_accounts_owner" in e1.db.indexes
 
@@ -686,7 +722,7 @@ def test_subprocess_crash_index_create_before_commit_and_drop_ddl_after_commit(t
     )
     assert proc3.returncode == CRASH_EXIT_CODE
 
-    with Engine(db_file) as e2:
+    with _open(db_file) as e2:
         assert _rows(e2) == [{"id": 1, "owner": "Aayush", "balance": 1234}]
         assert "idx_accounts_owner" not in e2.db.indexes
 

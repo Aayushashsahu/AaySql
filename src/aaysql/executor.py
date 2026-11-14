@@ -14,8 +14,16 @@ from .storage import Database, coerce_value
 
 
 class Executor:
-    def __init__(self, db: Database | None = None):
+    def __init__(self, db: Database | None = None, recorder=None):
         self.db = db or Database()
+        # Optional MutationRecorder; when present every storage-level mutation is
+        # appended to it so the engine can write a delta WAL transaction without
+        # diffing the database.
+        self.recorder = recorder
+
+    def _record_ddl(self, method, *args) -> None:
+        if self.recorder is not None:
+            getattr(self.recorder, method)(*args)
 
     def execute(self, stmt):
         if isinstance(stmt, CreateTable):
@@ -40,14 +48,17 @@ class Executor:
 
     def create_table(self, s):
         self.db.create_table(s.name, s.columns)
+        self._record_ddl("record_create_table", self.db.tables[s.name])
         return {"status": "ok", "message": f"Table '{s.name}' created"}
 
     def drop_table(self, s):
         self.db.drop_table(s.name)
+        self._record_ddl("record_drop_table", s.name)
         return {"status": "ok", "message": f"Table '{s.name}' dropped"}
 
     def create_index(self, s):
         self.db.create_index(s.name, s.table, s.column)
+        self._record_ddl("record_create_index", s.name, s.table, s.column)
         return {
             "status": "ok",
             "message": f"Index '{s.name}' created on {s.table}({s.column})",
@@ -55,6 +66,7 @@ class Executor:
 
     def drop_index(self, s):
         self.db.drop_index(s.name)
+        self._record_ddl("record_drop_index", s.name)
         return {"status": "ok", "message": f"Index '{s.name}' dropped"}
 
     def explain(self, s):
@@ -125,6 +137,7 @@ class Executor:
         for index in self.db.indexes_on(table.name):
             for row in new_rows:
                 index.add(row)
+        self._record_ddl("record_insert", table.name, new_rows)
         return {"status": "ok", "rows_affected": len(new_rows)}
 
     def _value(self, expr, row, table=None):
@@ -172,6 +185,7 @@ class Executor:
         for _, new in staged:
             self._check_constraints(table, new, rows=post_rows, ignore_row=new)
         indexes = self.db.indexes_on(table.name)
+        positions = {id(row): pos for pos, row in enumerate(table.rows)}
         previous_keys = [
             {index.name: old[index.column] for index in indexes} for old, _ in staged
         ]
@@ -179,6 +193,11 @@ class Executor:
             old.update(new)
         if staged:
             table.touch()
+            if self.recorder is not None:
+                for old, _ in staged:
+                    self._record_ddl(
+                        "record_update", table.name, positions[id(old)], old
+                    )
         for (old, _), previous in zip(staged, previous_keys):
             for index in indexes:
                 index.remove(old, key=previous[index.name], forget=False)
@@ -193,7 +212,13 @@ class Executor:
             for row in doomed:
                 index.remove(row)
         before = len(table.rows)
+        positions = {id(row): pos for pos, row in enumerate(table.rows)}
         table.rows[:] = [row for row in table.rows if id(row) not in targets]
         if len(table.rows) != before:
             table.touch()
+            if self.recorder is not None:
+                doomed_positions = [
+                    positions[id(row)] for row in doomed if id(row) in positions
+                ]
+                self._record_ddl("record_delete", table.name, doomed_positions)
         return {"status": "ok", "rows_affected": before - len(table.rows)}

@@ -65,11 +65,13 @@ The database lock is released when the process exits, including on a crash.
 
 | File | Meaning |
 | --- | --- |
-| `app.aaydb` | The committed snapshot (UTF-8 JSON, format 3). |
-| `app.aaydb.wal` | Present only while a commit is durable but not yet checkpointed. An empty WAL is removed on a clean close. |
+| `app.aaydb` | Root manifest (UTF-8 JSON, format 4) describing the committed generation: table segments, index definitions, and `checkpoint_lsn`. |
+| `app.aaydb.seg/` | Immutable, content-addressed table segments (`seg_<digest>.seg`). Never edit by hand; unreferenced files are collected at checkpoint. |
+| `app.aaydb.wal` | Delta write-ahead log (format-4 records with `changes`). Present only while a commit is durable but not yet checkpointed. An empty WAL is removed on a clean close. |
 | `app.aaydb.server.lock` | OS-held lock; content is the owner PID for diagnostics only. Never delete it to "fix" a busy database. |
-| `.<db>.<random>.tmp` | Snapshot staging file. Leftovers from a crash are removed on the next successful load. |
-| `app.aaydb.pre-restore-<id>` | The database that a `restore --force` replaced. Delete it once you are satisfied with the restore. |
+| `.<db>.manifest.*.tmp`, `.<db>.seg/.*.tmp` | Manifest and segment staging files. Leftovers from a crash are removed on the next successful load or checkpoint. |
+| `app.aaydb.pre-restore-<id>` | The database that a `restore --force` replaced, with its segments copied into `<previous>.seg/`. Delete it once you are satisfied with the restore. |
+| `app.aaydb.v3.bak` | Temporary copy kept during a v3→v4 migration. Removed after verification; seeing it means an interrupted migration that a later `--migrate` finishes. |
 
 ## 4. Logs
 
@@ -99,16 +101,27 @@ failure is logged server-side with a traceback and the client receives
 
 ## 5. WAL recovery
 
-Recovery is automatic on open. The snapshot is loaded, WAL records newer than its
+Recovery is automatic on open.
+
+**Format v4 (current).** The root manifest generation is loaded, then committed
+delta transactions in the WAL with `commit_lsn > manifest.checkpoint_lsn` are
+applied in order. The delta list is validated before any change is applied, so a
+structurally invalid transaction is rejected whole. Recovery then publishes a new
+manifest generation, appends a `CHECKPOINT` record, and truncates the WAL.
+
+**Format v3 and earlier.** The snapshot is loaded, WAL records newer than its
 `wal_lsn` are validated, the newest committed image is installed, and a checkpoint
 rewrites the snapshot atomically before truncating the WAL.
 
 What recovery handles without intervention:
 
-- Torn or checksum-corrupt **trailing** record: dropped, then checkpointed.
+- Torn or checksum-corrupt **trailing** record: the tail is dropped and repaired,
+  then the committed prefix is checkpointed.
 - A crash before `COMMIT`: the transaction is discarded.
 - A crash after the `COMMIT` record was fsynced: the transaction is replayed.
-- Repeated recovery: reopening again is a no-op.
+- A crash during checkpoint publication: the previous complete manifest and
+  generations remain loadable; the WAL still holds the committed delta.
+- Repeated recovery: reopening again is a no-op, and replay is idempotent.
 
 What it refuses (and why that is correct):
 
@@ -116,6 +129,10 @@ What it refuses (and why that is correct):
   instead of silently skipping forward. Restore from a backup; do not edit the WAL.
 - A duplicate `BEGIN`, non-monotonic LSN, mismatched `write_lsn`, or a `CHECKPOINT`
   pointing at an unknown commit. The log is structurally invalid.
+- A WAL written by a different database identity (`db_id`), or a delta that
+  addresses a missing table or an out-of-range row position. Loading fails closed.
+- A missing or modified segment referenced by the manifest. Loading fails; restore
+  from a verified backup rather than adding or editing segment files.
 
 ## 6. Ambiguous COMMIT
 
@@ -166,13 +183,19 @@ Behavior worth knowing:
 - Before reading, backup opens the database once so any pending WAL is applied. The
   backup therefore contains the last durably committed state, not a torn snapshot.
 - An existing backup directory is never replaced without `--force`.
-- Restore verifies the manifest and the SHA-256 of the database file, checks that the
-  format is not newer than this release, and opens the candidate copy before touching
-  the target.
+- A format-v4 backup records a file inventory: the root manifest plus every
+  referenced segment, each with its size and SHA-256. Verification re-hashes the
+  inventory and opens a staged copy. A missing or modified segment fails the backup.
+- Restore verifies the manifest and the SHA-256 of every inventory file, checks that
+  the format is not newer than this release, and opens the candidate copy before
+  touching the target.
 - Restore refuses an existing target without `--force`, refuses a target owned by a
   server, and refuses a target that still has a non-empty WAL (recover it first).
+- A v4 restore installs segments first and replaces the root manifest atomically, so
+  the target is always either the previous generation or the restored one.
 - With `--force` the previous database is moved to
-  `<target>.pre-restore-<uuid>` and kept until the restored copy opens successfully.
+  `<target>.pre-restore-<uuid>` with its segments copied into `<previous>.seg/`, so
+  the old generation stays independently openable.
 - The source database and WAL are only ever read.
 
 Suggested routine: back up daily while the server is stopped, verify immediately,
@@ -181,13 +204,21 @@ monthly.
 
 ## 9. Disk space
 
-- A snapshot is rewritten in full on every commit. You need free space of roughly
-  the database size during a commit (temporary file) plus the WAL image, which is a
-  full copy of the database per un-checkpointed transaction.
+- **Format v4.** A commit appends only the rows it changed to the WAL. A checkpoint
+  writes a new segment for each table whose content changed and reuses the existing
+  segment bytes for unchanged tables, then publishes a small manifest. You need free
+  space for the changed table's segment plus the WAL while it is pending, not a full
+  copy of the database per commit. Old segments are collected at checkpoint, so the
+  steady state is roughly the live data plus at most one pending WAL threshold
+  (default 1 MiB).
+- **Format v3.** A snapshot is rewritten in full on every commit. You need free space
+  of roughly the database size during a commit (temporary file) plus the WAL image,
+  which is a full copy of the database per un-checkpointed transaction.
 - A long explicit transaction does **not** accumulate WAL records; only `COMMIT`
   writes. But a failed checkpoint leaves the WAL in place until the next open.
 - If a commit fails with `StorageError` mentioning the database file or `ENOSPC`,
-  free space and retry the statement; the previous state remains durable.
+  free space and retry the statement; the previous state remains durable. If only the
+  checkpoint failed, the commit is already in the WAL and recovery applies it.
 - A `RECOVERY_REQUIRED` state does not grow the WAL; further statements are rejected
   before touching storage.
 
