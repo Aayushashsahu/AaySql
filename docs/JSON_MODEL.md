@@ -59,18 +59,23 @@ Supported JSON value constructs:
 - **Maximum key length**: 1,024 bytes.
 - **Maximum path segments**: 32 segments.
 
-### 2.5 Canonical Serialization
-All stored and hashed JSON bytes follow canonical serialization:
-- Encoding: UTF-8.
-- Sorting: Object keys sorted lexicographically by Unicode code point.
-- Compact separators: `(",", ":")` with no insignificant whitespace.
-- Finite values only (`allow_nan=False`).
+### 2.5 Storage Boundary Encoding & Serialization
+Standard JSON representations cannot distinguish a relational SQL NULL (`null`) from a top-level JSON null (`null`). AayushSQL resolves this unambiguously at the storage boundary without requiring format version bumps or magic wrapper fields:
+- **Relational SQL NULL**: For a `JSON` column, SQL NULL is stored as `None` (standard JSON `null` at rest).
+- **JSON Values**: Every valid JSON value in a `JSON` column (including top-level `JSON_NULL`, JSON numbers, booleans, strings, arrays, and objects) is canonicalized to compact UTF-8 JSON text upon serialization:
+  - Top-level `JSON_NULL` -> `"null"`
+  - JSON string `"null"` -> `"\"null\""`
+  - JSON number `42` -> `"42"`
+  - JSON object `{"a": 1}` -> `"{\"a\":1}"`
+- **Reconstitution**: During row coercion (`coerce_value`), `None` is preserved as SQL NULL, while string payloads in `JSON` columns are parsed via `parse_json_document`, perfectly restoring native Python structures and distinguishing `JSON_NULL` from string `"null"` and SQL NULL.
+- **Sentinel Discipline**: The internal `ABSENT` sentinel cannot be serialized and is rejected with `ConstraintError` if presented to table insertion, updates, or WAL recording.
+- **Scalar Table Isolation**: Relational scalar columns (`INT`, `FLOAT`, `TEXT`, `BOOL`) strictly accept only scalar types and reject `dict` or `list` payloads.
 
 ---
 
 ## 3. SQL Interface and Syntax
 
-### 3.1 DDL
+### 3.1 DDL and Collections
 Columns can be declared with data type `JSON` or `DOCUMENT`:
 ```sql
 AAYUSH CREATE TABLE users (
@@ -84,18 +89,28 @@ Collections are created with:
 ```sql
 AAYUSH CREATE COLLECTION events;
 ```
-This compiles to a table with columns: `_id TEXT PRIMARY KEY`, `_rev INT`, and `body JSON`.
+This compiles to a relational table with strict nullability constraints:
+- `_id TEXT PRIMARY KEY NOT NULL`
+- `_rev INT NOT NULL`
+- `body JSON NOT NULL`
 
-### 3.2 Path Navigation
+Inserting an explicit SQL NULL (`None`) into `_id`, `_rev`, or `body` raises a `ConstraintError`. However, inserting a top-level JSON null (`JSON_NULL` or string `'null'`) into `body` is permitted because JSON null is a valid document value and satisfies the relational `NOT NULL` constraint.
+
+### 3.2 Path Navigation and Query Functions
 Path access expressions support dot navigation and bracket indexing:
 - Dot notation: `profile.preferences.theme`
 - Bracket indexing: `profile.tags[0]`
-- Path function: `JSON_EXTRACT(profile, '$.preferences.theme')` or `JSON_VALUE(profile, '$.preferences.theme')`
-- Path existence: `JSON_EXISTS(profile, '$.preferences.theme')`
 
-When a path is absent or points to a non-existent index:
-- Navigation yields `ABSENT`.
-- In arithmetic or comparisons, `ABSENT` propagates as SQL NULL (`UNKNOWN`), preventing query crashes.
+AayushSQL provides three dedicated SQL functions with distinct semantics:
+1. `JSON_EXTRACT(doc, path)`: Extracts the document or value at the specified path.
+   - If the path exists and holds an explicit JSON null, it preserves and returns `JSON_NULL` (matching `IS JSON NULL`).
+   - If the path is absent, it returns SQL NULL (`None`).
+2. `JSON_VALUE(doc, path)`: Extracts an SQL scalar value at the specified path.
+   - If the path points to an atomic scalar (`str`, `int`, `float`, `bool`), it returns the scalar.
+   - If the path is absent, points to an explicit JSON null, or points to a complex structure (`dict`, `list`), it returns SQL NULL (`None`).
+3. `JSON_EXISTS(doc, path)`: Tests whether a path exists in the document.
+   - Returns boolean `TRUE` if the path exists (even if its value is `JSON_NULL`).
+   - Returns boolean `FALSE` if the path is `ABSENT`.
 
 ### 3.3 Document Mutations
 Nested document updates use `JSON_SET` and `JSON_REMOVE`:
@@ -110,18 +125,30 @@ SET profile = JSON_REMOVE(profile, '$.preferences.notifications')
 WHERE id = 1;
 ```
 
+#### Mutation Semantics and Copy-on-Write
+Point mutations via `JSON_SET` and `JSON_REMOVE` perform semantic field-level updates on documents. Rather than raw byte patching, the engine performs an in-memory deep copy of the document, applies the mutation along the parsed path, validates resource constraints (depth, size, keys), and writes the complete row post-image into the Delta WAL.
+
+#### Memory Ownership Boundaries
+To ensure transaction isolation and prevent external memory corruption:
+- Values passed into `INSERT` and `UPDATE` statements are deep-copied into the database row storage. Mutating the input Python object after execution has no effect on the stored row.
+- Results returned from `SELECT` queries are deep-copied prior to delivery. Callers modifying dictionaries or lists received from query results cannot corrupt the database's internal row cache or published snapshots.
+
 ---
 
-## 4. Durability, Undo, and Storage Integration
+## 4. Durability, Backup, and Storage Integration
 
 1. **Storage (Format v4)**:
-   - Root manifest and immutable table segments in `<db>.seg/` serialize JSON values natively through `canonical_json_bytes`.
+   - Root manifest and immutable table segments in `<db>.seg/` serialize JSON values through schema-aware canonical text encoding.
    - Existing format v3 and v4 databases remain fully compatible.
 2. **Delta WAL**:
-   - Delta mutation records (`insert`, `update`) store deep-copied rows containing JSON objects and arrays.
-   - Replay applies `coerce_value` on JSON columns, ensuring verified document reconstruction on recovery.
+   - Delta mutation records (`insert`, `update`) persist serialized JSON values, converting `JSON_NULL` to canonical `"null"` while preserving SQL NULL.
+   - Recovery re-materializes rows through `coerce_value`, guaranteeing round-trip fidelity across crashes.
 3. **In-Memory Undo Journal**:
    - `UpdateUndo` captures deep-copied before-images of rows, guaranteeing that rolled back transactions restore pristine nested structures without side effects.
 4. **MVCC Snapshots**:
    - Published roots are immutable. Writers use isolated copy-on-write workspaces.
    - Read queries return deep-copied document values, preventing external Python mutation from corrupting database roots.
+5. **Offline Backup and Restore**:
+   - Databases containing JSON columns and collections are fully supported by `backup_database`, `verify_backup`, and `restore_database`.
+   - Backup manifests record cryptographic SHA-256 hashes for all database files and segment directories; corruptions or tampering are detected fail-closed.
+

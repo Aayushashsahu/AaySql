@@ -18,6 +18,7 @@ from typing import Any
 
 from .ast import AggregateCall, Identifier, Select
 from .errors import ExecutionError
+from .json_value import deep_copy_json
 from .planner import PlanNode, QueryPlan, plan_select
 from .query import (
     SourceBinding,
@@ -582,7 +583,7 @@ def execute_select(
             limit_node.actual.update(rows_in=rows_before_limit, rows_out=len(records))
             state["lines"].append(f"LIMIT: rows_in={rows_before_limit} rows_out={len(records)}")
 
-    data = [out_row for out_row, _, _ in records]
+    data = [deep_copy_json(out_row) for out_row, _, _ in records]
     result: dict[str, Any] = {
         "status": "ok",
         "columns": cols,

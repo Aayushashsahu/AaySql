@@ -38,9 +38,9 @@ Everything behind the parser — relational joins, column resolution, grouping, 
   - Path navigation: dot notation (`col.field.subfield`) and bracket array indexing (`col.items[0]`) seamlessly usable across projections, `WHERE`, `ORDER BY`, `GROUP BY`, and `HAVING`.
   - Built-in JSON functions: `JSON_EXTRACT(doc, path)`, `JSON_VALUE(doc, path)`, `JSON_EXISTS(doc, path)`, `JSON_SET(doc, path, val)`, and `JSON_REMOVE(doc, path)`.
   - Point mutations: `UPDATE ... SET col.path = value` with deep copy-on-write, preserving untouched fields and recording granular rollback images in the in-memory undo journal.
-  - Collections: `CREATE COLLECTION <name>` creates an optimized document collection table (`id INT PRIMARY KEY, doc JSON NOT NULL`).
-  - Three-state null predicates: `IS NULL` (matches SQL NULL, JSON NULL, and ABSENT), `IS MISSING` (matches only missing properties/ABSENT), and `IS JSON NULL` (matches only explicit `{"key": null}`).
-  - Full transactional durability: integrated into Delta WAL format v4, crash recovery, undo rollback, and MVCC snapshot readers.
+  - Collections: `CREATE COLLECTION <name>` creates an optimized document collection table (`_id TEXT PRIMARY KEY NOT NULL, _rev INT NOT NULL, body JSON NOT NULL`).
+  - Three-state null predicates: `IS NULL` (matches SQL NULL, JSON NULL, and ABSENT), `IS MISSING` (matches only missing properties/ABSENT), and `IS JSON NULL` (matches only explicit `{"key": null}`). Top-level JSON null (`JSON_NULL`) is durably distinct from relational SQL NULL (`None`) across tables, segments, and Delta WAL without requiring format version bumps.
+  - Full transactional durability: integrated into Delta WAL format v4, crash recovery, undo rollback, MVCC snapshot readers, and offline backup/restore.
 - **SQL expression language** (`src/aaysql/expressions.py`, `src/aaysql/parser.py`):
   - One precedence-climbing parser for the whole expression grammar (`OR` < `AND` < `NOT` < comparisons/predicates < `+ -` < `* / %` < unary sign < primary), with parentheses overriding it. Numbers are lexed unsigned so subtraction and unary negation are unambiguous (`1-2` and `1 - 2` both mean minus).
   - One canonical evaluator used by every execution path (reference/embedded and plan-driven), with a shared AST traversal (`iter_expr_children`/`walk_expr`) that all validation, aggregate detection, grouped-expression checks, predicate placement, and EXPLAIN rendering go through — a new node type cannot silently bypass a rule.

@@ -201,12 +201,13 @@ AayushSQL treats structured documents as native values rather than opaque string
   - `IS MISSING` / `IS NOT MISSING`: Evaluates to TRUE only when a JSON path does not exist (ABSENT).
   - `IS JSON NULL` / `IS NOT JSON NULL`: Evaluates to TRUE only when the value exists and is an explicit JSON null.
 - **Built-in Functions**:
-  - `JSON_EXTRACT(doc, path)`: Extracts value at JSON path (e.g. `'$.address.city'`).
-  - `JSON_VALUE(doc, path)`: Scalar extraction equivalent.
-  - `JSON_EXISTS(doc, path)`: Returns TRUE if path exists and is not ABSENT.
+  - `JSON_EXTRACT(doc, path)`: Extracts value at JSON path (e.g. `'$.address.city'`). Returns explicit `JSON_NULL` if path exists with null, and SQL NULL (`None`) if absent.
+  - `JSON_VALUE(doc, path)`: Scalar extraction equivalent. Returns scalar value; returns SQL NULL (`None`) if absent, `JSON_NULL`, or non-scalar (`dict`/`list`).
+  - `JSON_EXISTS(doc, path)`: Returns TRUE if path exists and is not ABSENT (including if value is `JSON_NULL`).
   - `JSON_SET(doc, path, val)`: Returns copy-on-write document with path set to val.
   - `JSON_REMOVE(doc, path)`: Returns copy-on-write document with path removed.
-- **Collections**: `AAYUSH CREATE COLLECTION <name>;` compiles to a relational table with `_id TEXT PRIMARY KEY, _rev INT, body JSON`.
+- **Collections**: `AAYUSH CREATE COLLECTION <name>;` compiles to a relational table with `_id TEXT PRIMARY KEY NOT NULL, _rev INT NOT NULL, body JSON NOT NULL`. Inserting an explicit SQL NULL into any collection column raises `ConstraintError`; top-level JSON null (`JSON_NULL`) is accepted in `body`.
+- **Memory Ownership**: Mutation inputs and `SELECT` query results are deep-copied to eliminate reference aliasing between callers and database rows.
 
 ## 6. Expression Contexts
 

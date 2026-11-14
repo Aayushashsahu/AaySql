@@ -268,11 +268,7 @@ def iter_expr_children(expr: Any) -> Iterator[Any]:
         yield expr.expr
     elif isinstance(expr, AggregateCall):
         yield expr.arg
-    elif isinstance(expr, IsNull):
-        yield expr.expr
-    elif isinstance(expr, IsMissing):
-        yield expr.expr
-    elif isinstance(expr, IsJsonNull):
+    elif isinstance(expr, (IsNull, IsMissing, IsJsonNull)):
         yield expr.expr
     elif isinstance(expr, PathAccess):
         if not isinstance(expr.expr, Identifier):
@@ -537,19 +533,35 @@ def eval_expr(
     if isinstance(expr, FunctionCall):
         func = expr.func.upper()
         args = [eval_expr(a, row_ctx, sources, aggregate_eval) for a in expr.args]
-        if func in {"JSON_EXTRACT", "JSON_VALUE"}:
+        if func == "JSON_EXTRACT":
             if len(args) != 2:
-                raise ExecutionError(f"{func}() requires exactly 2 arguments (doc, path)")
+                raise ExecutionError("JSON_EXTRACT() requires exactly 2 arguments (doc, path)")
             doc, path = args[0], args[1]
-            if doc is None or doc is JSON_NULL or doc is ABSENT:
+            if doc is None or doc is ABSENT:
+                return None
+            if path is None or path is ABSENT:
                 return None
             res = extract_path(doc, parse_json_path(path))
-            return None if (res is ABSENT or res is JSON_NULL) else res
+            return None if res is ABSENT else res
+        if func == "JSON_VALUE":
+            if len(args) != 2:
+                raise ExecutionError("JSON_VALUE() requires exactly 2 arguments (doc, path)")
+            doc, path = args[0], args[1]
+            if doc is None or doc is ABSENT:
+                return None
+            if path is None or path is ABSENT:
+                return None
+            res = extract_path(doc, parse_json_path(path))
+            if res is ABSENT or res is JSON_NULL or isinstance(res, (dict, list)):
+                return None
+            return res
         if func == "JSON_EXISTS":
             if len(args) != 2:
                 raise ExecutionError("JSON_EXISTS() requires exactly 2 arguments (doc, path)")
             doc, path = args[0], args[1]
-            if doc is None or doc is JSON_NULL or doc is ABSENT:
+            if doc is None or doc is ABSENT:
+                return False
+            if path is None or path is ABSENT:
                 return False
             res = extract_path(doc, parse_json_path(path))
             return res is not ABSENT
@@ -557,11 +569,15 @@ def eval_expr(
             if len(args) != 3:
                 raise ExecutionError("JSON_SET() requires exactly 3 arguments (doc, path, val)")
             doc, path, val = args[0], args[1], args[2]
+            if doc is None or doc is ABSENT:
+                return None
             return set_path(doc, parse_json_path(path), val)
         if func == "JSON_REMOVE":
             if len(args) != 2:
                 raise ExecutionError("JSON_REMOVE() requires exactly 2 arguments (doc, path)")
             doc, path = args[0], args[1]
+            if doc is None or doc is ABSENT:
+                return None
             return remove_path(doc, parse_json_path(path))
         raise ExecutionError(f"Unsupported function '{expr.func}'")
     if isinstance(expr, Like):

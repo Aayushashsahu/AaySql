@@ -25,7 +25,7 @@ Version identifiers for this release:
 | Statement | Supported | Notes |
 | --- | --- | --- |
 | `CREATE TABLE` | Yes | Column-level constraints only; supports `INT`, `TEXT`, `FLOAT`, `BOOL`, `JSON`, `DOCUMENT`. |
-| `CREATE COLLECTION` | Yes | Sugar creating a relational table with `_id TEXT PRIMARY KEY, _rev INT, body JSON`. |
+| `CREATE COLLECTION` | Yes | Sugar creating a relational table with `_id TEXT PRIMARY KEY NOT NULL, _rev INT NOT NULL, body JSON NOT NULL`. |
 | `DROP TABLE` | Yes | Fails when the table does not exist. Indexes on it are removed with it. |
 | `INSERT` | Yes | Multi-row `VALUES`, optional column list, literal values only (`DEFAULT` resolved when a column is omitted). JSON text or native dict/list accepted. |
 | `SELECT` | Yes | Requires `FROM`; supports dot navigation (`profile.role`) and bracket indexing (`tags[0]`). |
@@ -65,7 +65,7 @@ Statements may end with `;`. The CLI and client accept one statement per call.
 | `IS MISSING` / `IS NOT MISSING` | Yes | True only when a JSON path does not exist (ABSENT). |
 | `IS JSON NULL` / `IS NOT JSON NULL` | Yes | True only for explicit JSON null values. |
 | JSON Navigation | Yes | Dot navigation (`doc.prop.sub`) and array bracket indexing (`arr[0]`). |
-| JSON Functions | Yes | `JSON_EXTRACT(doc, path)`, `JSON_VALUE(doc, path)`, `JSON_EXISTS(doc, path)`, `JSON_SET(doc, path, val)`, `JSON_REMOVE(doc, path)`. |
+| JSON Functions | Yes | `JSON_EXTRACT` (preserves explicit `JSON_NULL`), `JSON_VALUE` (returns SQL scalars; null/non-scalars become `NULL`), `JSON_EXISTS` (checks path existence), `JSON_SET`, `JSON_REMOVE`. |
 | Boolean expressions | Yes | `AND`, `OR`, `NOT`, parentheses, `TRUE`/`FALSE` literals. |
 | Three-valued `NULL` logic | Yes | `UNKNOWN` is distinct from `FALSE`; `NOT UNKNOWN` is `UNKNOWN`; `5 = NULL` is `UNKNOWN` while `5 IS NULL` is `FALSE`. |
 

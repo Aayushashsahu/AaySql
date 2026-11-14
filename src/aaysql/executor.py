@@ -2,6 +2,7 @@ import time
 
 from .ast import *
 from .errors import ConstraintError, ExecutionError
+from .json_value import deep_copy_json, set_path
 from .planner import ESTIMATE_NOTE, format_metrics, format_plan, plan_select
 from .query import (
     SourceBinding,
@@ -10,8 +11,7 @@ from .query import (
     is_sql_true,
     validate_expr_columns,
 )
-from .json_value import deep_copy_json, set_path
-from .storage import Database, coerce_value
+from .storage import Database, coerce_value, serialize_row_for_storage
 from .undo import (
     CreateIndexUndo,
     CreateTableUndo,
@@ -173,7 +173,8 @@ class Executor:
         for index in self.db.indexes_on(table.name):
             for row in new_rows:
                 index.add(row)
-        self._record_ddl("record_insert", table.name, new_rows)
+        serialized_rows = [serialize_row_for_storage(table.columns, r) for r in new_rows]
+        self._record_ddl("record_insert", table.name, serialized_rows)
         return {"status": "ok", "rows_affected": len(new_rows)}
 
     def _value(self, expr, row, table=None):
@@ -246,7 +247,10 @@ class Executor:
             if self.recorder is not None:
                 for old, _ in staged:
                     self._record_ddl(
-                        "record_update", table.name, positions[id(old)], old
+                        "record_update",
+                        table.name,
+                        positions[id(old)],
+                        serialize_row_for_storage(table.columns, old),
                     )
         for (old, _), previous in zip(staged, previous_keys):
             for index in indexes:

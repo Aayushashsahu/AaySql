@@ -17,6 +17,7 @@ import pytest
 
 from aaysql import Engine as AayushSQL
 from aaysql.errors import ConstraintError
+from aaysql.json_value import JSON_NULL
 
 
 def test_create_table_with_json_and_document_types():
@@ -219,3 +220,71 @@ def test_invalid_json_insert_rejected():
     # Null byte
     with pytest.raises(ConstraintError):
         db.execute("AAYUSH INSERT INTO t (id, doc) VALUES (3, '{\"a\\u0000\": 1}');")
+
+
+def test_json_extract_vs_value_vs_exists_semantics():
+    db = AayushSQL()
+    db.execute("AAYUSH CREATE TABLE t (id INT PRIMARY KEY, doc JSON);")
+    # Row 1: object with present null, scalar, sub-object, array
+    db.execute(
+        "AAYUSH INSERT INTO t (id, doc) VALUES (1, "
+        "'{\"present_null\": null, \"scalar\": \"text_val\", \"obj\": {\"k\": 1}, \"arr\": [10, 20]}');"
+    )
+    # Row 2: SQL NULL document
+    db.execute("AAYUSH INSERT INTO t (id, doc) VALUES (2, NULL);")
+    # Row 3: top-level JSON null
+    db.execute("AAYUSH INSERT INTO t (id, doc) VALUES (3, 'null');")
+
+    # 1. JSON_EXTRACT preserves JSON null as JSON_NULL
+    res = db.execute("AAYUSH SELECT JSON_EXTRACT(doc, '$.present_null') AS val FROM t WHERE id = 1;")
+    assert res["rows"][0]["val"] is JSON_NULL
+
+    # 2. JSON_EXTRACT returns SQL NULL (None) for missing path
+    res = db.execute("AAYUSH SELECT JSON_EXTRACT(doc, '$.missing') AS val FROM t WHERE id = 1;")
+    assert res["rows"][0]["val"] is None
+
+    # 3. JSON_VALUE returns SQL NULL (None) for JSON null
+    res = db.execute("AAYUSH SELECT JSON_VALUE(doc, '$.present_null') AS val FROM t WHERE id = 1;")
+    assert res["rows"][0]["val"] is None
+
+    # 4. JSON_VALUE returns SQL NULL (None) for non-scalar objects and arrays
+    res = db.execute("AAYUSH SELECT JSON_VALUE(doc, '$.obj') AS val FROM t WHERE id = 1;")
+    assert res["rows"][0]["val"] is None
+    res = db.execute("AAYUSH SELECT JSON_VALUE(doc, '$.arr') AS val FROM t WHERE id = 1;")
+    assert res["rows"][0]["val"] is None
+
+    # 5. JSON_VALUE returns the scalar value
+    res = db.execute("AAYUSH SELECT JSON_VALUE(doc, '$.scalar') AS val FROM t WHERE id = 1;")
+    assert res["rows"][0]["val"] == "text_val"
+
+    # 6. JSON_EXISTS distinguishes present null from missing path
+    res = db.execute(
+        "AAYUSH SELECT JSON_EXISTS(doc, '$.present_null') AS has_null, "
+        "JSON_EXISTS(doc, '$.missing') AS has_missing FROM t WHERE id = 1;"
+    )
+    assert res["rows"][0]["has_null"] is True
+    assert res["rows"][0]["has_missing"] is False
+
+    # 7. IS JSON NULL applied to extracted values
+    res = db.execute("AAYUSH SELECT id FROM t WHERE JSON_EXTRACT(doc, '$.present_null') IS JSON NULL;")
+    assert [r["id"] for r in res["rows"]] == [1]
+
+    # JSON_VALUE returns SQL NULL, so IS JSON NULL is False
+    res = db.execute("AAYUSH SELECT id FROM t WHERE JSON_VALUE(doc, '$.present_null') IS JSON NULL;")
+    assert [r["id"] for r in res["rows"]] == []
+
+    # 8. SQL NULL document input behavior
+    res = db.execute(
+        "AAYUSH SELECT JSON_EXTRACT(doc, '$.any') AS e, JSON_VALUE(doc, '$.any') AS v, "
+        "JSON_EXISTS(doc, '$.any') AS ex FROM t WHERE id = 2;"
+    )
+    assert res["rows"][0]["e"] is None
+    assert res["rows"][0]["v"] is None
+    assert res["rows"][0]["ex"] is False
+
+    # 9. Top-level JSON null document input behavior
+    res = db.execute("AAYUSH SELECT JSON_EXTRACT(doc, '$') AS root FROM t WHERE id = 3;")
+    assert res["rows"][0]["root"] is JSON_NULL
+
+    res = db.execute("AAYUSH SELECT JSON_EXTRACT(doc, '$.child') AS child FROM t WHERE id = 3;")
+    assert res["rows"][0]["child"] is None

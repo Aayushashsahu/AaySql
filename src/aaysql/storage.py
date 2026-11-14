@@ -14,6 +14,14 @@ from .btree import BTreeError
 from .delta import apply_changes
 from .errors import ConstraintError, ExecutionError, StorageError
 from .index import INDEX_NAME_PATTERN, Index
+from .json_value import (
+    ABSENT,
+    JSON_NULL,
+    canonical_json_text,
+    deep_copy_json,
+    parse_json_document,
+    validate_json_value,
+)
 from .statistics import StatisticsStore
 from .wal import (
     _CRASH_ENV_VAR,
@@ -22,15 +30,6 @@ from .wal import (
     fsync_dir,
     parse_wal,
     parse_wal_v4,
-)
-
-from .json_value import (
-    JSON_NULL,
-    ABSENT,
-    _to_serializable,
-    deep_copy_json,
-    parse_json_document,
-    validate_json_value,
 )
 
 FORMAT_NAME = "aaysql"
@@ -59,7 +58,7 @@ TYPE_MAP: dict[str, type] = {
 
 SUPPORTED_TYPES: tuple[str, ...] = tuple(TYPE_MAP.keys())
 
-_SCALAR_TYPES = (type(None), bool, int, float, str, dict, list)
+_SCALAR_TYPES = (type(None), bool, int, float, str)
 
 
 def validate_type_name(type_name: str) -> str:
@@ -76,6 +75,8 @@ def validate_type_name(type_name: str) -> str:
 
 def coerce_value(value: Any, col: ColumnDef) -> Any:
     """Validate and coerce a value against a column definition and nullability."""
+    if value is ABSENT:
+        raise ConstraintError(f"ABSENT sentinel cannot be assigned or stored in column '{col.name}'")
     if value is None:
         if col.not_null or col.primary_key:
             raise ConstraintError(f"Column '{col.name}' cannot be NULL")
@@ -102,14 +103,14 @@ def coerce_value(value: Any, col: ColumnDef) -> Any:
         if not isinstance(value, str):
             raise ConstraintError(f"Column '{col.name}' expects TEXT")
     elif col.type_name.upper() in ("JSON", "DOCUMENT"):
-        if value is None:
-            return None
         if value is JSON_NULL:
             return JSON_NULL
         if isinstance(value, str):
             return parse_json_document(value)
-        if isinstance(value, (dict, list, int, float, bool)):
+        if isinstance(value, (dict, list)):
             return validate_json_value(deep_copy_json(value))
+        if isinstance(value, (int, float, bool)):
+            return validate_json_value(value)
         raise ConstraintError(f"Column '{col.name}' expects JSON, got {type(value).__name__}")
     return value
 
@@ -129,7 +130,9 @@ def validate_column_def(col: ColumnDef) -> ColumnDef:
         has_default=col.has_default,
     )
     if col.has_default:
-        if not isinstance(col.default, _SCALAR_TYPES):
+        is_json = normalized_type in ("JSON", "DOCUMENT")
+        allowed_defaults = (type(None), bool, int, float, str, dict, list) if is_json else _SCALAR_TYPES
+        if not isinstance(col.default, allowed_defaults):
             raise ConstraintError(f"Invalid DEFAULT value for column '{col.name}'")
         coerced_default = coerce_value(col.default, normalized_col)
         normalized_col = ColumnDef(
@@ -144,6 +147,42 @@ def validate_column_def(col: ColumnDef) -> ColumnDef:
     elif col.default is not None:
         raise ConstraintError(f"Column '{col.name}' has a default value without has_default=True")
     return normalized_col
+
+
+def serialize_row_for_storage(columns: list[ColumnDef], row: dict[str, Any]) -> dict[str, Any]:
+    """Serialize a row into a schema-aware dictionary suitable for persistent storage.
+
+    For JSON/DOCUMENT columns:
+    - SQL NULL (None) is serialized as None (JSON null).
+    - Top-level JSON null (JSON_NULL) is serialized as canonical JSON text "null".
+    - Any other JSON value (object, array, string, number, bool) is serialized as its
+      canonical JSON string via canonical_json_text().
+    - ABSENT sentinel is rejected with a StorageError.
+
+    For scalar columns:
+    - Dicts and lists are rejected with StorageError.
+    - Scalar values (or None) are preserved as-is.
+    """
+    serialized: dict[str, Any] = {}
+    for col in columns:
+        val = row.get(col.name)
+        if val is ABSENT:
+            raise StorageError(f"ABSENT sentinel cannot be persisted for column '{col.name}'")
+        if col.type_name.upper() in ("JSON", "DOCUMENT"):
+            if val is None:
+                serialized[col.name] = None
+            elif val is JSON_NULL:
+                serialized[col.name] = "null"
+            else:
+                serialized[col.name] = canonical_json_text(val)
+        else:
+            if isinstance(val, (dict, list)):
+                raise StorageError(
+                    f"Invalid value for scalar column '{col.name}': "
+                    f"dictionaries and lists cannot be stored in {col.type_name}"
+                )
+            serialized[col.name] = val
+    return serialized
 
 
 def validate_table_schema(columns: list[ColumnDef]) -> list[ColumnDef]:
@@ -232,7 +271,7 @@ class Table:
         return {
             "name": self.name,
             "columns": [_column_to_dict(col) for col in self.columns],
-            "rows": [_to_serializable(row) for row in self.rows],
+            "rows": [serialize_row_for_storage(self.columns, row) for row in self.rows],
         }
 
     @classmethod
@@ -308,9 +347,9 @@ class Database:
         if name in self.tables:
             raise ExecutionError(f"Table '{name}' already exists")
         columns = [
-            ColumnDef(name="_id", type_name="TEXT", primary_key=True),
-            ColumnDef(name="_rev", type_name="INT"),
-            ColumnDef(name="body", type_name="JSON"),
+            ColumnDef(name="_id", type_name="TEXT", primary_key=True, not_null=True),
+            ColumnDef(name="_rev", type_name="INT", not_null=True),
+            ColumnDef(name="body", type_name="JSON", not_null=True),
         ]
         self.create_table(name, columns)
 

@@ -259,9 +259,9 @@ def parse_json_document(text: str) -> Any:
 
 
 def _to_serializable(val: Any) -> Any:
-    if val is JSON_NULL or val is None:
-        return None
     if val is ABSENT:
+        raise ConstraintError("Cannot serialize ABSENT sentinel")
+    if val is JSON_NULL or val is None:
         return None
     if isinstance(val, (int, float, str, bool)):
         return val

@@ -124,3 +124,51 @@ def test_collection_crud_operations():
     db.execute("AAYUSH DELETE FROM orders WHERE _id = 'ord-002';")
     res3 = db.execute("AAYUSH SELECT count(*) AS cnt FROM orders;")
     assert res3["rows"][0]["cnt"] == 1
+
+
+def test_returned_result_mutation_does_not_mutate_stored_data():
+    db = AayushSQL()
+    db.execute("AAYUSH CREATE TABLE profiles (id INT PRIMARY KEY, doc JSON);")
+    db.execute(
+        "AAYUSH INSERT INTO profiles (id, doc) VALUES "
+        "(1, '{\"user\": {\"name\": \"Alice\"}, \"tags\": [\"admin\", \"ops\"]}');"
+    )
+
+    # Fetch document through Engine
+    res1 = db.execute("AAYUSH SELECT id, doc FROM profiles WHERE id = 1;")
+    doc1 = res1["rows"][0]["doc"]
+    assert doc1["user"]["name"] == "Alice"
+
+    # Caller mutates the returned dictionary and list
+    doc1["user"]["name"] = "MUTATED_BY_CALLER"
+    doc1["tags"].append("HACKED")
+    doc1["new_field"] = "INJECTED"
+
+    # Re-query and verify database state was not altered
+    res2 = db.execute("AAYUSH SELECT id, doc FROM profiles WHERE id = 1;")
+    doc2 = res2["rows"][0]["doc"]
+    assert doc2["user"]["name"] == "Alice"
+    assert doc2["tags"] == ["admin", "ops"]
+    assert "new_field" not in doc2
+
+
+def test_input_structure_mutation_does_not_mutate_stored_data():
+    db = AayushSQL()
+    db.execute("AAYUSH CREATE TABLE profiles (id INT PRIMARY KEY, doc JSON);")
+    tbl = db.db.table("profiles")
+    col_def = tbl.columns[1]
+
+    # Input dictionary and list supplied from caller
+    input_doc = {"user": {"name": "Bob"}, "scores": [10, 20]}
+    coerced = db.executor._coerce(input_doc, col_def)
+    tbl.rows.append({"id": 1, "doc": coerced})
+
+    # Caller mutates the original input structure after insertion
+    input_doc["user"]["name"] = "MUTATED_AFTER_INSERT"
+    input_doc["scores"].append(999)
+
+    # Verify database contents remain pristine
+    res = db.execute("AAYUSH SELECT id, doc FROM profiles WHERE id = 1;")
+    doc = res["rows"][0]["doc"]
+    assert doc["user"]["name"] == "Bob"
+    assert doc["scores"] == [10, 20]
