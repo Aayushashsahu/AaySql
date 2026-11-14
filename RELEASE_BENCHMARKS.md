@@ -120,3 +120,72 @@ What this shows:
 - **Noise.** Windows NTFS `fsync` tails dominate single-row commit latency; the
   100-row and 1,000-row medians moved by several milliseconds between runs. Treat
   the column as an order-of-magnitude comparison, not a precise ratio.
+
+---
+
+## 6. Undo-Journal Transactions (Phase 3, development)
+
+Produced by [`benchmarks/benchmark_undo.py`](benchmarks/benchmark_undo.py) with
+`PYTHONPATH=src python benchmarks/benchmark_undo.py`. The script uses the same cases
+and settings for the Phase 2 baseline and the Phase 3 journal: in-memory engine,
+one secondary index on `value`, no index on `id`, warm-up 1, 3 measured repetitions
+(median shown), sizes 100 / 1,000 / 10,000 / 100,000 rows. The baseline was re-run
+from commit `070a932` in a clean worktree with this same script, so the row counts
+match exactly. Timings are one machine and are not CI gates.
+
+`MUTATIONS = 10`; `txn_100_rows` is one 100-row statement. `rollback_*` cases make
+10 statements inside one transaction and roll back. `transaction_memory` reports
+`tracemalloc` peak for 10 single-row UPDATEs (the database itself is not allocated
+inside the probe).
+
+| Case | 100 rows | 1,000 rows | 10,000 rows | 100,000 rows |
+| --- | ---: | ---: | ---: | ---: |
+| `begin_rollback` | 0.24 -> 0.04 ms | 3.60 -> 0.02 ms | 64.50 -> 0.03 ms | 1168.48 -> 0.02 ms |
+| `txn_1_row` | 0.55 -> 0.12 ms | 8.15 -> 0.13 ms | 84.74 -> 0.92 ms | 3308.91 -> 9.23 ms |
+| `txn_10_rows` | 1.57 -> 0.89 ms | 8.89 -> 1.40 ms | 83.13 -> 5.51 ms | 3402.57 -> 63.71 ms |
+| `txn_100_rows` | 9.16 -> 8.31 ms | 22.84 -> 11.51 ms | 142.72 -> 50.16 ms | 3810.09 -> 668.03 ms |
+| `multi_statement_10` | 8.32 -> 1.55 ms | 52.34 -> 2.22 ms | 568.69 -> 5.75 ms | 11952.52 -> 91.15 ms |
+| `rollback_inserts` | 9.78 -> 1.90 ms | 55.14 -> 2.55 ms | 518.65 -> 6.42 ms | 11125.99 -> 89.55 ms |
+| `rollback_updates` | 15.90 -> 19.74 ms | 85.75 -> 34.88 ms | 689.30 -> 348.91 ms | 13251.25 -> 3458.20 ms |
+| `rollback_deletes` | 14.52 -> 18.06 ms | 78.66 -> 35.78 ms | 745.83 -> 379.94 ms | 10551.77 -> 3475.84 ms |
+| `rollback_ddl` | 15.48 -> 8.56 ms | 90.78 -> 28.14 ms | 827.42 -> 367.09 ms | 16333.57 -> 8280.66 ms |
+| `failed_statement` | 1.35 -> 0.28 ms | 10.46 -> 0.24 ms | 78.96 -> 1.64 ms | 1462.04 -> 14.80 ms |
+| `autocommit_insert` | 0.12 -> 0.10 ms | 0.18 -> 0.19 ms | 0.51 -> 0.94 ms | 8.28 -> 8.97 ms |
+| `commit_no_mutations` | 0.56 -> 0.02 ms | 5.21 -> 0.03 ms | 39.52 -> 0.02 ms | 762.41 -> 0.03 ms |
+| `transaction_memory` (peak) | 76 -> 6 KiB | 530 -> 6 KiB | 4,675 -> 6 KiB | 48,905 -> 6 KiB |
+
+Persistent v4 autocommit INSERT (median, including WAL append and size-triggered
+checkpoint work; no explicit transaction):
+
+| Rows | Phase 2 | Phase 3 |
+| ---: | ---: | ---: |
+| 100 | 1.82 ms | 1.97 ms |
+| 1,000 | 4.68 ms | 3.08 ms |
+| 10,000 | 58.78 ms | 3.19 ms |
+| 100,000 | 741.33 ms | 10.73 ms |
+
+What this shows:
+
+- **BEGIN/COMMIT/ROLLBACK are independent of database size.** `begin_rollback` drops
+  from 1.17 s to ~0.02 ms at 100,000 rows, and an empty commit from 762 ms to
+  ~0.03 ms, because no clone happens.
+- **Rollback cost follows the mutations.** 10 inserts roll back in ~90 ms at 100,000
+  rows after paying the 10 table scans used to validate them; the undo itself is
+  removal of the appended rows. Journal peak memory is ~6 KiB at every size.
+- **`rollback_updates` / `rollback_deletes` are scan-bound, not undo-bound.** Each of
+  the 10 statements scans the table (no index on `id`), so the case is ~3.5 s at
+  100,000 rows even though only 10 inverse entries are applied. With an index the
+  scans disappear; the undo work stays proportional to rows changed.
+- **`rollback_ddl` is index-build-bound.** Five `CREATE INDEX` / `DROP INDEX` rounds
+  build and drop trees over every row; rollback restores the prior index state
+  without rebuilding. At 100,000 rows that is ~8.3 s, dominated by the five builds.
+- **`txn_100_rows` is primary-key-validation-bound.** Every new row is checked
+  against the existing rows in the same batch, so one 100-row statement is O(100 x
+  table rows). This behavior predates the undo journal and is unchanged; inserting
+  the same 100 rows as separate statements (`multi_statement_10` is 10 rows) avoids
+  the quadratic validation.
+- **Autocommit is unchanged within noise.** It performs the same single mutation and
+  WAL commit as before; the journal is empty after success.
+- **No speedup beyond these measurements is claimed.** Load, backup, restore, v3
+  snapshot commits, and v4 changed-table checkpoints remain O(database/table), and
+  `Database.clone()` remains O(database) for direct API users.

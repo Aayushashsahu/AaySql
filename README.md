@@ -84,8 +84,8 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 - Data types & constraints: `INT`/`INTEGER`, `TEXT`/`VARCHAR`, `FLOAT`/`DOUBLE`, `BOOL`/`BOOLEAN`; `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`.
 - Transactions (v0.5.0):
   - `AAYUSH BEGIN`, `AAYUSH COMMIT`, `AAYUSH ROLLBACK` for multi-statement transactions.
-  - Mutations inside a transaction are visible to later statements but stay in memory until the single `COMMIT` save; `ROLLBACK` restores the pre-`BEGIN` snapshot, including DDL and index changes.
-  - Each statement stays atomic inside a transaction.
+  - `BEGIN` is O(1): it records an undo-journal marker instead of cloning the database. Mutations inside a transaction are visible to later statements but stay in memory until the single `COMMIT` save; `ROLLBACK` applies inverse entries for the rows, indexes, and schema objects that actually changed.
+  - Each statement stays atomic inside a transaction through a per-statement journal marker. Journal memory is proportional to the rows and catalog objects the transaction touched, not to the size of the database.
   - Closing the engine or exiting the CLI with an active transaction rolls it back and prints a warning to `stderr`.
 - Delta WAL, segmented checkpoints & format v4 (see [`WAL.md`](WAL.md), [`docs/FORMAT_V4.md`](docs/FORMAT_V4.md)):
   - Commits append only the changed rows (`insert`/`update`/`delete`/DDL), never a whole-database image; the WAL `COMMIT` `fsync` remains the commit point.

@@ -13,8 +13,13 @@ All notable changes to AayushSQL are documented in this file.
 - **Documentation**: [`docs/FORMAT_V4.md`](docs/FORMAT_V4.md) plus updates to [`COMPATIBILITY.md`](COMPATIBILITY.md), [`WAL.md`](WAL.md), [`docs/OPERATIONS.md`](docs/OPERATIONS.md), [`README.md`](README.md), and [`RELEASE_BENCHMARKS.md`](RELEASE_BENCHMARKS.md).
 - **Tests and benchmark**: `test_delta_v4.py`, `test_checkpoints_v4.py`, `test_migration_v4.py`, `test_backup_v4.py`, `test_crash_v4.py` (including real subprocess crash points), and `benchmarks/benchmark_v4.py` (100 / 1k / 10k / 100k rows, commit vs checkpoint vs recovery, bytes written, unchanged tables).
 
+### Changed
+- **In-memory undo journal for transactions (`src/aaysql/undo.py`, `src/aaysql/executor.py`, `src/aaysql/engine.py`, `src/aaysql/transaction.py`)**: `BEGIN` and per-statement markers are O(1); transactions no longer clone the database. Mutations append inverse entries (insert start/rows, update before-images in place, deleted row objects at their original positions, DDL objects and index state), and rollback applies only those entries. Indexes are restored with exact inverse operations, and `Table.revision` is bumped so cached statistics cannot survive a rollback. Journal memory is proportional to the mutations made, not to the database size.
+- **Commit classification keeps its meaning.** Pre-commit failures undo the journal and raise `StorageError`; a successful WAL `COMMIT` fsync followed by a checkpoint failure remains committed with a pending checkpoint; an ambiguous fsync clears the journal without applying it, leaves memory untouched, and keeps `needs_recovery` set.
+- **Tests and benchmark**: `tests/test_undo_journal.py` and `tests/test_undo_engine.py` cover journal inverses, duplicate-row order, injected partial failures, autocommit, v3/v4, durability classification, and a monkeypatched `Database.clone` proof. `benchmarks/benchmark_undo.py` reports clone-free transaction, statement-rollback, memory, and persistent-autocommit results.
+
 ### Notes
-- `.aaydb` format v4 is **not** readable by the v1.0.0 package. Package version remains `1.0.0` and tag `v1.0.0` is unchanged. `Database.clone()` and load remain O(database), so no O(1) claim is made.
+- `.aaydb` format v4 is **not** readable by the v1.0.0 package. Package version remains `1.0.0` and tag `v1.0.0` is unchanged. `Database.clone()`, load, backup, and restore remain O(database); rollback cost is O(mutations), while UPDATE/DELETE row location, index builds, v3 snapshot commits, and v4 checkpoints stay proportional to table or database size. No O(1) database claim is made.
 
 ## [1.0.0] — 2026-11-11
 

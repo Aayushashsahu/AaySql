@@ -12,8 +12,8 @@ source of truth:
 
 Every cached entry is keyed by table name *and* validated against the live table
 object plus its row revision counter. ``INSERT``/``UPDATE``/``DELETE`` bump that
-counter, snapshots and rollbacks replace the whole ``Database`` (and therefore
-this cache), so a stale entry can never survive a mutation.
+counter, and rollback/undo also bumps it, so a stale entry can never survive a
+mutation or a rolled-back transaction.
 """
 
 from __future__ import annotations
