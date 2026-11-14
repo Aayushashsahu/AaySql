@@ -24,17 +24,18 @@ Version identifiers for this release:
 
 | Statement | Supported | Notes |
 | --- | --- | --- |
-| `CREATE TABLE` | Yes | Column-level constraints only; no table constraints, no `IF NOT EXISTS`. |
+| `CREATE TABLE` | Yes | Column-level constraints only; supports `INT`, `TEXT`, `FLOAT`, `BOOL`, `JSON`, `DOCUMENT`. |
+| `CREATE COLLECTION` | Yes | Sugar creating a relational table with `_id TEXT PRIMARY KEY, _rev INT, body JSON`. |
 | `DROP TABLE` | Yes | Fails when the table does not exist. Indexes on it are removed with it. |
-| `INSERT` | Yes | Multi-row `VALUES`, optional column list, literal values only (`DEFAULT` resolved when a column is omitted). |
-| `SELECT` | Yes | Requires `FROM`; `SELECT` without a table is not supported. |
-| `UPDATE` | Yes | Multiple `SET` assignments, optional `WHERE`, expression values. |
+| `INSERT` | Yes | Multi-row `VALUES`, optional column list, literal values only (`DEFAULT` resolved when a column is omitted). JSON text or native dict/list accepted. |
+| `SELECT` | Yes | Requires `FROM`; supports dot navigation (`profile.role`) and bracket indexing (`tags[0]`). |
+| `UPDATE` | Yes | Multiple `SET` assignments, optional `WHERE`, expression values, path assignments (`SET profile.role = 'lead'`), and `JSON_SET` / `JSON_REMOVE`. |
 | `DELETE` | Yes | Optional `WHERE`; `DELETE` without `WHERE` removes every row. |
 | `CREATE INDEX` | Yes | Exactly one column per index; no `UNIQUE` indexes. |
 | `DROP INDEX` | Yes | Fails when the index does not exist. |
 | `BEGIN` | Yes | One explicit transaction per session. Default READ COMMITTED; `BEGIN SNAPSHOT` pins the read view. No nesting, no `SAVEPOINT`, no `SERIALIZABLE`. |
 | `COMMIT` | Yes | Single durable WAL commit of the whole transaction; stale writes raise `WRITE_CONFLICT`. |
-| `ROLLBACK` | Yes | Reverses the transaction's rows, DDL, and index changes through the in-memory undo journal. |
+| `ROLLBACK` | Yes | Reverses the transaction's rows, DDL, and index changes through the in-memory undo journal. Restores exact pre-transaction JSON document state. |
 | `EXPLAIN` | Yes | Prints the plan; never executes the statement or mutates state. |
 | `EXPLAIN ANALYZE` | Yes | Executes the statement and reports measured per-operator counters. |
 
@@ -60,7 +61,11 @@ Statements may end with `;`. The CLI and client accept one statement per call.
 | `LIKE` / `NOT LIKE` | Yes | `%` and `_`, case-sensitive, no `ESCAPE`, no `ILIKE`. |
 | `IN` / `NOT IN` | Yes | Literal lists only. Empty list and `IN (SELECT …)` are parse errors. |
 | `BETWEEN` / `NOT BETWEEN` | Yes | Inclusive. |
-| `IS NULL` / `IS NOT NULL` | Yes | `IS TRUE`, `IS FALSE`, `IS DISTINCT FROM` are **not** supported. |
+| `IS NULL` / `IS NOT NULL` | Yes | True for SQL NULL, JSON NULL, and ABSENT. |
+| `IS MISSING` / `IS NOT MISSING` | Yes | True only when a JSON path does not exist (ABSENT). |
+| `IS JSON NULL` / `IS NOT JSON NULL` | Yes | True only for explicit JSON null values. |
+| JSON Navigation | Yes | Dot navigation (`doc.prop.sub`) and array bracket indexing (`arr[0]`). |
+| JSON Functions | Yes | `JSON_EXTRACT(doc, path)`, `JSON_VALUE(doc, path)`, `JSON_EXISTS(doc, path)`, `JSON_SET(doc, path, val)`, `JSON_REMOVE(doc, path)`. |
 | Boolean expressions | Yes | `AND`, `OR`, `NOT`, parentheses, `TRUE`/`FALSE` literals. |
 | Three-valued `NULL` logic | Yes | `UNKNOWN` is distinct from `FALSE`; `NOT UNKNOWN` is `UNKNOWN`; `5 = NULL` is `UNKNOWN` while `5 IS NULL` is `FALSE`. |
 
@@ -76,6 +81,7 @@ See [LANGUAGE_SPEC.md](LANGUAGE_SPEC.md) for the full grammar.
 | `TEXT` | `VARCHAR` | No length limits; length modifiers are not parsed. |
 | `FLOAT` | `DOUBLE` | IEEE-754 double; stored values are floats. |
 | `BOOL` | `BOOLEAN` | `TRUE`/`FALSE`, plus `0`/`1` accepted on write. Never treated as a number. |
+| `JSON` | `DOCUMENT` | Native structured documents; validated JSON. Enforces 1 MiB max document size, 64 max depth, 1 KiB max key length, 32 max path segments, signed 64-bit integer range, no duplicate keys, no non-finite floats, no null bytes. |
 
 | Constraint | Supported | Notes |
 | --- | --- | --- |

@@ -2,9 +2,17 @@
 
 All notable changes to AayushSQL are documented in this file.
 
-## [Unreleased] — format v4 (delta WAL + segmented checkpoints)
+## [Unreleased] — format v4 & Phase 5 (Native JSON & Document Model)
 
 ### Added
+- **Native JSON & Document Model (Phase 5, `src/aaysql/json_value.py`, `docs/JSON_MODEL.md`)**: First-class `JSON` and `DOCUMENT` column data types with strict schema validation. Enforces strict limits: max 1 MiB document size, max 64 nesting depth, max 1 KiB key length, max 32 path segments, signed 64-bit integer range. Rejects duplicate keys, non-finite floats (`NaN`, `Infinity`), and null bytes `\u0000`.
+- **Sentinels and Three-State Truth Table (`src/aaysql/json_value.py`, `src/aaysql/expressions.py`)**: Distinct `JSON_NULL` (`_JsonNull`) and `ABSENT` (`_Absent`) internal query sentinels. Complete three-state truth table: `IS NULL` (true for SQL NULL, JSON NULL, ABSENT), `IS MISSING` (true only for ABSENT), `IS JSON NULL` (true only for JSON NULL), and their negated counterparts.
+- **Path Navigation & Indexing (`src/aaysql/parser.py`, `src/aaysql/expressions.py`)**: Dot navigation (`profile.address.city`) and bracket indexing (`tags[0]`, `tags['key']`) in projection and predicates. Path ambiguity resolution handles table qualifier vs column vs property without schema knowledge at parse time.
+- **Built-in Document Functions**: `JSON_EXTRACT(doc, path)`, `JSON_VALUE(doc, path)`, `JSON_EXISTS(doc, path)`, `JSON_SET(doc, path, val)`, and `JSON_REMOVE(doc, path)`.
+- **Collections (`CREATE COLLECTION <name>`)**: Sugar compiling directly to relational tables with `_id TEXT PRIMARY KEY, _rev INT, body JSON`.
+- **Point Mutation & Transactional Integrity**: Supports `UPDATE ... SET col.path = val`, `JSON_SET`, `JSON_REMOVE`, and whole document replacement. In-memory undo journal records before-images using `deep_copy_json`, providing O(1) begin, zero database cloning, failed statement atomicity, and clean rollback.
+- **MVCC & Storage Integration**: Format v4 segments and delta WAL store canonical serializations. MVCC snapshot readers remain isolated via copy-on-write boundaries preventing Python object aliasing or in-place mutation bleed-through.
+- **Tests & Benchmarks**: 38 dedicated tests across `test_json_values.py`, `test_json_queries.py`, `test_json_mutations.py`, `test_json_storage.py`, `test_json_mvcc.py`, and `benchmarks/benchmark_json.py`.
 - **Delta WAL (`src/aaysql/wal.py`, `src/aaysql/delta.py`)**: commits append only the changed rows and schema objects (`insert` / `update` / `delete` / DDL) instead of a whole-database image. Framing, checksums, LSNs, the `COMMIT` fsync commit point, torn-tail repair, mid-log corruption failure, and ambiguous-commit handling are preserved. Every record carries the database identity; a foreign `db_id` is rejected.
 - **Segmented checkpoints (`src/aaysql/segments.py`, `src/aaysql/storage.py`)**: the database path is now a root manifest referencing immutable, content-addressed per-table segments in `<db>.seg/`. Checkpoints write only changed tables, reuse unchanged segment bytes, publish the manifest atomically, then append `CHECKPOINT` and truncate the WAL. Unreferenced segments are garbage-collected. Missing, truncated, modified, or path-traversing segment references fail closed.
 - **Format v4 and explicit migration**: new databases are v4; formats v1–v3 remain readable and stay on the v3 backend until `migrate_to_v4()` / `aaysql --migrate PATH` runs under the canonical `DatabaseLease` (backup to `<db>.v3.bak`, segments, publish, verify, cleanup; restore on failure). The operation is idempotent and finishes an interrupted migration.

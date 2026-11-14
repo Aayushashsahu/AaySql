@@ -33,6 +33,14 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 ## Implemented vs. Planned Features
 
 ### Implemented (v1.0.0)
+- **Native JSON & Document Model** (`src/aaysql/json_value.py`, specification in [`docs/JSON_MODEL.md`](docs/JSON_MODEL.md)):
+  - Native `JSON` and `DOCUMENT` column types with strict RFC 8259 validation, copy-on-write path updates, canonical serialization, and strict resource limits (1 MiB max document, 64 max depth, 1 KiB max key length, 32 max path segments).
+  - Path navigation: dot notation (`col.field.subfield`) and bracket array indexing (`col.items[0]`) seamlessly usable across projections, `WHERE`, `ORDER BY`, `GROUP BY`, and `HAVING`.
+  - Built-in JSON functions: `JSON_EXTRACT(doc, path)`, `JSON_VALUE(doc, path)`, `JSON_EXISTS(doc, path)`, `JSON_SET(doc, path, val)`, and `JSON_REMOVE(doc, path)`.
+  - Point mutations: `UPDATE ... SET col.path = value` with deep copy-on-write, preserving untouched fields and recording granular rollback images in the in-memory undo journal.
+  - Collections: `CREATE COLLECTION <name>` creates an optimized document collection table (`id INT PRIMARY KEY, doc JSON NOT NULL`).
+  - Three-state null predicates: `IS NULL` (matches SQL NULL, JSON NULL, and ABSENT), `IS MISSING` (matches only missing properties/ABSENT), and `IS JSON NULL` (matches only explicit `{"key": null}`).
+  - Full transactional durability: integrated into Delta WAL format v4, crash recovery, undo rollback, and MVCC snapshot readers.
 - **SQL expression language** (`src/aaysql/expressions.py`, `src/aaysql/parser.py`):
   - One precedence-climbing parser for the whole expression grammar (`OR` < `AND` < `NOT` < comparisons/predicates < `+ -` < `* / %` < unary sign < primary), with parentheses overriding it. Numbers are lexed unsigned so subtraction and unary negation are unambiguous (`1-2` and `1 - 2` both mean minus).
   - One canonical evaluator used by every execution path (reference/embedded and plan-driven), with a shared AST traversal (`iter_expr_children`/`walk_expr`) that all validation, aggregate detection, grouped-expression checks, predicate placement, and EXPLAIN rendering go through — a new node type cannot silently bypass a rule.
@@ -221,6 +229,47 @@ WHERE salary > 40000
 GROUP BY department
 HAVING AVG(salary) > 50000
 ORDER BY average_salary DESC;
+```
+
+## Example Native JSON & Document Queries
+
+### Document collections and nested insertion
+
+```sql
+AAYUSH CREATE COLLECTION customers;
+AAYUSH INSERT INTO customers VALUES (1, '{"name": "Alice", "address": {"city": "Seattle", "zip": 98101}, "tags": ["admin", "beta"]}');
+```
+
+### Path navigation and array indexing
+
+```sql
+AAYUSH SELECT
+    id,
+    doc.name AS customer_name,
+    doc.address.city AS city,
+    doc.tags[0] AS primary_tag
+FROM customers
+WHERE doc.address.zip = 98101;
+```
+
+### Three-state null predicates
+
+```sql
+-- Differentiate between SQL NULL, missing fields, and JSON explicit null
+AAYUSH SELECT id FROM customers WHERE doc.middle_name IS MISSING;
+AAYUSH SELECT id FROM customers WHERE doc.spouse IS JSON NULL;
+AAYUSH SELECT id FROM customers WHERE doc.nickname IS NULL; -- matches both missing and JSON null
+```
+
+### Point mutations on documents
+
+```sql
+-- Point update deep property without rewriting the whole document
+AAYUSH UPDATE customers SET doc.address.city = 'Bellevue' WHERE id = 1;
+
+-- Mutate with JSON functions
+AAYUSH UPDATE customers SET doc = JSON_SET(doc, '$.contact.email', 'alice@example.com') WHERE id = 1;
+AAYUSH UPDATE customers SET doc = JSON_REMOVE(doc, '$.tags[1]') WHERE id = 1;
 ```
 
 ## Installation and Execution

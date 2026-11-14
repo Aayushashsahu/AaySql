@@ -87,7 +87,9 @@ class UpdateUndo:
         # forward index update) and then restore the old key.
         for index in indexes:
             index.discard(row, forget=False)
-        row.update(self.before)
+        from .json_value import deep_copy_json
+
+        row.update(deep_copy_json(self.before))
         for index in indexes:
             index.ensure(row)
         table.touch()

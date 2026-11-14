@@ -23,6 +23,10 @@ class TokenType(Enum):
     MINUS = auto()
     SLASH = auto()
     PERCENT = auto()
+    LBRACKET = auto()
+    RBRACKET = auto()
+    LBRACE = auto()
+    RBRACE = auto()
     EOF = auto()
 
 

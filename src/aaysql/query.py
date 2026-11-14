@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .ast import AggregateCall, Identifier, Literal, Select, SelectItem
+from .ast import AggregateCall, FunctionCall, Identifier, Literal, PathAccess, Select, SelectItem
 from .errors import ExecutionError
 from .expressions import (  # re-exported: the canonical implementation
     COMPARISON_OPS,
@@ -26,6 +26,7 @@ from .expressions import (  # re-exported: the canonical implementation
     is_sql_true,
     iter_expr_children,
     resolve_identifier,
+    resolve_path_access,
     sql_and,
     sql_not,
     sql_or,
@@ -72,7 +73,15 @@ def validate_expr_columns(
     """Validate all column references and aggregate placement in an expression."""
     ensure_known_expr(expr)
     for node in walk_expr(expr):
-        if isinstance(node, Identifier):
+        if isinstance(node, PathAccess):
+            resolve_path_access(node, sources)
+        elif isinstance(node, Identifier):
+            if node.qualifier is not None:
+                source = next((s for s in sources if s.ref == node.qualifier), None)
+                if source is None:
+                    col_matches = [s for s in sources if node.qualifier in s.column_map]
+                    if len(col_matches) == 1:
+                        continue
             resolve_identifier(node, sources)
         elif isinstance(node, AggregateCall):
             if not allow_aggregates:
@@ -157,9 +166,7 @@ def _eval_group_expr(
 
 
 def _default_expr_label(expr: Any, index: int) -> str:
-    if isinstance(expr, Identifier):
-        return expr.label
-    if isinstance(expr, AggregateCall):
+    if isinstance(expr, (Identifier, AggregateCall, PathAccess, FunctionCall)):
         return expr.label
     return f"expr_{index + 1}"
 

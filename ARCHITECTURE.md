@@ -137,17 +137,18 @@ The complete contract, framing details, error codes and limitations are in
 
 - **`token.py` & `lexer.py`**: Tokenizes SQL into typed tokens (`PREFIX` for `AAYUSH`, identifiers, numbers, strings, operators, punctuation).
 - **`ast.py` & `parser.py`**: Enforce the single `AAYUSH` prefix and parse DDL/DML, `CREATE INDEX`, `DROP INDEX`, `EXPLAIN [ANALYZE]`, and relational queries into immutable AST nodes. Expression parsing is one precedence-climbing chain (`OR` → `AND` → `NOT` → comparison/predicate → additive → multiplicative → unary → primary) with `CASE`, `DISTINCT`, and `OFFSET` handled in place.
-- **`expressions.py`**: The canonical expression engine: source bindings, identifier resolution, three-valued logic, the shared AST traversal, arithmetic/`LIKE`/`IN`/`BETWEEN`/`CASE` semantics, and the single `eval_expr`.
+- **`expressions.py`**: The canonical expression engine: source bindings, identifier resolution, three-valued logic, the shared AST traversal, arithmetic/`LIKE`/`IN`/`BETWEEN`/`CASE`/`IS MISSING`/`IS JSON NULL` semantics, path disambiguation, and the single `eval_expr`.
+- **`json_value.py`**: Phase 5 native JSON and document model: `_JsonNull` and `_Absent` sentinels, strict validation and resource limits (depth, size, key length, path segments), canonical UTF-8 serialization, deep-copy immutability boundaries, copy-on-write path navigation and mutations (`extract_path`, `set_path`, `remove_path`), and order-insensitive structural equality.
 - **`query.py`**: Statement-level validation on top of the expression engine: aggregate placement, grouped-expression checks, duplicate output-label rejection, aggregate evaluation, and the `execute_select` entry point.
 - **`planner.py`**: Logical planning (predicate placement), physical planning (access paths, join algorithms), the cost model, and plan/metric rendering. Imports no executor code.
 - **`statistics.py`**: Bounded-memory per-table statistics and the revision-validated cache used by the cost model.
 - **`execution.py`**: Runs the physical plan tree: scans, hash/nested-loop joins, post-join filters, aggregation, projection, `DISTINCT`, sort, `OFFSET`, `LIMIT`, and per-operator metrics.
 - **`index.py` / `btree.py`**: Secondary index maintenance, lookups, range scans, and B+ tree invariants.
-- **`executor.py`**: Executes DDL/DML and `EXPLAIN`, maintains indexes on mutations, records inverse operations before each mutation, and delegates `SELECT` to the query pipeline.
+- **`executor.py`**: Executes DDL/DML, `CREATE COLLECTION`, and `EXPLAIN`, maintains indexes on mutations, records inverse operations before each mutation, and delegates `SELECT` to the query pipeline.
 - **`mvcc.py`**: Published roots, pinned snapshots, READ COMMITTED/SNAPSHOT sessions, copy-on-write workspaces, revision conflict detection, snapshot accounting, and the group-commit queue.
 - **`undo.py`**: The in-memory inverse journal: markers, inverse entries for rows and DDL, reverse-order replay, and discard-after-durable-commit. It is not serialized and is not a second WAL.
 - **`wal.py`**: WAL record schema, SHA-256 checksums, strict validation, byte-accurate tail parsing and repair, the append state machine with write-all/poisoning, directory fsync error classification, checkpoint/truncation helpers, and internal crash-test hooks.
-- **`storage.py`**: Schema/type/constraint validation, `Table`/`Database` models, v1/v2->v3 migration, crash-safe checkpointing, and startup WAL recovery.
+- **`storage.py`**: Schema/type/constraint validation, `JSON`/`DOCUMENT` coercions, `Table`/`Database` models, v1/v2->v3 migration, crash-safe checkpointing, and startup WAL recovery.
 - **`engine.py` & `transaction.py`**: Coordinate lexing, parsing, execution, and persistence. Autocommit and explicit `COMMIT` persist through WAL + checkpoint; ambiguous fsync errors and poisoned WALs enforce reopen recovery.
 - **`server.py`**: One `Engine` per server, session model, transaction coordinator, TCP server, framed request dispatch, authentication, TLS configuration, process lock, bounded graceful shutdown, `python -m aaysql.server` CLI.
 - **`protocol.py`**: Frame encoding/decoding and incremental reading, envelope and request validation, protocol version, capabilities, and the stable protocol error codes.

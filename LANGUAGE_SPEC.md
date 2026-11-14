@@ -32,6 +32,7 @@ Only the following column types (case-insensitive) are accepted by `CREATE TABLE
 | `TEXT` | `VARCHAR` | `str` |
 | `FLOAT` | `DOUBLE` | `float` (integers coerced to `float`) |
 | `BOOL` | `BOOLEAN` | `bool` (`0` and `1` coerced to `False`/`True`) |
+| `JSON` | `DOCUMENT` | `dict` / `list` / scalars (nested JSON structures with strict limits) |
 
 Computed expressions are not typed columns: a `SELECT` result may mix types across rows, and `UPDATE` results are still validated and coerced against the target column (see §6.8).
 
@@ -44,11 +45,11 @@ Precedence from lowest to highest. Parentheses override it.
 | 1 | `OR` | left |
 | 2 | `AND` | left |
 | 3 | `NOT` (prefix) | right |
-| 4 | `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] NULL`, `[NOT] IN`, `[NOT] BETWEEN`, `[NOT] LIKE` | non-associative |
+| 4 | `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] NULL`, `IS [NOT] MISSING`, `IS [NOT] JSON NULL`, `[NOT] IN`, `[NOT] BETWEEN`, `[NOT] LIKE` | non-associative |
 | 5 | `+`, `-` | left |
 | 6 | `*`, `/`, `%` | left |
 | 7 | unary `+`, unary `-` | right |
-| 8 | literals, identifiers, aggregates, `CASE`, `( expr )` | — |
+| 8 | literals, identifiers, path navigation (`doc.prop`, `arr[0]`), functions (`JSON_EXTRACT`), aggregates, `CASE`, `( expr )` | — |
 
 Consequences worth stating explicitly:
 
@@ -189,6 +190,23 @@ AAYUSH SELECT id FROM users ORDER BY id OFFSET 5;
 - `LIMIT` and `OFFSET` must be non-negative integers; negative values, floats, and other tokens are rejected with `ParserError`.
 - `OFFSET` is applied after `ORDER BY` and before `LIMIT`, and never before filtering, joins, grouping, or sorting.
 - An `OFFSET` beyond the result size returns no rows.
+
+### 5.10 Native JSON & Document Model
+
+AayushSQL treats structured documents as native values rather than opaque strings:
+- **Path Navigation**: Dot notation (`doc.prop.nested`) and array bracket indexing (`tags[0]`, `tags['key']`).
+- **Disambiguation**: `table.column` vs `column.property` vs `table.column.property` is resolved at runtime against active table sources.
+- **Three-State Truth Table**:
+  - `IS NULL` / `IS NOT NULL`: SQL NULL, explicit JSON NULL, and ABSENT all evaluate to TRUE under `IS NULL`.
+  - `IS MISSING` / `IS NOT MISSING`: Evaluates to TRUE only when a JSON path does not exist (ABSENT).
+  - `IS JSON NULL` / `IS NOT JSON NULL`: Evaluates to TRUE only when the value exists and is an explicit JSON null.
+- **Built-in Functions**:
+  - `JSON_EXTRACT(doc, path)`: Extracts value at JSON path (e.g. `'$.address.city'`).
+  - `JSON_VALUE(doc, path)`: Scalar extraction equivalent.
+  - `JSON_EXISTS(doc, path)`: Returns TRUE if path exists and is not ABSENT.
+  - `JSON_SET(doc, path, val)`: Returns copy-on-write document with path set to val.
+  - `JSON_REMOVE(doc, path)`: Returns copy-on-write document with path removed.
+- **Collections**: `AAYUSH CREATE COLLECTION <name>;` compiles to a relational table with `_id TEXT PRIMARY KEY, _rev INT, body JSON`.
 
 ## 6. Expression Contexts
 

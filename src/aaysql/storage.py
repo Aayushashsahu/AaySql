@@ -24,6 +24,15 @@ from .wal import (
     parse_wal_v4,
 )
 
+from .json_value import (
+    JSON_NULL,
+    ABSENT,
+    _to_serializable,
+    deep_copy_json,
+    parse_json_document,
+    validate_json_value,
+)
+
 FORMAT_NAME = "aaysql"
 FORMAT_VERSION = 3
 # Format versions 1 (pre-index) and 2 (pre-WAL) remain readable and upgrade to
@@ -44,11 +53,13 @@ TYPE_MAP: dict[str, type] = {
     "DOUBLE": float,
     "BOOL": bool,
     "BOOLEAN": bool,
+    "JSON": dict,
+    "DOCUMENT": dict,
 }
 
 SUPPORTED_TYPES: tuple[str, ...] = tuple(TYPE_MAP.keys())
 
-_SCALAR_TYPES = (type(None), bool, int, float, str)
+_SCALAR_TYPES = (type(None), bool, int, float, str, dict, list)
 
 
 def validate_type_name(type_name: str) -> str:
@@ -90,6 +101,16 @@ def coerce_value(value: Any, col: ColumnDef) -> Any:
     elif typ is str:
         if not isinstance(value, str):
             raise ConstraintError(f"Column '{col.name}' expects TEXT")
+    elif col.type_name.upper() in ("JSON", "DOCUMENT"):
+        if value is None:
+            return None
+        if value is JSON_NULL:
+            return JSON_NULL
+        if isinstance(value, str):
+            return parse_json_document(value)
+        if isinstance(value, (dict, list, int, float, bool)):
+            return validate_json_value(deep_copy_json(value))
+        raise ConstraintError(f"Column '{col.name}' expects JSON, got {type(value).__name__}")
     return value
 
 
@@ -203,7 +224,7 @@ class Table:
         return Table(
             name=self.name,
             columns=list(self.columns),
-            rows=[row.copy() for row in self.rows],
+            rows=[deep_copy_json(row) for row in self.rows],
             revision=self.revision,
         )
 
@@ -211,7 +232,7 @@ class Table:
         return {
             "name": self.name,
             "columns": [_column_to_dict(col) for col in self.columns],
-            "rows": [dict(row) for row in self.rows],
+            "rows": [_to_serializable(row) for row in self.rows],
         }
 
     @classmethod
@@ -282,6 +303,16 @@ class Database:
             raise ExecutionError(f"Table '{name}' already exists")
         validated_columns = validate_table_schema(columns)
         self.tables[name] = Table(name, validated_columns)
+
+    def create_collection(self, name: str) -> None:
+        if name in self.tables:
+            raise ExecutionError(f"Table '{name}' already exists")
+        columns = [
+            ColumnDef(name="_id", type_name="TEXT", primary_key=True),
+            ColumnDef(name="_rev", type_name="INT"),
+            ColumnDef(name="body", type_name="JSON"),
+        ]
+        self.create_table(name, columns)
 
     def table(self, name: str) -> Table:
         if name not in self.tables:
