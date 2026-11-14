@@ -1,24 +1,27 @@
 """Explicit transaction state for AayushSQL.
 
 The model is deliberately single-process and single-writer: at most one explicit
-transaction exists per engine instance. ``BEGIN`` captures a deep snapshot of the
-in-memory database (rows and index trees); statements mutate memory only; ``COMMIT``
-performs the single durable save; ``ROLLBACK`` reinstalls the snapshot.
+transaction exists per engine instance. ``BEGIN`` records an O(1) marker in the
+in-memory undo journal (no database copy); statements mutate memory only;
+``COMMIT`` performs the single durable save; ``ROLLBACK`` applies the journal's
+inverse entries in reverse order.
+
+The journal is in-memory rollback state, not durable storage: the durable record
+of a committed transaction is still the delta WAL written at ``COMMIT``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 from .errors import ExecutionError
 
 
 @dataclass
 class Transaction:
-    """One explicit transaction and the state it started from."""
+    """One explicit transaction and the journal position it started at."""
 
-    snapshot: Any
+    undo_marker: int
     dirty: bool = False
     statements: int = 0
 
@@ -34,12 +37,12 @@ class TransactionManager:
     def in_transaction(self) -> bool:
         return self.active is not None
 
-    def begin(self, snapshot: Any) -> None:
+    def begin(self, undo_marker: int) -> None:
         if self.active is not None:
             raise ExecutionError(
                 "Nested transactions are not supported; COMMIT or ROLLBACK the active transaction first"
             )
-        self.active = Transaction(snapshot=snapshot)
+        self.active = Transaction(undo_marker=undo_marker)
         self._begun += 1
 
     def record_statement(self) -> None:

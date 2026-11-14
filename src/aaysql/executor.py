@@ -11,15 +11,32 @@ from .query import (
     validate_expr_columns,
 )
 from .storage import Database, coerce_value
+from .undo import (
+    CreateIndexUndo,
+    CreateTableUndo,
+    DeleteUndo,
+    DropIndexUndo,
+    DropTableUndo,
+    InsertUndo,
+    UpdateUndo,
+)
 
 
 class Executor:
-    def __init__(self, db: Database | None = None, recorder=None):
+    def __init__(self, db: Database | None = None, recorder=None, journal=None):
         self.db = db or Database()
         # Optional MutationRecorder; when present every storage-level mutation is
         # appended to it so the engine can write a delta WAL transaction without
         # diffing the database.
         self.recorder = recorder
+        # Optional UndoJournal; when present every storage-level mutation first
+        # records its exact inverse so a failed statement or transaction can be
+        # reversed in memory without cloning the database.
+        self.journal = journal
+
+    def _record_undo(self, entry) -> None:
+        if self.journal is not None:
+            self.journal.record(entry)
 
     def _record_ddl(self, method, *args) -> None:
         if self.recorder is not None:
@@ -48,16 +65,21 @@ class Executor:
 
     def create_table(self, s):
         self.db.create_table(s.name, s.columns)
+        self._record_undo(CreateTableUndo(s.name))
         self._record_ddl("record_create_table", self.db.tables[s.name])
         return {"status": "ok", "message": f"Table '{s.name}' created"}
 
     def drop_table(self, s):
+        table = self.db.table(s.name)
+        indexes = self.db.indexes_on(s.name)
+        self._record_undo(DropTableUndo(s.name, table, indexes))
         self.db.drop_table(s.name)
         self._record_ddl("record_drop_table", s.name)
         return {"status": "ok", "message": f"Table '{s.name}' dropped"}
 
     def create_index(self, s):
         self.db.create_index(s.name, s.table, s.column)
+        self._record_undo(CreateIndexUndo(s.name))
         self._record_ddl("record_create_index", s.name, s.table, s.column)
         return {
             "status": "ok",
@@ -65,6 +87,10 @@ class Executor:
         }
 
     def drop_index(self, s):
+        if s.name not in self.db.indexes:
+            raise ExecutionError(f"Index '{s.name}' does not exist")
+        index = self.db.indexes[s.name]
+        self._record_undo(DropIndexUndo(s.name, index))
         self.db.drop_index(s.name)
         self._record_ddl("record_drop_index", s.name)
         return {"status": "ok", "message": f"Index '{s.name}' dropped"}
@@ -132,6 +158,7 @@ class Executor:
         for row in new_rows:
             self._check_constraints(table, row, rows=staged_pool)
             staged_pool.append(row)
+        self._record_undo(InsertUndo(table.name, len(table.rows), new_rows))
         table.rows.extend(new_rows)
         table.touch()
         for index in self.db.indexes_on(table.name):
@@ -189,6 +216,10 @@ class Executor:
         previous_keys = [
             {index.name: old[index.column] for index in indexes} for old, _ in staged
         ]
+        for old, _new in staged:
+            self._record_undo(
+                UpdateUndo(table.name, positions[id(old)], dict(old))
+            )
         for old, new in staged:
             old.update(new)
         if staged:
@@ -208,17 +239,26 @@ class Executor:
         table = self.db.table(s.table)
         targets = set(map(id, self._filtered(table, s.where)))
         doomed = [row for row in table.rows if id(row) in targets]
-        for index in self.db.indexes_on(table.name):
-            for row in doomed:
-                index.remove(row)
         before = len(table.rows)
         positions = {id(row): pos for pos, row in enumerate(table.rows)}
+        if doomed:
+            # Record inverses before mutating, so a failure during index
+            # maintenance still leaves enough information to restore the rows.
+            self._record_undo(
+                DeleteUndo(
+                    table.name,
+                    [(positions[id(row)], row) for row in doomed],
+                )
+            )
         table.rows[:] = [row for row in table.rows if id(row) not in targets]
         if len(table.rows) != before:
             table.touch()
-            if self.recorder is not None:
-                doomed_positions = [
-                    positions[id(row)] for row in doomed if id(row) in positions
-                ]
-                self._record_ddl("record_delete", table.name, doomed_positions)
+        for index in self.db.indexes_on(table.name):
+            for row in doomed:
+                index.remove(row)
+        if len(table.rows) != before and self.recorder is not None:
+            doomed_positions = [
+                positions[id(row)] for row in doomed if id(row) in positions
+            ]
+            self._record_ddl("record_delete", table.name, doomed_positions)
         return {"status": "ok", "rows_affected": before - len(table.rows)}

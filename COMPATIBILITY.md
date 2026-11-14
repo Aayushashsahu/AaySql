@@ -34,7 +34,7 @@ Version identifiers for this release:
 | `DROP INDEX` | Yes | Fails when the index does not exist. |
 | `BEGIN` | Yes | One explicit transaction per engine; no nesting, no `SAVEPOINT`. |
 | `COMMIT` | Yes | Single durable WAL commit of the whole transaction. |
-| `ROLLBACK` | Yes | Restores the pre-`BEGIN` snapshot, including DDL and indexes. |
+| `ROLLBACK` | Yes | Reverses the transaction's rows, DDL, and index changes through the in-memory undo journal. |
 | `EXPLAIN` | Yes | Prints the plan; never executes the statement or mutates state. |
 | `EXPLAIN ANALYZE` | Yes | Executes the statement and reports measured per-operator counters. |
 

@@ -23,6 +23,7 @@ from .locking import DatabaseLease
 from .parser import Parser
 from .storage import Database, open_storage
 from .transaction import TransactionManager
+from .undo import UndoJournal
 
 _MUTATION_STATEMENTS = (
     CreateTable,
@@ -60,6 +61,7 @@ class Engine:
         """
         self.lexer = Lexer()
         self._recorder = MutationRecorder()
+        self._journal = UndoJournal()
         self._lease: DatabaseLease | None = None
         self._owns_lease = False
         if db_path is None or str(db_path) == ":memory:":
@@ -93,7 +95,9 @@ class Engine:
                 # the database may already have recovered or checkpointed the WAL.
                 self._release_owned_lease()
                 raise
-        self.executor = Executor(self.db, recorder=self._recorder)
+        self.executor = Executor(
+            self.db, recorder=self._recorder, journal=self._journal
+        )
         self.transactions = TransactionManager()
         self._closed = False
         self._recovery_required = False
@@ -139,10 +143,10 @@ class Engine:
                 "reopen the database to recover"
             )
 
-    def _install(self, db: Database) -> None:
-        """Replace in-memory state and rebind the executor to the new database."""
-        self.db = db
-        self.executor.db = db
+    @property
+    def undo_entries(self) -> int:
+        """Number of pending inverse entries (inspection/tests only)."""
+        return len(self._journal)
 
     def execute(self, sql: str) -> dict[str, Any]:
         self._ensure_usable()
@@ -159,46 +163,65 @@ class Engine:
         if self.transactions.in_transaction:
             return self._execute_in_transaction(stmt)
 
-        if self.storage is not None and isinstance(stmt, _MUTATION_STATEMENTS):
-            snapshot = self.db.clone()
+        if isinstance(stmt, _MUTATION_STATEMENTS):
+            return self._execute_autocommit(stmt)
+        return self.executor.execute(stmt)
+
+    def _execute_autocommit(self, stmt: Any) -> dict[str, Any]:
+        """Run one independent mutating statement with statement atomicity.
+
+        The undo journal reverses partial effects on failure. When the statement
+        is durable, its inverse entries are discarded only after the storage
+        layer has classified the commit; an ambiguous COMMIT is never treated as
+        a rollback.
+        """
+        persistent = self.storage is not None
+        mark = self._journal.mark()
+        if persistent:
             self._recorder.clear()
             self._recorder.start()
-            try:
-                result = self.executor.execute(stmt)
+        try:
+            result = self.executor.execute(stmt)
+            if persistent:
                 changes = self._recorder.take()
                 self.storage.save(self.db, changes)
-            except AmbiguousCommitError:
+        except AmbiguousCommitError:
+            if persistent:
                 self._recorder.take()
+            # The commit may be durable. Keep the WAL for recovery and never
+            # apply inverse entries as though the transaction had rolled back.
+            self._journal.clear()
+            self._recovery_required = True
+            raise
+        except Exception:
+            if persistent:
+                self._recorder.take()
+            self._journal.rollback_to(mark, self.db)
+            if persistent and self.storage.wal.poisoned:
                 self._recovery_required = True
-                raise
-            except Exception:
-                self._recorder.take()
-                self._install(snapshot)
-                if self.storage is not None and self.storage.wal.poisoned:
-                    self._recovery_required = True
-                raise
-            return result
-        return self.executor.execute(stmt)
+            raise
+        self._journal.discard_to(mark)
+        return result
 
     def _execute_in_transaction(self, stmt: Any) -> dict[str, Any]:
         if not isinstance(stmt, _MUTATION_STATEMENTS):
             return self.executor.execute(stmt)
         # Each statement stays atomic inside the transaction: a failed statement
-        # must not leave partial rows or index entries behind.
-        before_statement = self.db.clone()
-        mark = self._recorder.mark()
+        # undoes only its own inverse entries, leaving earlier statements alone.
+        mark = self._journal.mark()
+        recorder_mark = self._recorder.mark()
         try:
             result = self.executor.execute(stmt)
         except Exception:
-            self._install(before_statement)
-            self._recorder.rollback_to(mark)
+            self._journal.rollback_to(mark, self.db)
+            self._recorder.rollback_to(recorder_mark)
             raise
         self.transactions.record_statement()
         return result
 
     def begin(self) -> dict[str, Any]:
         self._ensure_usable()
-        self.transactions.begin(self.db.clone())
+        self.transactions.begin(self._journal.mark())
         self._recorder.clear()
         self._recorder.start()
         return {"status": "ok", "message": "Transaction started"}
@@ -206,29 +229,35 @@ class Engine:
     def commit(self) -> dict[str, Any]:
         self._ensure_usable()
         transaction = self.transactions.commit()
+        marker = transaction.undo_marker
         try:
             changes = self._recorder.take()
             if self.storage is not None:
                 self.storage.save(self.db, changes)
         except AmbiguousCommitError:
+            # The transaction may be durable. Reopen recovery decides; do not
+            # discard the WAL or apply the undo journal.
+            self._journal.clear()
             self._recovery_required = True
             raise
         except Exception:
-            # The commit never became durable before WAL COMMIT fsync, so memory
-            # must match the previously durable state captured at BEGIN. If the
-            # failed append may have left torn bytes, only a reopen can continue.
+            # The commit never became durable before WAL COMMIT fsync, so reverse
+            # the transaction's mutations in memory. If the failed append may
+            # have left torn bytes, only a reopen can continue.
             self._recorder.take()
-            self._install(transaction.snapshot)
+            self._journal.rollback_to(marker, self.db)
             if self.storage is not None and self.storage.wal.poisoned:
                 self._recovery_required = True
             raise
+        # Durable (or in-memory) commit: inverse entries are no longer needed.
+        self._journal.discard_to(marker)
         return {"status": "ok", "message": "Transaction committed"}
 
     def rollback(self) -> dict[str, Any]:
         self._ensure_usable()
         transaction = self.transactions.rollback()
         self._recorder.clear()
-        self._install(transaction.snapshot)
+        self._journal.rollback_to(transaction.undo_marker, self.db)
         return {"status": "ok", "message": "Transaction rolled back"}
 
     def checkpoint(self) -> None:

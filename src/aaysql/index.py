@@ -69,6 +69,56 @@ class Index:
         if value is not None:
             self.tree.insert(value, row)
 
+    def discard(
+        self, row: dict[str, Any], key: Any = _MISSING, forget: bool = True
+    ) -> None:
+        """Remove ``row`` if it is present; never raise when it is absent.
+
+        Undo paths need this: a statement that failed part-way through index
+        maintenance may not have inserted or removed the entry it intended to.
+        """
+        value = row.get(self.column) if key is _MISSING else key
+        if value is not None:
+            try:
+                self.tree.delete(value, row)
+            except KeyError:
+                pass
+        if forget:
+            self._order.pop(id(row), None)
+
+    def ensure(self, row: dict[str, Any]) -> None:
+        """Insert ``row`` under its current key unless that entry already exists."""
+        value = row.get(self.column)
+        if value is None:
+            return
+        if id(row) not in self._order:
+            self._order[id(row)] = self._next_order
+            self._next_order += 1
+        for existing in self.tree.search(value):
+            if existing is row:
+                return
+        self.tree.insert(value, row)
+
+    def restore_positions(
+        self, entries: list[tuple[int, dict[str, Any]]]
+    ) -> None:
+        """Re-add deleted ``(position, row)`` pairs in original table order.
+
+        ``_order`` records each row's position in table order and is never
+        shifted when a row is deleted, so restoring the captured position is
+        enough to make index scans agree with table scans again.
+        """
+        ordered = sorted(entries, key=lambda entry: entry[0])
+        for _position, row in ordered:
+            self.discard(row)
+        for position, row in ordered:
+            self._order[id(row)] = position
+            value = row.get(self.column)
+            if value is not None:
+                self.tree.insert(value, row)
+        if ordered:
+            self._next_order = max(self._next_order, ordered[-1][0] + 1)
+
     def remove(self, row: dict[str, Any], key: Any = _MISSING, forget: bool = True) -> None:
         """Remove ``row`` from the tree.
 

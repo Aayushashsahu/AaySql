@@ -202,7 +202,38 @@ Suggested routine: back up daily while the server is stopped, verify immediately
 copy the backup directory off the machine, and test a restore into a scratch path
 monthly.
 
-## 9. Disk space
+## 9. Transaction memory and rollback
+
+`AAYUSH BEGIN` records an undo-journal marker; it does not copy the database. Each
+mutating statement records the inverse of what it changed, plus a statement marker so
+a failed statement is undone without discarding earlier work. `ROLLBACK` applies the
+inverse entries down to the `BEGIN` marker, including DDL and index changes.
+
+- Memory used by an open transaction is proportional to the rows and catalog objects
+  it touched, not to the size of the database. The journal is in memory only; a very
+  large transaction can still consume memory proportional to its own changes.
+- The journal is kept until commit durability is classified. It is released after a
+  successful commit, after a definite pre-commit failure (after undo), and after an
+  ambiguous commit (discarded without undo). On an ambiguous commit, memory is left
+  unchanged because the transaction may be durable.
+- Normal transaction execution does not call `Database.clone()`. The public clone API
+  remains O(database) for callers that use it directly.
+
+Some costs remain proportional to the table or database and are not undo work:
+
+- `UPDATE` and `DELETE` locate rows by scanning the table when no usable index
+  applies, so a large statement costs O(table) even though its rollback is O(rows
+  changed).
+- `CREATE INDEX` builds a B+ tree over every row, and `ROLLBACK` restores the prior
+  index state rather than rebuilding it — the build cost is paid by the DDL itself.
+- Format v3 commits rewrite the full snapshot; format v4 commits append only the delta
+  but a checkpoint writes a segment for each changed table.
+- Opening, loading, backup, and restore remain O(database).
+
+There is no MVCC or snapshot isolation: other sessions still see no uncommitted work
+because the server serializes access and permits one explicit transaction at a time.
+
+## 10. Disk space
 
 - **Format v4.** A commit appends only the rows it changed to the WAL. A checkpoint
   writes a new segment for each table whose content changed and reuses the existing
@@ -222,7 +253,7 @@ monthly.
 - A `RECOVERY_REQUIRED` state does not grow the WAL; further statements are rejected
   before touching storage.
 
-## 10. Database ownership and locking
+## 11. Database ownership and locking
 
 **One owner per file-backed database.** A `.aaydb` file is owned by exactly one of:
 an embedded `Engine`, a server, an offline backup, or a restore. Opening a database
@@ -282,7 +313,7 @@ To recover from `DATABASE_LOCKED`:
 2. Confirm the process is gone. Do not delete the lock file.
 3. Reopen the database; the OS lock is already free and recovery runs normally.
 
-## 11. Single-writer limitations
+## 12. Single-writer limitations
 
 - Exactly one server process per database, and exactly one active transaction across
   all its sessions.
@@ -292,11 +323,11 @@ To recover from `DATABASE_LOCKED`:
 - Every statement is serialized through one lock, so throughput does not grow with
   client count.
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 | Symptom | Likely cause | Action |
 | --- | --- | --- |
-| `DATABASE_LOCKED` / "already in use" | A server, embedded `Engine`, backup or restore owns the database. | Stop the owner (`§10`). Do not delete the lock file. |
+| `DATABASE_LOCKED` / "already in use" | A server, embedded `Engine`, backup or restore owns the database. | Stop the owner (`§11`). Do not delete the lock file. |
 | `RECOVERY_REQUIRED` | Ambiguous commit or damaged WAL. | §6 and §7. |
 | `StorageError: Corrupted database file …` | Snapshot is not valid JSON or fails validation. | Restore a backup; keep the file for diagnosis. |
 | `StorageError: Corrupted WAL record …` | Mid-log corruption. | Restore a backup; do not truncate the WAL manually. |

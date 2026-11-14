@@ -107,7 +107,8 @@ A commit executes in two distinct phases: WAL commit, followed by checkpointing.
 
 1. **Failure before `COMMIT` fsync (e.g., serialization or write error before `COMMIT`):**
    - `StorageError` is raised.
-   - `Engine` restores the pre-transaction / pre-statement snapshot in memory.
+   - `Engine` applies the in-memory undo journal (no database clone or snapshot
+     restore) and releases it.
 2. **Checkpoint failure *after* `COMMIT` fsync succeeds:**
    - The transaction is **already durably committed in the WAL**.
    - `Engine` preserves the committed in-memory state, keeps the WAL intact (does **not** truncate it), marks `pending_checkpoint = True`, and reports commit success rather than returning a misleading commit failure.
