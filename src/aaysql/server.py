@@ -40,6 +40,7 @@ from .errors import (
     LexerError,
     ParserError,
     StorageError,
+    WriteConflictError,
 )
 from .locking import LOCK_SUFFIX, DatabaseLease, canonical_lock_path, canonical_path
 from .protocol import (
@@ -59,8 +60,8 @@ from .protocol import (
     SQL_EXECUTION_ERROR,
     SQL_PARSE_ERROR,
     TOO_MANY_CONNECTIONS,
-    TRANSACTION_BUSY,
     TRANSACTION_ERROR,
+    WRITE_CONFLICT,
     FrameError,
     FrameReader,
     decode_message,
@@ -298,6 +299,7 @@ class Session:
     client_version: str = "unknown"
     recent_ids: set[str] = field(default_factory=set)
     recent_order: deque[str] = field(default_factory=lambda: deque(maxlen=MAX_RECENT_REQUEST_IDS))
+    datastore: Any = field(default=None, repr=False)
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
@@ -315,24 +317,33 @@ class Session:
 
 
 class TransactionCoordinator:
-    """Serializes engine access and enforces single-session transaction ownership.
+    """Runs independent session transactions against one MVCC engine.
 
-    The engine has exactly one ``TransactionManager``; this class decides which
-    session may use it. Every engine call happens under ``self._lock`` and no
-    response is written while that lock is held.
+    Readers never take the execution lock: each session owns a snapshot and can
+    run while another session is writing or waiting for a WAL fsync. The store
+    itself admits one writer at a time for statement generation, but releases
+    that admission before durability so later commits can join the next batch.
     """
 
     def __init__(self, engine: Engine, *, logger: logging.Logger) -> None:
         self.engine = engine
         self._logger = logger
         self._lock = threading.Lock()
+        self._idle = threading.Condition(self._lock)
         self._owner: str | None = None
         self._unavailable_reason: str | None = None
         self._shut_down = False
+        self._inflight = 0
+        self._active_sessions: dict[str, Session] = {}
 
     @property
     def owner(self) -> str | None:
-        return self._owner
+        with self._lock:
+            for session_id, session in self._active_sessions.items():
+                datastore = session.datastore
+                if datastore is not None and datastore.in_transaction:
+                    return session_id
+            return None
 
     @property
     def unavailable_reason(self) -> str | None:
@@ -356,23 +367,24 @@ class TransactionCoordinator:
             raise ServerRequestError(RECOVERY_REQUIRED, "database requires recovery; reopen the server")
 
     def execute(self, session: Session, sql: str) -> dict[str, Any]:
-        """Run one statement for ``session`` under the execution lock."""
-        with self._lock:
+        """Run one statement for ``session`` without serializing readers."""
+        datastore = session.datastore
+        if datastore is None:
+            raise ServerRequestError(INTERNAL_ERROR, "session has no database context")
+        with self._idle:
             self._assert_available()
-            if self._owner is not None and self._owner != session.session_id:
-                raise ServerRequestError(
-                    TRANSACTION_BUSY,
-                    "another client owns the active transaction; retry after it "
-                    "commits or rolls back",
-                    retryable=True,
-                )
+            self._inflight += 1
+            self._active_sessions[session.session_id] = session
+        try:
             try:
-                result = self.engine.execute(sql)
+                result = datastore.execute(sql)
             except AmbiguousCommitError:
                 self._mark_unavailable(
                     "commit durability is ambiguous after a WAL fsync failure; "
                     "the database must be recovered by reopening it"
                 )
+                raise
+            except WriteConflictError:
                 raise
             except Exception:
                 if self.engine.needs_recovery or self.engine.wal_poisoned:
@@ -381,83 +393,82 @@ class TransactionCoordinator:
                         "reopen the server to recover"
                     )
                 raise
-            # The engine exposes the authoritative transaction state; ownership
-            # follows it rather than guessing from the SQL text.
-            if self.engine.in_transaction:
-                self._owner = session.session_id
-                session.owns_transaction = True
-            else:
-                self._owner = None
-                session.owns_transaction = False
+            session.owns_transaction = datastore.in_transaction
             return result
+        finally:
+            with self._idle:
+                self._inflight -= 1
+                if not (datastore.in_transaction):
+                    self._active_sessions.pop(session.session_id, None)
+                if self._inflight == 0:
+                    self._idle.notify_all()
 
     def release_session(self, session: Session) -> str:
-        """Roll back a disconnected owner's transaction. Returns a short outcome."""
-        with self._lock:
-            if self._owner != session.session_id:
-                return "no_transaction"
-            if self._unavailable_reason is not None or self.engine.needs_recovery:
-                self._logger.error(
-                    "session %s disconnected after an ambiguous commit; not rolling back "
-                    "and not releasing the database for further use",
+        """Roll back a disconnected session's own transaction, if any."""
+        datastore = session.datastore
+        if datastore is None:
+            return "no_transaction"
+        if self._unavailable_reason is not None or self.engine.needs_recovery:
+            self._logger.error(
+                "session %s disconnected after an ambiguous commit; not rolling back "
+                "and not releasing the database for further use",
+                session.session_id,
+            )
+            return "recovery_required"
+        try:
+            if datastore.in_transaction:
+                datastore.rollback()
+                self._logger.info(
+                    "rolled back the uncommitted transaction of disconnected session %s",
                     session.session_id,
                 )
-                return "recovery_required"
-            try:
-                if self.engine.in_transaction:
-                    self.engine.rollback()
-                    self._logger.info(
-                        "rolled back the uncommitted transaction of disconnected session %s",
-                        session.session_id,
-                    )
-                    return "rolled_back"
-                return "no_transaction"
-            except Exception:
-                self._logger.exception(
-                    "rollback for disconnected session %s failed", session.session_id
-                )
-                self._mark_unavailable(
-                    "could not roll back a disconnected client's transaction; "
-                    "reopen the server to recover"
-                )
-                return "failed"
-            finally:
-                if not self.engine.in_transaction:
-                    self._owner = None
-                    session.owns_transaction = False
+                outcome = "rolled_back"
+            else:
+                outcome = "no_transaction"
+        except Exception:
+            self._logger.exception(
+                "rollback for disconnected session %s failed", session.session_id
+            )
+            self._mark_unavailable(
+                "could not roll back a disconnected client's transaction; "
+                "reopen the server to recover"
+            )
+            outcome = "failed"
+        finally:
+            session.owns_transaction = False
+            with self._idle:
+                self._active_sessions.pop(session.session_id, None)
+        try:
+            datastore.close()
+        except Exception:
+            self._logger.exception("closing session %s failed", session.session_id)
+        return outcome
 
     def shutdown(self, timeout: float) -> bool:
         """Bounded wait for in-flight work, then roll back and close the engine."""
-        acquired = self._lock.acquire(timeout=timeout)
-        if not acquired:
+        deadline = time.monotonic() + timeout
+        with self._idle:
+            self._shut_down = True
+            while self._inflight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._logger.error(
+                        "in-flight database work did not finish within %.1fs; "
+                        "closing without touching the engine",
+                        timeout,
+                    )
+                    return False
+                self._idle.wait(remaining)
+        if self._unavailable_reason is not None or self.engine.needs_recovery:
             self._logger.error(
-                "in-flight database work did not finish within %.1fs; "
-                "closing without touching the engine",
-                timeout,
+                "closing the engine with an ambiguous durability state; "
+                "the WAL is preserved for reopen recovery"
             )
-            self._shut_down = True
-            return False
         try:
-            self._shut_down = True
-            if self._unavailable_reason is not None or self.engine.needs_recovery:
-                self._logger.error(
-                    "closing the engine with an ambiguous durability state; "
-                    "the WAL is preserved for reopen recovery"
-                )
-            elif self.engine.in_transaction:
-                try:
-                    self.engine.rollback()
-                    self._logger.info("rolled back an uncommitted transaction during shutdown")
-                except Exception:
-                    self._logger.exception("rollback during shutdown failed")
-                    self._mark_unavailable("shutdown could not roll back an active transaction")
-            try:
-                self.engine.close()
-            except Exception:
-                self._logger.exception("engine close during shutdown failed")
-            return True
-        finally:
-            self._lock.release()
+            self.engine.close()
+        except Exception:
+            self._logger.exception("engine close during shutdown failed")
+        return True
 
 
 # --- TCP plumbing ---------------------------------------------------------
@@ -941,12 +952,14 @@ class AayushSQLServer:
 
     def _new_session(self, sock: Any, peer: Any) -> Session:
         now = time.monotonic()
+        assert self._engine is not None
         session = Session(
             session_id=uuid.uuid4().hex,
             peer=peer if isinstance(peer, tuple) and len(peer) >= 2 else None,
             connected_at=now,
             last_activity=now,
             socket=sock,
+            datastore=self._engine.connect(),
         )
         with self._sessions_lock:
             self._sessions[session.session_id] = session
@@ -1190,6 +1203,8 @@ class AayushSQLServer:
                     "the database requires recovery"
                 ),
             )
+        if isinstance(exc, WriteConflictError):
+            return WRITE_CONFLICT, str(exc)
         if isinstance(exc, ConstraintError):
             return CONSTRAINT_ERROR, str(exc)
         if isinstance(exc, (LexerError, ParserError)):

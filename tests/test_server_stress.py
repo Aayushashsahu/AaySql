@@ -230,20 +230,30 @@ def test_multi_client_mixed_workload_stress(tmp_path: Path, num_clients: int):
                                 time.sleep(0.01)
                                 continue
                             raise
-                    try:
-                        client.execute(
-                            f"AAYUSH INSERT INTO accounts VALUES ({row_id}, {grp}, 500, 'w_{worker_id}')"
-                        )
-                        client.execute(
-                            f"AAYUSH UPDATE accounts SET balance = balance + 25 WHERE id = {row_id}"
-                        )
-                        client.execute("AAYUSH COMMIT")
-                    except Exception:
+                    txn_deadline = time.monotonic() + 15.0
+                    while True:
                         try:
-                            client.execute("AAYUSH ROLLBACK")
-                        except Exception:
-                            pass
-                        raise
+                            client.execute(
+                                f"AAYUSH INSERT INTO accounts VALUES ({row_id}, {grp}, 500, 'w_{worker_id}')"
+                            )
+                            client.execute(
+                                f"AAYUSH UPDATE accounts SET balance = balance + 25 WHERE id = {row_id}"
+                            )
+                            client.execute("AAYUSH COMMIT")
+                            break
+                        except ServerError as exc:
+                            try:
+                                client.execute("AAYUSH ROLLBACK")
+                            except Exception:
+                                pass
+                            if (
+                                exc.code in {"WRITE_CONFLICT", TRANSACTION_BUSY}
+                                and time.monotonic() < txn_deadline
+                            ):
+                                time.sleep(0.01)
+                                client.execute("AAYUSH BEGIN")
+                                continue
+                            raise
 
                     with lock:
                         committed_workers.append(worker_id)

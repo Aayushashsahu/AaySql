@@ -189,3 +189,21 @@ What this shows:
 - **No speedup beyond these measurements is claimed.** Load, backup, restore, v3
   snapshot commits, and v4 changed-table checkpoints remain O(database/table), and
   `Database.clone()` remains O(database) for direct API users.
+
+## Phase 4 — MVCC readers and group commit
+
+Measured with `python benchmarks/benchmark_concurrency.py --workers 8 --per-worker 10`
+on Windows 11, Python 3.11, local NTFS; 80 durable autocommit INSERT transactions
+on a format-v4 database.
+
+| Path | Throughput | WAL fsyncs | Batches | Notes |
+| --- | ---: | ---: | ---: | --- |
+| One session, serial | 130.2 txn/s | 80 | 80 | one fsync per transaction |
+| 8 sessions, grouped | 785.8 txn/s | 10 | 10 | 8 transactions per fsync |
+| Reader while writer is open | 0.08 ms median | — | — | 50 point reads, max 0.53 ms |
+
+The grouped path produced **6.0× higher commit throughput** and reduced WAL
+fsyncs from 80 to 10. All 80 rows were present after commit; the v4 WAL replay
+was exercised independently by `tests/test_group_commit.py` and the subprocess
+crash test. These are local single-host numbers, not a hardware-independent
+claim.

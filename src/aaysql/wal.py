@@ -562,6 +562,192 @@ class WalManager:
         _maybe_crash("after_commit_fsync")
         return commit_lsn, txn_id
 
+    def append_commit_batch(
+        self, image_payloads: list[dict[str, Any]]
+    ) -> list[tuple[int, str]]:
+        """Append several format-v1..3 transactions with one COMMIT fsync.
+
+        The records stay three per transaction (BEGIN/WRITE/COMMIT) and keep
+        monotonically increasing LSNs, so recovery sees ordinary independent
+        transactions. The single ``fsync`` after the last COMMIT is the shared
+        commit point: a failure before it makes every transaction in the batch
+        either not durable (``StorageError``) or ambiguous (any COMMIT bytes were
+        written), and the WAL is poisoned either way.
+        """
+        if not image_payloads:
+            return []
+        self._ensure_writable()
+        if self.wal_path.exists() and self.wal_path.is_dir():
+            raise StorageError(f"WAL path '{self.wal_path}' is a directory")
+
+        prepared: list[tuple[list[bytes], int, str, int]] = []
+        lsn = self.last_lsn
+        try:
+            for image_payload in image_payloads:
+                txn_id = f"txn-{uuid.uuid4().hex}"
+                begin_lsn, write_lsn, commit_lsn = lsn + 1, lsn + 2, lsn + 3
+                committed_image = dict(image_payload)
+                committed_image["wal_lsn"] = commit_lsn
+                records = [
+                    serialize_record(build_record(begin_lsn, txn_id, "begin")),
+                    serialize_record(
+                        build_record(write_lsn, txn_id, "write", image=committed_image)
+                    ),
+                    serialize_record(
+                        build_record(commit_lsn, txn_id, "commit", write_lsn=write_lsn)
+                    ),
+                ]
+                prepared.append((records, commit_lsn, txn_id, write_lsn))
+                lsn = commit_lsn
+        except Exception as exc:
+            raise StorageError(
+                f"Failed to serialize WAL records for '{self.wal_path}': {exc}"
+            ) from exc
+
+        self._append_prepared(
+            [(records, commit_lsn) for records, commit_lsn, _txn, _write in prepared]
+        )
+        return [(commit_lsn, txn_id) for _records, commit_lsn, txn_id, _w in prepared]
+
+    def append_delta_batch(
+        self, change_sets: list[list[dict[str, Any]]], *, db_id: str
+    ) -> list[tuple[int, str]]:
+        """Append several format-v4 delta transactions with one COMMIT fsync."""
+        from .delta import validate_changes  # local import avoids a module cycle
+
+        if not change_sets:
+            return []
+        for changes in change_sets:
+            validate_changes(changes)
+        self._ensure_writable()
+        if self.wal_path.exists() and self.wal_path.is_dir():
+            raise StorageError(f"WAL path '{self.wal_path}' is a directory")
+
+        prepared: list[tuple[list[bytes], int, str, int]] = []
+        lsn = self.last_lsn
+        try:
+            for changes in change_sets:
+                ops = validate_changes(changes)
+                txn_id = f"txn-{uuid.uuid4().hex}"
+                begin_lsn, write_lsn, commit_lsn = lsn + 1, lsn + 2, lsn + 3
+                records = [
+                    serialize_record(
+                        build_record_v4(begin_lsn, txn_id, "begin", db_id=db_id)
+                    ),
+                    serialize_record(
+                        build_record_v4(
+                            write_lsn, txn_id, "write", db_id=db_id, changes=ops
+                        )
+                    ),
+                    serialize_record(
+                        build_record_v4(
+                            commit_lsn,
+                            txn_id,
+                            "commit",
+                            db_id=db_id,
+                            write_lsn=write_lsn,
+                        )
+                    ),
+                ]
+                prepared.append((records, commit_lsn, txn_id, write_lsn))
+                lsn = commit_lsn
+        except Exception as exc:
+            raise StorageError(
+                f"Failed to serialize WAL records for '{self.wal_path}': {exc}"
+            ) from exc
+
+        self._append_prepared(
+            [(records, commit_lsn) for records, commit_lsn, _txn, _write in prepared]
+        )
+        return [(commit_lsn, txn_id) for _records, commit_lsn, txn_id, _w in prepared]
+
+    def _append_prepared(
+        self, prepared: list[tuple[list[bytes], int]]
+    ) -> None:
+        """Write prepared record triples and fsync once after the final COMMIT."""
+        parent = self.wal_path.parent
+        created_new = not self.wal_path.exists()
+        try:
+            if str(parent):
+                parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise StorageError(
+                f"Failed to create WAL directory '{parent}': {exc}"
+            ) from exc
+
+        single = len(prepared) == 1
+        commit_bytes_written = False
+        fd: int | None = None
+        try:
+            fd = self._open_append()
+            for records, commit_lsn in prepared:
+                begin_bytes, write_bytes, commit_bytes = records
+                self.state = "begin_appended"
+                _write_all(fd, begin_bytes)
+                self.last_lsn = commit_lsn - 2
+                _maybe_crash("after_begin")
+
+                self.state = "write_appended"
+                _write_all(fd, write_bytes)
+                self.last_lsn = commit_lsn - 1
+                if single and os.environ.get(_CRASH_ENV_VAR) == "after_write_before_commit":
+                    os.fsync(fd)
+                    if created_new:
+                        fsync_dir(parent)
+                    os._exit(99)
+
+                if single and os.environ.get(_CRASH_ENV_VAR) == "partial_commit_record":
+                    partial_len = max(1, len(commit_bytes) // 2)
+                    partial = commit_bytes[:partial_len].rstrip(b"\n")
+                    if not partial:
+                        partial = b"{"
+                    _write_all(fd, partial)
+                    os.fsync(fd)
+                    if created_new:
+                        fsync_dir(parent)
+                    os._exit(99)
+
+                self.state = "commit_attempted"
+                commit_bytes_written = True
+                _write_all(fd, commit_bytes)
+                self.last_lsn = commit_lsn
+            os.fsync(fd)
+            self.state = "commit_durable"
+        except OSError as exc:
+            self.poisoned = True
+            if commit_bytes_written:
+                self.state = "ambiguous"
+                raise AmbiguousCommitError(
+                    f"Commit durability is ambiguous because WAL fsync failed on "
+                    f"'{self.wal_path}': {exc}; reopen the database to recover"
+                ) from exc
+            self.state = "damaged"
+            raise StorageError(
+                f"Failed to append WAL records to '{self.wal_path}': {exc}; "
+                "the WAL may contain an incomplete record and is blocked until recovery"
+            ) from exc
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        if created_new:
+            try:
+                fsync_dir(parent)
+            except StorageError as exc:
+                self.poisoned = True
+                self.state = "ambiguous"
+                raise AmbiguousCommitError(
+                    f"Commit durability is ambiguous because the WAL directory entry "
+                    f"could not be made durable for '{self.wal_path}': {exc}; "
+                    "reopen the database to recover"
+                ) from exc
+
+        self.state = "idle"
+        _maybe_crash("after_commit_fsync")
+
     def append_delta_transaction(
         self, changes: list[dict[str, Any]], *, db_id: str
     ) -> tuple[int, str]:

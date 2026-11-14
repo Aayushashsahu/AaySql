@@ -32,8 +32,8 @@ Version identifiers for this release:
 | `DELETE` | Yes | Optional `WHERE`; `DELETE` without `WHERE` removes every row. |
 | `CREATE INDEX` | Yes | Exactly one column per index; no `UNIQUE` indexes. |
 | `DROP INDEX` | Yes | Fails when the index does not exist. |
-| `BEGIN` | Yes | One explicit transaction per engine; no nesting, no `SAVEPOINT`. |
-| `COMMIT` | Yes | Single durable WAL commit of the whole transaction. |
+| `BEGIN` | Yes | One explicit transaction per session. Default READ COMMITTED; `BEGIN SNAPSHOT` pins the read view. No nesting, no `SAVEPOINT`, no `SERIALIZABLE`. |
+| `COMMIT` | Yes | Single durable WAL commit of the whole transaction; stale writes raise `WRITE_CONFLICT`. |
 | `ROLLBACK` | Yes | Reverses the transaction's rows, DDL, and index changes through the in-memory undo journal. |
 | `EXPLAIN` | Yes | Prints the plan; never executes the statement or mutates state. |
 | `EXPLAIN ANALYZE` | Yes | Executes the statement and reports measured per-operator counters. |
@@ -126,12 +126,12 @@ misinterpretation:
 - `RIGHT JOIN`, `FULL JOIN`, `CROSS JOIN`, `NATURAL JOIN`, `USING`.
 - `ALTER TABLE`, `TRUNCATE`, `CREATE VIEW`, `CREATE SCHEMA`, `CREATE DATABASE`.
 - `INSERT … SELECT`, `UPDATE … FROM`, `DELETE … USING`, `RETURNING`.
-- `SAVEPOINT`, `RELEASE`, `SET TRANSACTION`, isolation-level control.
+- `SAVEPOINT`, `RELEASE`, `SET TRANSACTION`; isolation is selected only by `BEGIN [ISOLATION LEVEL] SNAPSHOT|READ COMMITTED`.
 - `SELECT` without `FROM` (`AAYUSH SELECT 1` is rejected).
 - Scientific-notation numeric literals (`1e5`), hexadecimal literals, binary literals.
 - `IS TRUE` / `IS FALSE` / `IS DISTINCT FROM`.
 - Multiple statements in one `Engine.execute` call.
-- `MVCC`, snapshot isolation, concurrent writers, parallel query execution.
+- `SERIALIZABLE` isolation, row-level version chains, concurrent write execution, parallel query execution.
 
 ---
 
@@ -222,13 +222,13 @@ Result payloads mirror `Engine.execute()` minus `status`.
 
 **Stable error codes.** `INVALID_REQUEST`, `UNSUPPORTED_PROTOCOL_VERSION`,
 `AUTHENTICATION_FAILED`, `SQL_PARSE_ERROR`, `SQL_EXECUTION_ERROR`,
-`CONSTRAINT_ERROR`, `TRANSACTION_BUSY`, `TRANSACTION_ERROR`, `REQUEST_TOO_LARGE`,
+`CONSTRAINT_ERROR`, `WRITE_CONFLICT`, `TRANSACTION_BUSY`, `TRANSACTION_ERROR`, `REQUEST_TOO_LARGE`,
 `RESPONSE_TOO_LARGE`, `DATABASE_UNAVAILABLE`, `RECOVERY_REQUIRED`,
 `CONNECTION_TIMEOUT`, `TOO_MANY_CONNECTIONS`, `HELLO_REQUIRED`,
 `UNKNOWN_OPERATION`, `INTERNAL_ERROR`.
 
-**Retry semantics.** `TRANSACTION_BUSY`, `TOO_MANY_CONNECTIONS`, and
-`CONNECTION_TIMEOUT` are marked `retryable`. A lost connection or a read timeout
+**Retry semantics.** `WRITE_CONFLICT`, `TRANSACTION_BUSY`, `TOO_MANY_CONNECTIONS`,
+and `CONNECTION_TIMEOUT` are marked `retryable`. A lost connection or a read timeout
 after a request was sent is **not** retryable: the outcome is unknown and the
 client raises with `outcome_unknown = True` instead of replaying the statement.
 
@@ -291,9 +291,11 @@ Considered internal (no stability guarantee): `aaysql.parser`, `aaysql.lexer`,
 
 ## 5. Operational contract
 
-- **One writer per database.** The server serializes all engine access; there is no
-  MVCC and no concurrent write execution. Other sessions receive `TRANSACTION_BUSY`
-  while a transaction is owned elsewhere.
+- **One commit generator per database.** Readers run concurrently against pinned
+  committed snapshots. One writer is admitted at a time to generate a commit, and
+  admission is released before the shared WAL fsync. Stale writes receive
+  `WRITE_CONFLICT`; there is no multi-writer execution and no `SERIALIZABLE`
+  isolation. See [`docs/MVCC.md`](docs/MVCC.md).
 - **One owner per database file.** An embedded `Engine`, a server, a backup and a
   restore all take the same exclusive OS-level lease on `<db>.server.lock`
   (`fcntl` on POSIX, `msvcrt` on Windows) before loading or recovering anything. The

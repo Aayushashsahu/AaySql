@@ -322,6 +322,39 @@ class Database:
             copy.indexes[name] = Index(name, index.table, index.column, rows)
         return copy
 
+    def shallow_clone(self) -> Database:
+        """Copy the catalog while sharing published tables and index trees.
+
+        Callers must detach a table before mutating it. This is the root used by
+        an MVCC writer: O(tables) catalog work, no row copies until a table is
+        actually changed.
+        """
+        copy = Database()
+        copy.wal_lsn = self.wal_lsn
+        copy.tables = dict(self.tables)
+        copy.indexes = dict(self.indexes)
+        copy.stats = StatisticsStore()
+        return copy
+
+    def detach_table(self, name: str) -> Table:
+        """Give this database a private copy of ``name`` and its indexes."""
+        table = self.table(name)
+        specs = [
+            (index_name, index.column)
+            for index_name, index in self.indexes.items()
+            if index.table == name
+        ]
+        private = table.clone()
+        self.tables[name] = private
+        self.stats.invalidate(name)
+        for index_name, column in specs:
+            self.indexes[index_name] = Index(index_name, name, column, private.rows)
+        return private
+
+    def drop_indexes_on(self, table_name: str) -> None:
+        for name in [n for n, index in self.indexes.items() if index.table == table_name]:
+            del self.indexes[name]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "format": FORMAT_NAME,
@@ -580,6 +613,41 @@ class JsonFileStorage:
             self.pending_checkpoint = True
             self.last_checkpoint_error = exc
 
+    def save_batch(
+        self, entries: list[tuple[Database, list[dict[str, Any]] | None]]
+    ) -> list[tuple[int, str]]:
+        """Append several format-v1..3 full-image transactions with one fsync.
+
+        Checkpointing is deliberately deferred until after the caller publishes
+        the merged roots. A full WAL image must include every earlier batch
+        member, so checkpointing a member's private workspace here could publish
+        an older row set. The WAL itself is fully recoverable in any case.
+        """
+        if not entries:
+            return []
+        try:
+            payloads = [db.to_dict() for db, _changes in entries]
+        except Exception as exc:
+            if isinstance(exc, StorageError):
+                raise
+            raise StorageError(f"Failed to serialize database '{self.path}': {exc}") from exc
+
+        results = self.wal.append_commit_batch(payloads)
+        for (db, _changes), (commit_lsn, _txn_id) in zip(entries, results):
+            db.wal_lsn = commit_lsn
+        return results
+
+    def checkpoint_batch(
+        self, db: Database, commit_lsn: int, txn_id: str | None = None
+    ) -> None:
+        """Checkpoint the final merged batch root after publication."""
+        try:
+            self._checkpoint(db, commit_lsn, txn_id=txn_id)
+        except (OSError, StorageError) as exc:
+            # The batch is already durable in the WAL.
+            self.pending_checkpoint = True
+            self.last_checkpoint_error = exc
+
     def cleanup_if_clean(self, db: Database | None = None) -> None:
         """Remove an empty 0-byte WAL when no checkpoint is pending."""
         if not self.pending_checkpoint:
@@ -764,6 +832,40 @@ class SegmentedStorage:
         except (OSError, StorageError) as exc:
             # The commit is already durable in the WAL. Keep the WAL intact and
             # report a pending checkpoint, never a rollback.
+            self.pending_checkpoint = True
+            self.last_checkpoint_error = exc
+
+    def save_batch(
+        self, entries: list[tuple[Database, list[dict[str, Any]] | None]]
+    ) -> list[tuple[int, str]]:
+        """Append format-v4 delta transactions with one shared COMMIT fsync.
+
+        Checkpointing is deferred until the caller has published the merged
+        roots, so the manifest can never reference a state older than the WAL
+        commit point.
+        """
+        if not entries:
+            return []
+        if self.db_id is None:  # pragma: no cover - internal invariant
+            raise StorageError("Segmented storage has no database identity")
+        pending = [(db, list(changes or [])) for db, changes in entries]
+        pending = [(db, changes) for db, changes in pending if changes]
+        if not pending:
+            return []
+        results = self.wal.append_delta_batch(
+            [changes for _db, changes in pending], db_id=self.db_id
+        )
+        for (db, _changes), (commit_lsn, _txn_id) in zip(pending, results):
+            db.wal_lsn = commit_lsn
+        return results
+
+    def checkpoint_batch(self, db: Database, commit_lsn: int) -> None:
+        """Checkpoint a published batch root when the WAL crossed the threshold."""
+        try:
+            wal_path = self.wal.wal_path
+            if wal_path.exists() and wal_path.stat().st_size >= self.checkpoint_bytes:
+                self._checkpoint(db, commit_lsn)
+        except (OSError, StorageError) as exc:
             self.pending_checkpoint = True
             self.last_checkpoint_error = exc
 

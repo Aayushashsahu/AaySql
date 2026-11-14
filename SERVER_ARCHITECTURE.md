@@ -4,9 +4,10 @@ This document describes the client/server layer added in v0.8.0: one server
 process, one database engine, many client connections, and a versioned network
 protocol. It also states exactly what the concurrency contract is — and is not.
 
-**The database engine did not change.** The server uses the existing
-`aaysql.engine.Engine`, the existing parser, planner, executor, B+ tree indexes,
-statistics, WAL and crash recovery. `.aaydb` format version stays **3**.
+The server still uses one `aaysql.engine.Engine`, the existing parser, planner,
+executor, B+ tree indexes, statistics, WAL and crash recovery. Phase 4 adds
+independent MVCC sessions over that engine; the on-disk format version is
+unchanged (`.aaydb` format **4** for new databases).
 
 ---
 
@@ -31,21 +32,20 @@ Startup order is strict: acquire the process lock → open the engine (recovery
 runs here) → bind the socket → begin accepting. A client can therefore never
 reach a database that has not finished recovering.
 
-## 2. Multiple clients, serialized execution
+## 2. Multiple clients, concurrent readers
 
-Multiple clients may hold connections at the same time. They do **not** get
-parallel database execution.
+Multiple clients may hold connections and execute at the same time.
 
-- `TransactionCoordinator` holds one `threading.Lock`. Every statement is
-  executed while holding it.
-- The lock is released before the response is written to the socket, so a slow
-  client cannot stall the engine.
-- Each connection has its own thread (`socketserver.ThreadingTCPServer`), but a
-  thread that is not executing is blocked waiting for the lock, not touching the
-  engine.
-
-This is the deliberate trade-off: **more clients improve accessibility, but
-actual database work is serialized.**
+- Each accepted connection owns a `DatabaseSession` with its own snapshot,
+  transaction manager, recorder, and undo journal.
+- Reads execute against a pinned, immutable committed root and do not take a
+  global execution lock. A slow reader cannot block a writer, and a writer's
+  uncommitted workspace is never visible.
+- One writer at a time is admitted to validate a commit and enqueue it. That
+  admission is released before the batch WAL fsync, so other sessions can run
+  and enqueue while the previous batch is on disk.
+- The commit queue publishes roots in durable order. Independent transactions
+  may share one WAL `COMMIT` fsync.
 
 ## 3. Session model
 
@@ -55,10 +55,11 @@ session carries:
 | Field | Meaning |
 | --- | --- |
 | `session_id` | Server-generated identity. Never accepted from the client. |
+| `datastore` | The independent MVCC `DatabaseSession` for this connection. |
 | `authenticated` | Set only by a successful handshake. |
 | `hello_done` | Handshake completed. |
 | `protocol_version` | Protocol spoken on this connection. |
-| `owns_transaction` | Mirrors the engine's authoritative transaction state. |
+| `owns_transaction` | Mirrors this session's transaction state. |
 | `last_activity` | Drives the idle timeout. |
 | `requests` | Statement counter for diagnostics. |
 | `client_name`, `client_version` | Client-supplied labels, sanitized and length-capped for logs. |
@@ -67,40 +68,36 @@ session carries:
 Sessions are removed when the connection ends, and session cleanup is where
 disconnect rollback happens.
 
-## 4. Transaction ownership
+## 4. Independent transactions
 
-The engine has exactly one `TransactionManager`, so the server must decide which
-session may use it.
-
-- `BEGIN` from session *A*: under the coordinator lock, if another session owns
-  the transaction the request is rejected with `TRANSACTION_BUSY` **before** the
-  engine is called; otherwise `engine.begin()` runs and the ownership record
-  points at *A*.
-- While *A* owns a transaction, every other session's `execute` (including
-  `SELECT`, `EXPLAIN`, DML and DDL) is rejected with `TRANSACTION_BUSY`
-  (`retryable: true`). Non-owners never reach the engine, so they cannot observe
-  uncommitted rows or schema changes and cannot absorb someone else's statements.
-- After every successful statement the coordinator re-derives ownership from
-  `engine.in_transaction` — the engine is the authority. SQL text is never
-  parsed to guess transaction state (it is only inspected to choose a more
-  precise error code).
-- `COMMIT` / `ROLLBACK` run through the engine; ownership is released based on
-  the resulting engine state.
-- Duplicate `BEGIN` from the owner is rejected by the engine itself and reported
-  as `TRANSACTION_ERROR`.
+- `BEGIN` creates a transaction on that connection only. It no longer takes a
+  server-wide ownership record, so another session cannot be blocked by it.
+- `READ COMMITTED` is the default. Each statement reads the latest committed
+  snapshot until the transaction performs its first write; after that the
+  transaction keeps its snapshot so its own reads stay coherent.
+- `BEGIN SNAPSHOT` (or `BEGIN ISOLATION LEVEL SNAPSHOT`) pins the committed
+  root for the whole transaction. There is no `SERIALIZABLE` level.
+- A reader never observes another session's uncommitted rows or DDL.
+- Writes are first-updater-wins at table granularity. If another transaction
+  committed a change to the same table after this snapshot, `COMMIT` fails with
+  `WRITE_CONFLICT` (retryable). The transaction is aborted; applications retry
+  the whole transaction from `BEGIN`.
+- Insert-only transactions may append to the same table concurrently. Their
+  UNIQUE and PRIMARY KEY values are reserved against published rows and earlier
+  queued inserts, so a collision raises `CONSTRAINT_ERROR`.
+- Duplicate `BEGIN` in one connection is rejected as `TRANSACTION_ERROR`.
 
 ### Busy policy
 
-Busy is an **immediate** retryable error, not a queue. The server does not hold
-requests on behalf of a blocked client, and the client library never replays a
-mutation. Applications retry the *whole* transaction on `TRANSACTION_BUSY` with
-their own backoff, and only when their transaction did not begin.
+`TRANSACTION_BUSY` is retained as a stable compatibility code but is no longer
+produced merely because another session holds a transaction. A stale writer
+receives `WRITE_CONFLICT`; the server never replays a mutation.
 
 ### Disconnect
 
-If the owner disconnects while holding an active transaction, the server rolls
-it back, releases ownership, and logs the cleanup (no SQL values are logged). No
-uncommitted mutation reaches persistent storage.
+If a session disconnects with an active transaction, only that session's
+transaction is rolled back and its snapshot released. No uncommitted mutation
+reaches persistent storage and no other session's transaction is affected.
 
 ## 5. Ambiguous commit handling
 
@@ -109,8 +106,8 @@ back":
 
 - `Engine` raises `AmbiguousCommitError` when the WAL commit record may or may
   not have reached disk.
-- The coordinator marks the whole database service unavailable and keeps the
-  owner tombstone so nothing else can start using the engine.
+- The coordinator marks the whole database service unavailable so no session
+  can start new work against the engine.
 - Every subsequent request from every session gets `RECOVERY_REQUIRED`
   (`retryable: false`).
 - The client receives a definite `RECOVERY_REQUIRED` error — never a rollback
@@ -172,7 +169,7 @@ retry with a supported version.
 
 Stable codes: `INVALID_REQUEST`, `UNSUPPORTED_PROTOCOL_VERSION`,
 `AUTHENTICATION_FAILED`, `SQL_PARSE_ERROR`, `SQL_EXECUTION_ERROR`,
-`CONSTRAINT_ERROR`, `TRANSACTION_BUSY`, `TRANSACTION_ERROR`,
+`CONSTRAINT_ERROR`, `WRITE_CONFLICT`, `TRANSACTION_BUSY`, `TRANSACTION_ERROR`,
 `REQUEST_TOO_LARGE`, `DATABASE_UNAVAILABLE`, `RECOVERY_REQUIRED`,
 `CONNECTION_TIMEOUT`, `INTERNAL_ERROR`, plus `UNKNOWN_OPERATION`,
 `TOO_MANY_CONNECTIONS` and `HELLO_REQUIRED`.
@@ -330,22 +327,25 @@ statement. Never replay `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`,
 
 ## 12. Concurrency limitations (explicit)
 
-Not supported in v0.8.0:
+Supported:
 
-- concurrent writes; every statement is serialized;
-- MVCC, snapshot isolation, or any configurable isolation level;
-- read-uncommitted / read-committed behavior;
-- multiple server processes writing one database;
+- many simultaneous connections and concurrent snapshot readers;
+- independent session-owned transactions with READ COMMITTED by default and
+  explicit `BEGIN SNAPSHOT`;
+- one writer admitted at a time, group commit sharing one WAL fsync, and
+  first-updater-wins `WRITE_CONFLICT`;
+- autocommit for mutations outside a transaction, disconnect rollback of only
+  the affected session, prompt recovery-required handling after an ambiguous
+  commit, and per-request error isolation.
+
+Not supported:
+
+- `SERIALIZABLE` isolation or configurable levels beyond READ COMMITTED/SNAPSHOT;
+- row-level version chains, concurrent write execution, or multiple server
+  processes writing one database;
 - parallel query execution;
 - transaction handoff between sessions;
-- statements from other sessions while a transaction is open (they get
-  `TRANSACTION_BUSY`, not a snapshot of committed data);
-- nested transactions and savepoints (unchanged from earlier versions).
-
-Supported: many simultaneous connections, session-owned transactions with
-strict single-owner enforcement, autocommit for mutations outside a transaction,
-disconnect rollback, prompt recovery-required handling after an ambiguous
-commit, and per-request error isolation.
+- nested transactions and savepoints.
 
 ## 13. Operational logging
 

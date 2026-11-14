@@ -230,8 +230,9 @@ Some costs remain proportional to the table or database and are not undo work:
   but a checkpoint writes a segment for each changed table.
 - Opening, loading, backup, and restore remain O(database).
 
-There is no MVCC or snapshot isolation: other sessions still see no uncommitted work
-because the server serializes access and permits one explicit transaction at a time.
+Readers use MVCC snapshots, so other sessions see the last committed version while a
+writer is active. Writers are admitted one at a time to generate a commit, and stale
+writes are rejected with `WRITE_CONFLICT`. See [`MVCC.md`](MVCC.md).
 
 ## 10. Disk space
 
@@ -313,15 +314,19 @@ To recover from `DATABASE_LOCKED`:
 2. Confirm the process is gone. Do not delete the lock file.
 3. Reopen the database; the OS lock is already free and recovery runs normally.
 
-## 12. Single-writer limitations
+## 12. Concurrency limits
 
-- Exactly one server process per database, and exactly one active transaction across
-  all its sessions.
-- Other sessions get `TRANSACTION_BUSY` (retryable) while another session holds a
-  transaction. Long transactions block reads from other sessions too.
-- No MVCC, no snapshot isolation, no parallel query execution.
-- Every statement is serialized through one lock, so throughput does not grow with
-  client count.
+- Exactly one server process and one database owner per file.
+- Every connection owns an independent transaction and snapshot. Readers do not block
+  on a writer and never observe uncommitted state.
+- One writer is admitted at a time to generate a commit; admission is released before
+  the batch WAL fsync. Independent commits share one durability point.
+- Conflicts are table-level and first-updater-wins. A stale `COMMIT` returns
+  `WRITE_CONFLICT` (retryable); retry the whole transaction.
+- No `SERIALIZABLE`, row-level version chains, concurrent write execution, or parallel
+  query execution.
+- A writer's copy-on-write cost is proportional to the table it changes; readers are
+  O(1) in database size. Checkpointing remains proportional to changed tables.
 
 ## 13. Troubleshooting
 
@@ -332,7 +337,8 @@ To recover from `DATABASE_LOCKED`:
 | `StorageError: Corrupted database file …` | Snapshot is not valid JSON or fails validation. | Restore a backup; keep the file for diagnosis. |
 | `StorageError: Corrupted WAL record …` | Mid-log corruption. | Restore a backup; do not truncate the WAL manually. |
 | `TOO_MANY_CONNECTIONS` | `--max-clients` reached. | Close idle clients or raise the limit. |
-| `TRANSACTION_BUSY` | Another session owns the transaction. | Retry after it commits/rolls back. |
+| `WRITE_CONFLICT` | Another transaction committed a change to the same table first. | Retry the whole transaction from `BEGIN`. |
+| `TRANSACTION_BUSY` | Legacy ownership rejection; independent sessions no longer use it. | Retry if a custom deployment still returns it. |
 | `CONNECTION_TIMEOUT` | Client idle or stalled mid-frame. | Reconnect; check client timeouts. |
 | Client raises `ConnectionLostError` | Server closed the connection. | The outcome is unknown — reconnect and inspect before retrying. |
 | Every `CREATE TABLE` says "already exists" | You opened a newer/other database file. | Check `--db` resolves to the file you expect. |

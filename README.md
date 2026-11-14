@@ -16,7 +16,7 @@ Every top-level SQL statement must begin with `AAYUSH`. Ordinary SQL without the
 
 AayushSQL v1.0.0 establishes a frozen, documented compatibility contract, security boundary, offline backup and restore (`aaysql-backup`), cross-platform CI (Ubuntu/Windows/macOS across Python 3.10–3.13), and wheel/source packaging on top of the full v0.1.0–v0.9.0 engine: relational queries, expressions (`IS NULL`, `LIKE`, `IN`, `BETWEEN`, arithmetic, `CASE`, `DISTINCT`, `OFFSET`), B+ tree indexes, cost-based optimizer and hash joins, transactions, WAL crash recovery, and TCP server with token auth and TLS.
 
-**Multiple connections, one writer.** The server adds accessibility, not concurrency: there is no MVCC, no snapshot isolation, and no parallel query execution.
+**Multiple connections, concurrent readers.** Each connection has an independent MVCC snapshot. Readers never block on a writer; one commit generator is admitted at a time and independent commits share a WAL fsync. There is no SERIALIZABLE isolation, row-level version chain, or parallel query execution.
 
 ## Why the `AAYUSH` Prefix Exists
 
@@ -49,8 +49,8 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 - **Client/server**: the new syntax works through `AayushSQLClient` unchanged — the protocol stays version `1` because SQL is still a string, and integration tests compare every feature against the embedded engine over real sockets.
 - **Tests**: `tests/test_expressions.py` (parser, precedence, truth tables), `tests/test_language_queries.py` (planning, EXPLAIN, index equivalence, joins, persistence), `tests/test_expression_fuzz.py` (deterministic randomized differential testing against an independent reference interpreter), `tests/test_client_server_language.py` (real TCP).
 - **Benchmarks**: `benchmarks/benchmark_language.py` with recorded results in `BENCHMARKS.md`.
-- **Server** (`src/aaysql/server.py`, entry point `python -m aaysql.server`): owns exactly one `Engine`, one session per connection, all engine access serialized through a single coordinator lock, session-owned transactions with immediate retryable `TRANSACTION_BUSY` for other sessions, automatic rollback when a transaction owner disconnects, and `RECOVERY_REQUIRED` for every session after an ambiguous commit.
-- **Versioned network protocol** (`src/aaysql/protocol.py`, protocol version `1`): 4-byte big-endian length + UTF-8 JSON frames, 1 MiB default frame limit validated before allocation, `hello`/`ping`/`execute` operations, request IDs with duplicate detection, and stable error codes (`INVALID_REQUEST`, `UNSUPPORTED_PROTOCOL_VERSION`, `AUTHENTICATION_FAILED`, `SQL_PARSE_ERROR`, `SQL_EXECUTION_ERROR`, `CONSTRAINT_ERROR`, `TRANSACTION_BUSY`, `TRANSACTION_ERROR`, `REQUEST_TOO_LARGE`, `DATABASE_UNAVAILABLE`, `RECOVERY_REQUIRED`, `CONNECTION_TIMEOUT`, `INTERNAL_ERROR`, `TOO_MANY_CONNECTIONS`, `HELLO_REQUIRED`, `UNKNOWN_OPERATION`). Tracebacks are never sent to clients.
+- **Server** (`src/aaysql/server.py`, entry point `python -m aaysql.server`): owns exactly one `Engine` and one independent MVCC session per connection. Readers run concurrently against committed snapshots instead of blocking behind a writer; each session owns its transaction, disconnect rolls back only that session, stale writers receive `WRITE_CONFLICT`, and `RECOVERY_REQUIRED` covers every session after an ambiguous commit.
+- **Versioned network protocol** (`src/aaysql/protocol.py`, protocol version `1`): 4-byte big-endian length + UTF-8 JSON frames, 1 MiB default frame limit validated before allocation, `hello`/`ping`/`execute` operations, request IDs with duplicate detection, and stable error codes (`INVALID_REQUEST`, `UNSUPPORTED_PROTOCOL_VERSION`, `AUTHENTICATION_FAILED`, `SQL_PARSE_ERROR`, `SQL_EXECUTION_ERROR`, `CONSTRAINT_ERROR`, `WRITE_CONFLICT`, `TRANSACTION_BUSY`, `TRANSACTION_ERROR`, `REQUEST_TOO_LARGE`, `DATABASE_UNAVAILABLE`, `RECOVERY_REQUIRED`, `CONNECTION_TIMEOUT`, `INTERNAL_ERROR`, `TOO_MANY_CONNECTIONS`, `HELLO_REQUIRED`, `UNKNOWN_OPERATION`). Tracebacks are never sent to clients.
 - **Python client** (`src/aaysql/client.py`): `AayushSQLClient` with `connect`/`execute`/`ping`/`close`, context manager, optional token and TLS, configurable timeouts, a documented exception hierarchy, and **no automatic retries** — an interrupted request reports `outcome_unknown`.
 - **Security**: loopback bind by default; non-loopback binds require both `AAYUSQL_AUTH_TOKEN` and TLS; tokens compared with `hmac.compare_digest` and never logged or stored; TLS certificate and hostname verification on by default; optional client-certificate verification.
 - **Operational**: exclusive per-database process lock released by the OS on crash, connection/ frame/ timeout limits, bounded graceful shutdown that rolls back uncommitted work, and integration tests over real sockets.
@@ -87,6 +87,11 @@ Everything behind the parser — relational joins, column resolution, grouping, 
   - `BEGIN` is O(1): it records an undo-journal marker instead of cloning the database. Mutations inside a transaction are visible to later statements but stay in memory until the single `COMMIT` save; `ROLLBACK` applies inverse entries for the rows, indexes, and schema objects that actually changed.
   - Each statement stays atomic inside a transaction through a per-statement journal marker. Journal memory is proportional to the rows and catalog objects the transaction touched, not to the size of the database.
   - Closing the engine or exiting the CLI with an active transaction rolls it back and prints a warning to `stderr`.
+- MVCC readers & group commit (see [`docs/MVCC.md`](docs/MVCC.md)):
+  - `Engine.connect()` returns an independent session. Readers pin a committed root and never block on a writer; `READ COMMITTED` is the default and `BEGIN SNAPSHOT` pins the read view.
+  - Writers use a private copy-on-write root; unchanged tables and indexes are shared with the published version. Published roots are immutable, so readers cannot observe partial or uncommitted state.
+  - First-updater-wins conflict detection raises `WriteConflictError` / protocol `WRITE_CONFLICT`. Insert-only transactions may append concurrently with UNIQUE/PRIMARY KEY reservation.
+  - A commit queue batches independent transactions into one WAL `COMMIT` fsync. Writer admission is released before that fsync, so other sessions keep running while the disk is busy.
 - Delta WAL, segmented checkpoints & format v4 (see [`WAL.md`](WAL.md), [`docs/FORMAT_V4.md`](docs/FORMAT_V4.md)):
   - Commits append only the changed rows (`insert`/`update`/`delete`/DDL), never a whole-database image; the WAL `COMMIT` `fsync` remains the commit point.
   - Checkpoints publish a root manifest at `<db>` that references one immutable, content-addressed segment per table under `<db>.seg/`. Unchanged tables reuse their existing segment bytes, and unreferenced generations are collected.
@@ -110,7 +115,7 @@ Everything behind the parser — relational joins, column resolution, grouping, 
 - Automated cross-platform GitHub Actions CI across Ubuntu, Windows, and macOS on Python 3.10–3.13, plus packaging and clean-venv install validation.
 
 ### Planned (Post-1.0 Roadmap)
-- Candidate future work beyond v1.0.0: subqueries/`UNION`, expression or multi-column indexes, aggregate `DISTINCT`, window functions, and concurrent MVCC writers (the v1.0.0 model is strictly single-writer).
+- Candidate future work beyond v1.0.0: subqueries/`UNION`, expression or multi-column indexes, aggregate `DISTINCT`, window functions, row-level MVCC conflict tracking, and multi-writer execution (the current model admits one commit generator at a time).
 
 ## Example SQL Expressions
 
@@ -344,21 +349,26 @@ with AayushSQLClient("127.0.0.1", 8765) as db:
 ### Multiple clients
 
 A connection is not a transaction. Client A may hold an open transaction while
-Client B stays connected; B's statements are rejected with
-`TRANSACTION_BUSY` (`retryable: true`) until A commits or rolls back. B never
-sees A's uncommitted rows, and B's statements are never folded into A's
-transaction. If A disconnects mid-transaction, the server rolls it back
-automatically.
+Client B keeps reading the last committed database version; B is never blocked
+and never sees A's uncommitted rows. B's own `BEGIN` is independent. If two
+transactions write the same table, the first durable commit wins and the stale
+`COMMIT` receives `WRITE_CONFLICT` (`retryable: true`); retry the whole
+transaction. If A disconnects mid-transaction, the server rolls back only A and
+releases its snapshot.
 
 ```python
 from aaysql.client import AayushSQLClient, ServerError
 
 with AayushSQLClient("127.0.0.1", 8765) as db:
+    db.execute("AAYUSH BEGIN SNAPSHOT")
     try:
-        db.execute("AAYUSH SELECT * FROM students")
+        db.execute("AAYUSH UPDATE accounts SET balance = balance - 100 WHERE id = 1")
+        db.execute("AAYUSH COMMIT")
     except ServerError as exc:
-        if exc.code == "TRANSACTION_BUSY":
-            ...  # someone else owns the transaction; back off and retry
+        if exc.code == "WRITE_CONFLICT":
+            ...  # another transaction committed first; retry from BEGIN
+        else:
+            raise
 ```
 
 ### Authentication and TLS
@@ -392,10 +402,13 @@ determine the real state; never replay mutations or `COMMIT` automatically.
 
 ### Current concurrency limits
 
-- Statements execute **serially** against the single engine; there are no
-  concurrent writes, no MVCC, no snapshot isolation, and no parallel queries.
-- Only one session may own a transaction at a time; other sessions are blocked
-  with `TRANSACTION_BUSY` rather than being served stale reads.
+- Readers are concurrent snapshot readers. Writers are admitted one at a time
+  to generate a commit, but admission is released before the WAL fsync so
+  independent commits can batch behind one durability point.
+- `READ COMMITTED` is the default; `BEGIN SNAPSHOT` pins a repeatable read view.
+  There is no `SERIALIZABLE` level, no row-level version chain, no lock manager,
+  and no parallel query execution. Conflicting writes are table-level and
+  first-updater-wins.
 - Only one owner may hold a database file: one server, one embedded `Engine`,
   one backup, or one restore. The canonical `<database>.server.lock` lease
   enforces it across processes and within a process, for every entry point. A

@@ -1,6 +1,7 @@
 # Security
 
-AayushSQL 1.0.0 is a single-writer database with an optional TCP server. This
+AayushSQL 1.0.0 is a database with concurrent snapshot readers and one admitted
+commit generator at a time, plus an optional TCP server. This
 document states the security boundary and how to configure it. It does not claim
 that the engine is immune to attack.
 

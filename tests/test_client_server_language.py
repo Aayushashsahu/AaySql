@@ -171,11 +171,15 @@ def test_transactions_with_expressions_are_visible_only_inside_the_session(serve
         assert first.execute("AAYUSH SELECT id, score FROM t WHERE id = 1")["rows"] == [
             {"id": 1, "score": 180}
         ]
-        # Another session cannot see or join the in-progress transaction.
+        # Another session reads the last committed version concurrently; it
+        # cannot see or join the in-progress transaction.
         with AayushSQLClient(*server.address) as second:
-            with pytest.raises(ServerError) as excinfo:
-                second.execute("AAYUSH SELECT COUNT(*) AS c FROM t")
-            assert excinfo.value.code == "TRANSACTION_BUSY"
+            assert second.execute("AAYUSH SELECT COUNT(*) AS c FROM t")["rows"] == [
+                {"c": 5}
+            ]
+            assert second.execute(
+                "AAYUSH SELECT id, score, name FROM t WHERE id = 1"
+            )["rows"] == [{"id": 1, "score": 90, "name": "Alex"}]
         first.execute("AAYUSH ROLLBACK")
         assert first.execute("AAYUSH SELECT id, score FROM t WHERE id = 1")["rows"] == [
             {"id": 1, "score": 90}
