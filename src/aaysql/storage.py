@@ -22,6 +22,7 @@ from .json_value import (
     parse_json_document,
     validate_json_value,
 )
+from .schema_validator import validate_schema_definition
 from .statistics import StatisticsStore
 from .wal import (
     _CRASH_ENV_VAR,
@@ -246,6 +247,12 @@ class Table:
     # Bumped on every row mutation so cached planner statistics cannot go stale.
     # Not persisted: it is a runtime cache key, not part of the file format.
     revision: int = 0
+    is_collection: bool = False
+    validation_mode: str = "FLEXIBLE"
+    schema: dict[str, Any] | None = None
+    schema_version: int = 1
+    warn_count: int = 0
+    last_warn: dict[str, Any] | None = None
 
     @property
     def column_names(self) -> list[str]:
@@ -265,14 +272,28 @@ class Table:
             columns=list(self.columns),
             rows=[deep_copy_json(row) for row in self.rows],
             revision=self.revision,
+            is_collection=self.is_collection,
+            validation_mode=self.validation_mode,
+            schema=deep_copy_json(self.schema) if self.schema is not None else None,
+            schema_version=self.schema_version,
+            warn_count=self.warn_count,
+            last_warn=deep_copy_json(self.last_warn) if self.last_warn is not None else None,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "name": self.name,
             "columns": [_column_to_dict(col) for col in self.columns],
             "rows": [serialize_row_for_storage(self.columns, row) for row in self.rows],
         }
+        if self.is_collection:
+            data["is_collection"] = True
+            data["validation_mode"] = self.validation_mode
+            data["schema"] = deep_copy_json(self.schema) if self.schema is not None else None
+            data["schema_version"] = self.schema_version
+            data["warn_count"] = self.warn_count
+            data["last_warn"] = deep_copy_json(self.last_warn) if self.last_warn is not None else None
+        return data
 
     @classmethod
     def from_dict(cls, key: str, data: Any) -> Table:
@@ -322,7 +343,26 @@ class Table:
                 clean_row[col.name] = val
             rows.append(clean_row)
 
-        return cls(name=name, columns=columns, rows=rows)
+        is_collection = bool(data.get("is_collection", False))
+        validation_mode = str(data.get("validation_mode", "FLEXIBLE")).upper()
+        schema = data.get("schema")
+        schema_version = int(data.get("schema_version", 1))
+        warn_count = int(data.get("warn_count", 0))
+        last_warn = data.get("last_warn")
+        if schema is not None:
+            validate_schema_definition(schema)
+
+        return cls(
+            name=name,
+            columns=columns,
+            rows=rows,
+            is_collection=is_collection,
+            validation_mode=validation_mode,
+            schema=schema,
+            schema_version=schema_version,
+            warn_count=warn_count,
+            last_warn=last_warn,
+        )
 
 
 class Database:
@@ -335,7 +375,7 @@ class Database:
         # Planner statistics cache. A clone/reload starts empty, so snapshot
         # installation (transaction rollback, WAL recovery) can never expose
         # statistics that describe a superseded row set.
-        self.stats = StatisticsStore()
+        self.stats = StatisticsStore(self)
 
     def create_table(self, name: str, columns: list[ColumnDef]) -> None:
         if name in self.tables:
@@ -343,15 +383,33 @@ class Database:
         validated_columns = validate_table_schema(columns)
         self.tables[name] = Table(name, validated_columns)
 
-    def create_collection(self, name: str) -> None:
+    def create_collection(
+        self,
+        name: str,
+        validation_mode: str = "FLEXIBLE",
+        schema: dict[str, Any] | None = None,
+    ) -> None:
         if name in self.tables:
             raise ExecutionError(f"Table '{name}' already exists")
+        norm_mode = str(validation_mode).upper()
+        if norm_mode not in ("FLEXIBLE", "WARN", "STRICT"):
+            raise ExecutionError(f"Invalid validation mode '{validation_mode}'. Must be FLEXIBLE, WARN, or STRICT.")
+        if schema is not None:
+            validate_schema_definition(schema)
         columns = [
             ColumnDef(name="_id", type_name="TEXT", primary_key=True, not_null=True),
             ColumnDef(name="_rev", type_name="INT", not_null=True),
             ColumnDef(name="body", type_name="JSON", not_null=True),
         ]
-        self.create_table(name, columns)
+        validated_columns = validate_table_schema(columns)
+        self.tables[name] = Table(
+            name=name,
+            columns=validated_columns,
+            is_collection=True,
+            validation_mode=norm_mode,
+            schema=schema,
+            schema_version=1,
+        )
 
     def table(self, name: str) -> Table:
         if name not in self.tables:
@@ -365,12 +423,26 @@ class Database:
         for index_name in [n for n, index in self.indexes.items() if index.table == name]:
             del self.indexes[index_name]
 
-    def create_index(self, name: str, table_name: str, column: str) -> Index:
+    def create_index(
+        self,
+        name: str,
+        table_name: str,
+        column: str,
+        path: tuple[str, ...] | list[str] | None = None,
+    ) -> Index:
         if name in self.indexes:
             raise ExecutionError(f"Index '{name}' already exists")
         table = self.table(table_name)
         table.ensure_column(column)
-        index = Index(name, table_name, column, table.rows)
+        path_tuple: tuple[str, ...] | None = None
+        if path is not None:
+            path_tuple = tuple(path)
+            col_def = next(c for c in table.columns if c.name == column)
+            if col_def.type_name.upper() not in ("JSON", "DOCUMENT"):
+                raise ExecutionError(
+                    f"Cannot create path index on non-JSON column '{column}' in table '{table_name}'"
+                )
+        index = Index(name, table_name, column, table.rows, path=path_tuple)
         self.indexes[name] = index
         return index
 
@@ -389,7 +461,8 @@ class Database:
         for name, index in self.indexes.items():
             table = copy.tables.get(index.table)
             rows = table.rows if table is not None else ()
-            copy.indexes[name] = Index(name, index.table, index.column, rows)
+            copy.indexes[name] = Index(name, index.table, index.column, rows, path=index.path)
+        copy.stats = StatisticsStore(copy)
         return copy
 
     def shallow_clone(self) -> Database:
@@ -403,22 +476,22 @@ class Database:
         copy.wal_lsn = self.wal_lsn
         copy.tables = dict(self.tables)
         copy.indexes = dict(self.indexes)
-        copy.stats = StatisticsStore()
+        copy.stats = StatisticsStore(copy)
         return copy
 
     def detach_table(self, name: str) -> Table:
         """Give this database a private copy of ``name`` and its indexes."""
         table = self.table(name)
         specs = [
-            (index_name, index.column)
+            (index_name, index.column, index.path)
             for index_name, index in self.indexes.items()
             if index.table == name
         ]
         private = table.clone()
         self.tables[name] = private
         self.stats.invalidate(name)
-        for index_name, column in specs:
-            self.indexes[index_name] = Index(index_name, name, column, private.rows)
+        for index_name, column, path in specs:
+            self.indexes[index_name] = Index(index_name, name, column, private.rows, path=path)
         return private
 
     def drop_indexes_on(self, table_name: str) -> None:
@@ -496,7 +569,13 @@ def _index_from_spec(db: Database, name: Any, spec: Any) -> Index:
     table = db.tables[table_name]
     if column not in table.column_names:
         raise StorageError(f"Index '{name}' references unknown column '{table_name}.{column}'")
-    index = Index(name, table_name, column, table.rows)
+    raw_path = spec.get("path")
+    path_tuple = None
+    if raw_path is not None:
+        if not isinstance(raw_path, (list, tuple)) or not all(isinstance(p, str) for p in raw_path):
+            raise StorageError(f"Invalid path in index '{name}'")
+        path_tuple = tuple(raw_path)
+    index = Index(name, table_name, column, table.rows, path=path_tuple)
     try:
         index.validate()
     except BTreeError as exc:
@@ -837,7 +916,7 @@ class SegmentedStorage:
                 ref = dict(prior)
             tables[name] = ref
         indexes = {
-            name: {"table": index.table, "column": index.column}
+            name: index.describe()
             for name, index in db.indexes.items()
         }
         manifest = segments.build_manifest(

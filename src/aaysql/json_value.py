@@ -436,6 +436,9 @@ def extract_path(value: Any, path: Sequence[str | int]) -> Any:
     return curr
 
 
+get_path = extract_path
+
+
 def set_path(doc: Any, path: Sequence[str | int], new_value: Any) -> Any:
     """Return a new document with ``new_value`` set at ``path`` (copy-on-write).
 

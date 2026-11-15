@@ -46,6 +46,14 @@ MANIFEST_KEYS = frozenset(
     }
 )
 SEGMENT_KEYS = frozenset({"format", "format_version", "table", "columns", "rows"})
+ALLOWED_SEGMENT_KEYS = SEGMENT_KEYS | {
+    "is_collection",
+    "validation_mode",
+    "schema",
+    "schema_version",
+    "warn_count",
+    "last_warn",
+}
 TABLE_REF_KEYS = frozenset({"segment", "generation", "length", "sha256"})
 DB_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
@@ -144,13 +152,21 @@ def encode_segment(table: Table) -> dict[str, Any]:
             raise StorageError(
                 f"Row in table '{table.name}' is missing column {exc.args[0]!r}"
             ) from exc
-    return {
+    payload: dict[str, Any] = {
         "format": SEGMENT_FORMAT,
         "format_version": MANIFEST_FORMAT_VERSION,
         "table": table.name,
         "columns": [_column_payload(column) for column in table.columns],
         "rows": rows,
     }
+    if getattr(table, "is_collection", False):
+        payload["is_collection"] = True
+        payload["validation_mode"] = table.validation_mode
+        payload["schema"] = table.schema
+        payload["schema_version"] = table.schema_version
+        payload["warn_count"] = table.warn_count
+        payload["last_warn"] = table.last_warn
+    return payload
 
 
 def write_segment(db_path: Path, table: Table, *, generation: int) -> dict[str, Any]:
@@ -280,7 +296,8 @@ def _decode_segment(name: str, table_name: str, data: bytes, table_cls: Any) -> 
         payload = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise StorageError(f"Corrupted segment '{name}': invalid JSON ({exc})") from exc
-    if not isinstance(payload, dict) or set(payload.keys()) != SEGMENT_KEYS:
+    payload_keys = set(payload.keys())
+    if not isinstance(payload, dict) or not (SEGMENT_KEYS.issubset(payload_keys) and payload_keys.issubset(ALLOWED_SEGMENT_KEYS)):
         raise StorageError(f"Corrupted segment '{name}': unexpected field set")
     if payload.get("format") != SEGMENT_FORMAT:
         raise StorageError(f"Corrupted segment '{name}': unknown format")
@@ -313,7 +330,10 @@ def _decode_segment(name: str, table_name: str, data: bytes, table_cls: Any) -> 
                 "column count"
             )
         materialized.append(dict(zip(names, row)))
-    source = {"name": table_name, "columns": columns, "rows": materialized}
+    source: dict[str, Any] = {"name": table_name, "columns": columns, "rows": materialized}
+    for k in ("is_collection", "validation_mode", "schema", "schema_version", "warn_count", "last_warn"):
+        if k in payload:
+            source[k] = payload[k]
     try:
         return table_cls.from_dict(table_name, source)
     except StorageError:
@@ -351,7 +371,11 @@ def build_manifest(
             for name, ref in sorted(tables.items())
         },
         "indexes": {
-            name: {"table": spec["table"], "column": spec["column"]}
+            name: {
+                k: spec[k]
+                for k in ("table", "column", "path")
+                if k in spec and spec[k] is not None
+            }
             for name, spec in sorted(indexes.items())
         },
     }
@@ -412,17 +436,26 @@ def validate_manifest(payload: Any) -> dict[str, Any]:
     for name, spec in raw_indexes.items():
         if not isinstance(name, str) or not name:
             raise StorageError("Invalid index name in root manifest")
-        if not isinstance(spec, dict) or set(spec.keys()) != {"table", "column"}:
+        spec_keys = set(spec.keys())
+        if not isinstance(spec, dict) or not (
+            spec_keys == {"table", "column"} or spec_keys == {"table", "column", "path"}
+        ):
             raise StorageError(f"Invalid index definition '{name}' in root manifest")
         table_name = spec["table"]
         column = spec["column"]
+        path = spec.get("path")
+        if path is not None and (not isinstance(path, list) or not all(isinstance(p, str) for p in path)):
+            raise StorageError(f"Invalid path in index '{name}' in root manifest")
         if not isinstance(table_name, str) or table_name not in tables:
             raise StorageError(
                 f"Index '{name}' references unknown table {table_name!r}"
             )
         if not isinstance(column, str) or not column:
             raise StorageError(f"Index '{name}' has an invalid column name")
-        indexes[name] = {"table": table_name, "column": column}
+        entry: dict[str, Any] = {"table": table_name, "column": column}
+        if path is not None:
+            entry["path"] = path
+        indexes[name] = entry
     return {
         "format": MANIFEST_FORMAT,
         "format_version": MANIFEST_FORMAT_VERSION,
@@ -509,7 +542,7 @@ def load_database(db_path: Path, manifest: dict[str, Any]) -> Database:
         db.tables[name] = read_segment(db_path, ref, table_name=name)
     for name, spec in manifest["indexes"].items():
         try:
-            db.create_index(name, spec["table"], spec["column"])
+            db.create_index(name, spec["table"], spec["column"], path=spec.get("path"))
         except ExecutionError as exc:
             raise StorageError(
                 f"Corrupted index catalog in root manifest: {exc}"

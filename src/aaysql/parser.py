@@ -1,5 +1,6 @@
 from .ast import *
 from .errors import ParserError
+from .json_value import parse_json_document
 from .storage import SUPPORTED_TYPES, TYPE_MAP, validate_column_def
 from .token import Token, TokenType
 
@@ -129,7 +130,47 @@ class Parser:
             return self.parse_update()
         if self.keyword("DELETE"):
             return self.parse_delete()
+        if self.keyword("VALIDATE"):
+            return self.parse_validate()
+        if self.keyword("ALTER"):
+            return self.parse_alter()
         raise ParserError(f"Unknown statement {self.current().value!r}")
+
+    def parse_validate(self):
+        self.expect_kw("VALIDATE")
+        self.expect_kw("COLLECTION")
+        name = self.ident()
+        return ValidateCollection(name=name)
+
+    def parse_alter(self):
+        self.expect_kw("ALTER")
+        self.expect_kw("COLLECTION")
+        name = self.ident()
+        self.expect_kw("SET")
+        if self.keyword("VALIDATION"):
+            self.advance()
+            if self.keyword("MODE"):
+                self.advance()
+            if self.match(TokenType.EQ):
+                self.advance()
+            tok = self.current()
+            mode = str(tok.value).strip("'\"").upper()
+            self.advance()
+            return AlterCollection(name=name, action="SET_VALIDATION", value=mode)
+        if self.keyword("SCHEMA"):
+            self.advance()
+            if self.match(TokenType.EQ):
+                self.advance()
+            tok = self.current()
+            if self.match(TokenType.STRING):
+                schema_str = str(tok.value).strip("'\"")
+                self.advance()
+                schema_val = parse_json_document(schema_str)
+            else:
+                schema_val = parse_json_document(str(tok.value))
+                self.advance()
+            return AlterCollection(name=name, action="SET_SCHEMA", value=schema_val)
+        raise ParserError(f"Expected VALIDATION or SCHEMA after ALTER COLLECTION {name} SET")
 
     def parse_create(self):
         self.expect_kw("CREATE")
@@ -138,7 +179,29 @@ class Parser:
         if self.keyword("COLLECTION"):
             self.advance()
             name = self.ident()
-            return CreateCollection(name=name)
+            validation_mode = "FLEXIBLE"
+            schema = None
+            if self.keyword("VALIDATION"):
+                self.advance()
+                if self.keyword("MODE"):
+                    self.advance()
+                if self.match(TokenType.EQ):
+                    self.advance()
+                tok = self.current()
+                validation_mode = str(tok.value).strip("'\"").upper()
+                self.advance()
+            if self.keyword("SCHEMA"):
+                self.advance()
+                if self.match(TokenType.EQ):
+                    self.advance()
+                tok = self.current()
+                if self.match(TokenType.STRING):
+                    schema = parse_json_document(str(tok.value).strip("'\""))
+                    self.advance()
+                else:
+                    schema = parse_json_document(str(tok.value))
+                    self.advance()
+            return CreateCollection(name=name, validation_mode=validation_mode, schema=schema)
         self.expect_kw("TABLE")
         name = self.ident()
         self.expect(TokenType.LPAREN)
@@ -188,6 +251,13 @@ class Parser:
         table = self.ident()
         self.expect(TokenType.LPAREN)
         column = self.ident()
+        path = None
+        if self.match(TokenType.DOT):
+            segments = []
+            while self.match(TokenType.DOT):
+                self.advance()
+                segments.append(self.ident())
+            path = tuple(segments)
         if self.match(TokenType.COMMA):
             tok = self.current()
             raise ParserError(
@@ -195,7 +265,7 @@ class Parser:
                 f"create one index per column"
             )
         self.expect(TokenType.RPAREN)
-        return CreateIndex(name=name, table=table, column=column)
+        return CreateIndex(name=name, table=table, column=column, path=path)
 
     def parse_drop(self):
         self.expect_kw("DROP")

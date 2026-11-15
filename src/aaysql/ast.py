@@ -179,6 +179,20 @@ class CreateTable:
 @dataclass(frozen=True)
 class CreateCollection:
     name: str
+    validation_mode: str = "FLEXIBLE"
+    schema: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ValidateCollection:
+    name: str
+
+
+@dataclass(frozen=True)
+class AlterCollection:
+    name: str
+    action: str
+    value: Any
 
 
 @dataclass(frozen=True)
@@ -226,11 +240,13 @@ class CreateIndex:
     name: str
     table: str
     column: str
+    path: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
 class DropIndex:
     name: str
+
 
 
 @dataclass(frozen=True)

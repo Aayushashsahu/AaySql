@@ -135,11 +135,21 @@ def _hash_key(
 ) -> tuple[Any, ...] | None:
     """Build the equality key for one side; a NULL key column never matches."""
     values: list[Any] = []
-    for left_ref, left_column, right_ref, right_column in key_pairs:
-        if side == "LEFT":
-            value = ctx[left_ref][left_column]
+    for left_ref, left_col, right_ref, right_col in key_pairs:
+        ref = left_ref if side == "LEFT" else right_ref
+        col_expr = left_col if side == "LEFT" else right_col
+        if ref not in ctx:
+            return None
+        row = ctx[ref]
+        if "." in col_expr:
+            base_col, _, path_str = col_expr.partition(".")
+            path_tuple = tuple(path_str.split("."))
+            from .json_value import ABSENT, JSON_NULL, get_path
+            value = get_path(row.get(base_col), path_tuple)
+            if value is ABSENT or value is JSON_NULL:
+                value = None
         else:
-            value = ctx[right_ref][right_column]
+            value = row.get(col_expr)
         if value is None:
             return None
         values.append(value)
