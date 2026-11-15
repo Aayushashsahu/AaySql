@@ -152,3 +152,101 @@ To ensure transaction isolation and prevent external memory corruption:
    - Databases containing JSON columns and collections are fully supported by `backup_database`, `verify_backup`, and `restore_database`.
    - Backup manifests record cryptographic SHA-256 hashes for all database files and segment directories; corruptions or tampering are detected fail-closed.
 
+---
+
+## 5. Scalar JSON Path Indexes (Phase 6)
+
+### 5.1 DDL Syntax
+Scalar path indexes are created using dot-navigation over a JSON or DOCUMENT column:
+
+```sql
+AAYUSH CREATE INDEX idx_cust_city ON customers (body.address.city);
+AAYUSH CREATE INDEX idx_events_user_id ON events (payload.user.id);
+AAYUSH DROP INDEX idx_cust_city;
+```
+
+### 5.2 Memcomparable Binary Key Encoding
+Path indexes utilize a typed, order-preserving memcomparable byte encoding (`aaysql.index_encoding`) that preserves SQL comparison order under standard byte comparisons:
+
+- **Type Ordering**: `SQL NULL < BOOL < NUMBER < TEXT`.
+- **Boolean Encoding**: `0x10` for FALSE, `0x11` for TRUE.
+- **Numeric Encoding**: 64-bit IEEE float representation with sign bit inversion and scientific exponent bias; integer and float equivalents compare equal (`42 == 42.0`).
+- **Text Encoding**: UTF-8 bytes terminated by `0x00`, with escaping (`0x00 0xFF` for literal null bytes), guaranteeing prefix-freedom.
+- **Index Eligibility**: Only scalar values (null, bool, int, float, str) are indexable; arrays and objects are omitted from the index without error.
+
+### 5.3 Query Planner & Optimization
+The query planner detects scalar path expressions matching registered indexes:
+- Supports `=`, `>`, `>=`, `<`, `<=`, and `BETWEEN`.
+- Generates `INDEX SCAN` with candidate range bounds and path annotation:
+  ```
+  INDEX SCAN: idx_events_user_id
+    TABLE: events
+    PATH: payload.user.id
+    CONDITION: payload.user.id = 42
+  ```
+- Evaluates candidate selectivity against in-memory path statistics (`StatisticsStore`).
+- Re-verifies predicates on candidate rows to guarantee filtering precision.
+
+---
+
+## 6. Collection Validation Modes & Schema Versioning
+
+### 6.1 Validation Modes
+Collections support three validation modes:
+1. **`FLEXIBLE`** (Default): Accepts any structurally valid JSON document up to resource limits.
+2. **`WARN`**: Validates incoming documents against the collection schema. If invalid, the write succeeds, `warn_count` increments, and a diagnostic summary is saved in `last_warn`.
+3. **`STRICT`**: Enforces schema validation before mutations occur. Invalid writes raise `ConstraintError` naming the exact failing path and reason; mutations are aborted without side effects.
+
+### 6.2 Supported JSON Schema Subset
+A documented, strict subset of JSON Schema is supported fail-closed:
+- Keywords: `type`, `required`, `properties`, `additionalProperties`, `items`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`.
+- Types: `object`, `array`, `string`, `integer`, `number`, `boolean`, `null`.
+- Unknown or unsupported keywords (e.g. `$ref`, `oneOf`, `allOf`) fail-closed at definition time.
+
+### 6.3 Schema DDL & Inspection
+```sql
+AAYUSH CREATE COLLECTION users
+  VALIDATION MODE = 'STRICT'
+  SCHEMA = '{"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}';
+
+AAYUSH ALTER COLLECTION users SET VALIDATION MODE = 'WARN';
+AAYUSH ALTER COLLECTION users SET SCHEMA = '{"type": "object", "required": ["name", "email"]}';
+AAYUSH VALIDATE COLLECTION users;
+```
+
+---
+
+## 7. Collection Identity, Revisions & Concurrency
+
+### 7.1 Monotonic UUIDv7 Identity (`_id`)
+- Every collection table contains a primary key column `_id TEXT PRIMARY KEY`.
+- If `_id` is omitted in `INSERT`, a time-ordered, RFC 9562-compliant UUIDv7 is auto-generated.
+- Explicit `_id` values provided by callers are preserved.
+- `_id` is immutable; `UPDATE` statements attempting to modify `_id` are rejected with `ExecutionError`.
+
+### 7.2 Revision Tracking & Optimistic Concurrency Control (`_rev`)
+- Collections track an auto-incrementing `_rev INT` column (starts at 1).
+- Any update modifying the document `body` increments `_rev`.
+- Supports optimistic concurrency control:
+  ```sql
+  AAYUSH UPDATE docs
+  SET body = '{"status": "processed"}'
+  WHERE _id = '01a1e018-fad3-7e2b-a345-6b53e246d6a0' AND _rev = 2;
+  ```
+
+---
+
+## 8. Cross-Model Relational / Document Joins
+
+Relational tables and document collections can be seamlessly joined across scalar paths:
+```sql
+AAYUSH SELECT u.id, u.name, e.body.action
+FROM users u
+JOIN events e ON u.id = e.body.user_id;
+```
+
+The planner supports:
+- **Nested Loop Join** for smaller workloads or non-equality predicates.
+- **Hash Join with Path Extraction**: The hash join builder extracts join keys directly from dotted document paths (`_hash_key`), evaluating joins up to 370x faster than nested-loop scans.
+
+

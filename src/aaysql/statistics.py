@@ -21,8 +21,10 @@ from __future__ import annotations
 import hashlib
 import math
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+
+from .json_value import ABSENT, JSON_NULL, get_path
 
 MAX_EXACT_DISTINCT = 4096
 _DISTINCT_BITMAP_BITS = 8192
@@ -116,6 +118,22 @@ class ColumnStats:
 
 
 @dataclass(frozen=True)
+class PathStats:
+    """Estimates for one scalar JSON path of one column."""
+
+    column: str
+    path: tuple[str, ...]
+    present_count: int
+    null_count: int
+    missing_count: int
+    distinct: int
+    distinct_is_exact: bool
+    minimum: Any = None
+    maximum: Any = None
+    min_max_available: bool = False
+
+
+@dataclass(frozen=True)
 class TableStats:
     """Estimates for one table, tagged with the revision they describe."""
 
@@ -123,13 +141,17 @@ class TableStats:
     revision: int
     row_count: int
     columns: dict[str, Any]
+    paths: dict[tuple[str, tuple[str, ...]], PathStats] = field(default_factory=dict)
     method: str = METHOD
 
     def column(self, name: str) -> Any | None:
         return self.columns.get(name)
 
+    def path(self, column: str, path_segments: tuple[str, ...] | list[str]) -> PathStats | None:
+        return self.paths.get((column, tuple(path_segments)))
 
-def compute_table_stats(table: Any) -> TableStats:
+
+def compute_table_stats(table: Any, indexes: list[Any] | None = None) -> TableStats:
     """Compute statistics for ``table`` with a single bounded-memory pass."""
     names = [column.name for column in table.columns]
     counters = {name: _DistinctCounter() for name in names}
@@ -138,6 +160,21 @@ def compute_table_stats(table: Any) -> TableStats:
     maximum: dict[str, Any] = {name: None for name in names}
     comparable = {name: True for name in names}
     seen = {name: False for name in names}
+
+    target_paths: set[tuple[str, tuple[str, ...]]] = set()
+    if indexes:
+        for idx in indexes:
+            if getattr(idx, "path", None) and getattr(idx, "column", None):
+                target_paths.add((idx.column, tuple(idx.path)))
+
+    path_counters = {p: _DistinctCounter() for p in target_paths}
+    path_nulls = {p: 0 for p in target_paths}
+    path_missing = {p: 0 for p in target_paths}
+    path_present = {p: 0 for p in target_paths}
+    path_min: dict[tuple[str, tuple[str, ...]], Any] = {p: None for p in target_paths}
+    path_max: dict[tuple[str, tuple[str, ...]], Any] = {p: None for p in target_paths}
+    path_comparable = {p: True for p in target_paths}
+    path_seen = {p: False for p in target_paths}
 
     for row in table.rows:
         for name in names:
@@ -162,6 +199,30 @@ def compute_table_stats(table: Any) -> TableStats:
                 minimum[name] = None
                 maximum[name] = None
 
+        for col_name, path_tuple in target_paths:
+            p_key = (col_name, path_tuple)
+            doc = row.get(col_name)
+            pval = get_path(doc, path_tuple)
+            if pval is ABSENT:
+                path_missing[p_key] += 1
+            elif pval is None or pval is JSON_NULL:
+                path_nulls[p_key] += 1
+            else:
+                path_present[p_key] += 1
+                path_counters[p_key].add(pval)
+                if not path_seen[p_key]:
+                    path_min[p_key] = pval
+                    path_max[p_key] = pval
+                    path_seen[p_key] = True
+                elif path_comparable[p_key]:
+                    try:
+                        path_min[p_key] = min(path_min[p_key], pval)
+                        path_max[p_key] = max(path_max[p_key], pval)
+                    except TypeError:
+                        path_comparable[p_key] = False
+                        path_min[p_key] = None
+                        path_max[p_key] = None
+
     columns: dict[str, ColumnStats] = {}
     for name in names:
         counter = counters[name]
@@ -177,18 +238,38 @@ def compute_table_stats(table: Any) -> TableStats:
             min_max_available=comparable[name] and seen[name],
         )
 
+    paths: dict[tuple[str, tuple[str, ...]], PathStats] = {}
+    for p_key in target_paths:
+        counter = path_counters[p_key]
+        estimate = counter.estimate
+        present = path_present[p_key]
+        paths[p_key] = PathStats(
+            column=p_key[0],
+            path=p_key[1],
+            present_count=present,
+            null_count=path_nulls[p_key],
+            missing_count=path_missing[p_key],
+            distinct=min(estimate, max(present, 0)) if present else 0,
+            distinct_is_exact=counter.is_exact,
+            minimum=path_min[p_key],
+            maximum=path_max[p_key],
+            min_max_available=path_comparable[p_key] and path_seen[p_key],
+        )
+
     return TableStats(
         table=table.name,
         revision=getattr(table, "revision", 0),
         row_count=len(table.rows),
         columns=columns,
+        paths=paths,
     )
 
 
 class StatisticsStore:
     """Per-database cache of table statistics, invalidated by row revisions."""
 
-    def __init__(self) -> None:
+    def __init__(self, db: Any = None) -> None:
+        self._db_ref = weakref.ref(db) if db is not None else None
         self._entries: dict[str, tuple[weakref.ref[Any], int, TableStats]] = {}
 
     def invalidate(self, table_name: str | None = None) -> None:
@@ -197,7 +278,7 @@ class StatisticsStore:
         else:
             self._entries.pop(table_name, None)
 
-    def get(self, table: Any) -> TableStats:
+    def get(self, table: Any, indexes: list[Any] | None = None) -> TableStats:
         """Return statistics for ``table``, recomputing after any row change."""
         entry = self._entries.get(table.name)
         revision = getattr(table, "revision", 0)
@@ -205,7 +286,11 @@ class StatisticsStore:
             ref, cached_revision, stats = entry
             if ref() is table and cached_revision == revision:
                 return stats
-        stats = compute_table_stats(table)
+        if indexes is None and self._db_ref is not None:
+            db = self._db_ref()
+            if db is not None:
+                indexes = db.indexes_on(table.name)
+        stats = compute_table_stats(table, indexes=indexes)
         self._entries[table.name] = (weakref.ref(table), revision, stats)
         return stats
 

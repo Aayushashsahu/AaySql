@@ -11,8 +11,10 @@ from .query import (
     is_sql_true,
     validate_expr_columns,
 )
+from .schema_validator import validate_document, validate_schema_definition
 from .storage import Database, coerce_value, serialize_row_for_storage
 from .undo import (
+    AlterCollectionUndo,
     CreateIndexUndo,
     CreateTableUndo,
     DeleteUndo,
@@ -21,6 +23,7 @@ from .undo import (
     InsertUndo,
     UpdateUndo,
 )
+from .uuidv7 import generate_uuidv7
 
 
 class Executor:
@@ -48,6 +51,10 @@ class Executor:
             return self.create_table(stmt)
         if isinstance(stmt, CreateCollection):
             return self.create_collection(stmt)
+        if isinstance(stmt, ValidateCollection):
+            return self.validate_collection(stmt)
+        if isinstance(stmt, AlterCollection):
+            return self.alter_collection(stmt)
         if isinstance(stmt, DropTable):
             return self.drop_table(stmt)
         if isinstance(stmt, Insert):
@@ -67,10 +74,73 @@ class Executor:
         raise ExecutionError(f"Unsupported statement: {type(stmt).__name__}")
 
     def create_collection(self, s):
-        self.db.create_collection(s.name)
+        self.db.create_collection(s.name, validation_mode=s.validation_mode, schema=s.schema)
         self._record_undo(CreateTableUndo(s.name))
         self._record_ddl("record_create_table", self.db.tables[s.name])
         return {"status": "ok", "message": f"Collection '{s.name}' created"}
+
+    def validate_collection(self, s):
+        table = self.db.table(s.name)
+        if not table.is_collection:
+            raise ExecutionError(f"'{s.name}' is not a collection")
+        violations = []
+        valid_count = 0
+        for idx, row in enumerate(table.rows):
+            doc = row.get("body")
+            if table.schema is not None:
+                is_valid, err_path, err_reason = validate_document(doc, table.schema)
+                if not is_valid:
+                    violations.append({
+                        "row_index": idx,
+                        "id": row.get("_id"),
+                        "violations": [{"path": err_path, "reason": err_reason}],
+                    })
+                else:
+                    valid_count += 1
+            else:
+                valid_count += 1
+        return {
+            "status": "ok",
+            "collection": s.name,
+            "total_rows": len(table.rows),
+            "valid_rows": valid_count,
+            "invalid_rows": len(violations),
+            "violations": violations[:100],
+        }
+
+    def alter_collection(self, s):
+        table = self.db.table(s.name)
+        if not table.is_collection:
+            raise ExecutionError(f"'{s.name}' is not a collection")
+        self._record_undo(
+            AlterCollectionUndo(
+                s.name,
+                table.validation_mode,
+                deep_copy_json(table.schema),
+                table.schema_version,
+            )
+        )
+        if s.action == "SET_VALIDATION":
+            mode = str(s.value).upper()
+            if mode not in ("FLEXIBLE", "WARN", "STRICT"):
+                raise ExecutionError(f"Invalid validation mode '{s.value}'. Must be FLEXIBLE, WARN, or STRICT.")
+            table.validation_mode = mode
+            self._record_ddl("record_alter_collection", s.name, s.action, mode)
+            return {"status": "ok", "message": f"Collection '{s.name}' validation mode set to {mode}"}
+        if s.action == "SET_SCHEMA":
+            if s.value is not None:
+                validate_schema_definition(s.value)
+            table.schema = s.value
+            table.schema_version += 1
+            self._record_ddl(
+                "record_alter_collection",
+                s.name,
+                s.action,
+                s.value,
+                table.schema_version,
+            )
+            return {"status": "ok", "message": f"Collection '{s.name}' schema updated to version {table.schema_version}"}
+        raise ExecutionError(f"Unsupported action: {s.action}")
 
     def create_table(self, s):
         self.db.create_table(s.name, s.columns)
@@ -87,12 +157,13 @@ class Executor:
         return {"status": "ok", "message": f"Table '{s.name}' dropped"}
 
     def create_index(self, s):
-        self.db.create_index(s.name, s.table, s.column)
+        self.db.create_index(s.name, s.table, s.column, path=s.path)
         self._record_undo(CreateIndexUndo(s.name))
-        self._record_ddl("record_create_index", s.name, s.table, s.column)
+        self._record_ddl("record_create_index", s.name, s.table, s.column, s.path)
+        col_repr = f"{s.column}.{'.'.join(s.path)}" if s.path else s.column
         return {
             "status": "ok",
-            "message": f"Index '{s.name}' created on {s.table}({s.column})",
+            "message": f"Index '{s.name}' created on {s.table}({col_repr})",
         }
 
     def drop_index(self, s):
@@ -126,9 +197,16 @@ class Executor:
 
     def _build_row(self, table, columns, values):
         if columns is None:
-            if len(values) != len(table.columns):
+            if table.is_collection and len(values) == 1:
+                raw = {
+                    "_id": generate_uuidv7(),
+                    "_rev": 1,
+                    "body": values[0],
+                }
+            elif len(values) != len(table.columns):
                 raise ExecutionError(f"Expected {len(table.columns)} values, got {len(values)}")
-            raw = dict(zip(table.column_names, values))
+            else:
+                raw = dict(zip(table.column_names, values))
         else:
             if len(columns) != len(values):
                 raise ExecutionError(f"Expected {len(columns)} values, got {len(values)}")
@@ -138,6 +216,11 @@ class Executor:
                 if name in raw:
                     raise ExecutionError(f"Duplicate column '{name}' in INSERT")
                 raw[name] = value
+            if table.is_collection:
+                if "_id" not in raw:
+                    raw["_id"] = generate_uuidv7()
+                if "_rev" not in raw:
+                    raw["_rev"] = 1
         row = {}
         for col in table.columns:
             value = raw.get(col.name, col.default if col.has_default else None)
@@ -167,6 +250,20 @@ class Executor:
         for row in new_rows:
             self._check_constraints(table, row, rows=staged_pool)
             staged_pool.append(row)
+        if table.is_collection and table.schema is not None:
+            for row in new_rows:
+                doc = row.get("body")
+                is_valid, err_path, err_reason = validate_document(doc, table.schema)
+                if not is_valid:
+                    if table.validation_mode == "STRICT":
+                        raise ConstraintError(f"Document violates collection schema in STRICT mode at '{err_path}': {err_reason}")
+                    elif table.validation_mode == "WARN":
+                        table.warn_count += 1
+                        table.last_warn = {
+                            "timestamp": time.time(),
+                            "row_id": row.get("_id"),
+                            "violations": [{"path": err_path, "reason": err_reason}],
+                        }
         self._record_undo(InsertUndo(table.name, len(table.rows), new_rows))
         table.rows.extend(new_rows)
         table.touch()
@@ -175,7 +272,13 @@ class Executor:
                 index.add(row)
         serialized_rows = [serialize_row_for_storage(table.columns, r) for r in new_rows]
         self._record_ddl("record_insert", table.name, serialized_rows)
-        return {"status": "ok", "rows_affected": len(new_rows)}
+        res = {"status": "ok", "rows_affected": len(new_rows)}
+        if table.is_collection:
+            ids = [r["_id"] for r in new_rows]
+            res["inserted_ids"] = ids
+            if len(ids) == 1:
+                res["inserted_id"] = ids[0]
+        return res
 
     def _value(self, expr, row, table=None):
         if table is None:
@@ -207,6 +310,10 @@ class Executor:
         table = self.db.table(s.table)
         sources = [SourceBinding.from_table(table.name, table)]
         targets = self._filtered(table, s.where)
+        if table.is_collection:
+            for item in s.assignments:
+                if item[0] == "_id":
+                    raise ConstraintError("Cannot modify immutable collection column '_id'")
         staged = []
         for item in s.assignments:
             col = item[0]
@@ -215,10 +322,16 @@ class Executor:
             validate_expr_columns(expr, sources, allow_aggregates=False, context_name="UPDATE assignment")
         for old in targets:
             new = deep_copy_json(old)
+            body_modified = False
+            rev_explicitly_assigned = False
             for item in s.assignments:
                 col = item[0]
                 expr = item[1]
                 path = item[2] if len(item) == 3 else ()
+                if col == "_rev":
+                    rev_explicitly_assigned = True
+                if col == "body":
+                    body_modified = True
                 col_def = next(c for c in table.columns if c.name == col)
                 if path:
                     old_doc = new[col]
@@ -226,6 +339,20 @@ class Executor:
                     new[col] = self._coerce(set_path(old_doc, path, val), col_def)
                 else:
                     new[col] = self._coerce(eval_row_expr(expr, {table.name: old}, sources), col_def)
+            if table.is_collection and body_modified and not rev_explicitly_assigned:
+                new["_rev"] = old["_rev"] + 1
+            if table.is_collection and table.schema is not None and body_modified:
+                is_valid, err_path, err_reason = validate_document(new.get("body"), table.schema)
+                if not is_valid:
+                    if table.validation_mode == "STRICT":
+                        raise ConstraintError(f"Document violates collection schema in STRICT mode at '{err_path}': {err_reason}")
+                    elif table.validation_mode == "WARN":
+                        table.warn_count += 1
+                        table.last_warn = {
+                            "timestamp": time.time(),
+                            "row_id": new.get("_id"),
+                            "violations": [{"path": err_path, "reason": err_reason}],
+                        }
             staged.append((old, new))
         target_map = {id(old): new for old, new in staged}
         post_rows = [target_map.get(id(row), row) for row in table.rows]
@@ -234,7 +361,7 @@ class Executor:
         indexes = self.db.indexes_on(table.name)
         positions = {id(row): pos for pos, row in enumerate(table.rows)}
         previous_keys = [
-            {index.name: old[index.column] for index in indexes} for old, _ in staged
+            {index.name: index.extract_key(old) for index in indexes} for old, _ in staged
         ]
         for old, _new in staged:
             self._record_undo(

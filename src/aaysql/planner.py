@@ -125,6 +125,7 @@ class PlanNode:
     ref: str | None = None
     index_name: str | None = None
     index_column: str | None = None
+    index_path: tuple[str, ...] | None = None
     condition: str | None = None
     start: Any = None
     end: Any = None
@@ -197,6 +198,7 @@ class QueryPlan:
     table: str
     index_name: str | None = None
     index_column: str | None = None
+    index_path: tuple[str, ...] | None = None
     condition: str | None = None
     filter: str | None = None
     start: Any = None
@@ -218,6 +220,7 @@ class IndexMatch:
     end: Any = None
     start_inclusive: bool = True
     end_inclusive: bool = True
+    path: tuple[str, ...] | None = None
 
 
 # --- expression helpers ---------------------------------------------------
@@ -553,11 +556,48 @@ def _literal_matches_column_type(value: Any, type_name: str) -> bool:
     return False
 
 
-def _indexed_candidates(db: Database, table_name: str, column: str) -> list[str]:
+def _path_access_for(
+    expr: Any, ref: str
+) -> tuple[Identifier, tuple[str, ...]] | tuple[None, None]:
+    if isinstance(expr, Identifier):
+        if expr.qualifier is not None and expr.qualifier != ref and expr.name != "*":
+            # Potential single-segment path: <column>.<key>
+            return Identifier(name=expr.qualifier), (expr.name,)
+        return None, None
+
+    if isinstance(expr, PathAccess):
+        if not isinstance(expr.expr, Identifier):
+            return None, None
+        if not all(isinstance(seg, str) for seg in expr.path):
+            return None, None
+        if expr.expr.qualifier is not None:
+            if expr.expr.qualifier != ref:
+                return None, None
+            return Identifier(name=expr.expr.name), tuple(expr.path)
+        if expr.expr.name == ref and expr.path:
+            # Table-qualified: ref.column.seg1...
+            col_name = str(expr.path[0])
+            remaining = tuple(expr.path[1:])
+            if not remaining:
+                return None, None
+            return Identifier(name=col_name), remaining
+        return Identifier(name=expr.expr.name), tuple(expr.path)
+
+    return None, None
+
+
+def _indexed_candidates(
+    db: Database,
+    table_name: str,
+    column: str,
+    path: tuple[str, ...] | None = None,
+) -> list[str]:
     return sorted(
         name
         for name, index in db.indexes.items()
-        if index.table == table_name and index.column == column
+        if index.table == table_name
+        and index.column == column
+        and index.path == path
     )
 
 
@@ -582,12 +622,17 @@ def match_indexed_predicate(
         return None
 
     column = None
+    path = None
     value = None
-    if isinstance(predicate.left, Identifier) and isinstance(predicate.right, Literal):
+    if isinstance(predicate.left, (Identifier, PathAccess)) and isinstance(predicate.right, Literal):
         column = _identifier_for(predicate.left, ref)
+        if column is None:
+            column, path = _path_access_for(predicate.left, ref)
         value = predicate.right.value
-    elif isinstance(predicate.right, Identifier) and isinstance(predicate.left, Literal):
+    elif isinstance(predicate.right, (Identifier, PathAccess)) and isinstance(predicate.left, Literal):
         column = _identifier_for(predicate.right, ref)
+        if column is None:
+            column, path = _path_access_for(predicate.right, ref)
         op = _FLIPPED_OPS[op]
         value = predicate.left.value
 
@@ -596,14 +641,27 @@ def match_indexed_predicate(
 
     table = db.table(table_name)
     column_def = next((col for col in table.columns if col.name == column.name), None)
-    if column_def is None or not _literal_matches_column_type(value, column_def.type_name):
+    if column_def is None:
         return None
+    if path is None:
+        if not _literal_matches_column_type(value, column_def.type_name):
+            return None
+    else:
+        if column_def.type_name.upper() not in ("JSON", "DOCUMENT"):
+            return None
+        if not isinstance(value, (int, float, str, bool)):
+            return None
 
-    candidates = _indexed_candidates(db, table_name, column.name)
+    candidates = _indexed_candidates(db, table_name, column.name, path=path)
     if not candidates:
         return None
 
-    match = IndexMatch(index_name=candidates[0], column=column.name, predicate=predicate)
+    match = IndexMatch(
+        index_name=candidates[0],
+        column=column.name,
+        predicate=predicate,
+        path=path,
+    )
     if op == "=":
         match.start = value
         match.end = value
@@ -629,7 +687,14 @@ def _match_between(
     """``col BETWEEN low AND high`` over an index is one inclusive range."""
     if predicate.negated:
         return None
-    column = _identifier_for(predicate.expr, ref)
+    column = None
+    path = None
+    if isinstance(predicate.expr, Identifier):
+        column = _identifier_for(predicate.expr, ref)
+        if column is None:
+            column, path = _path_access_for(predicate.expr, ref)
+    elif isinstance(predicate.expr, PathAccess):
+        column, path = _path_access_for(predicate.expr, ref)
     low_ok, low = _literal_value(predicate.low)
     high_ok, high = _literal_value(predicate.high)
     if column is None or not (low_ok and high_ok):
@@ -643,12 +708,22 @@ def _match_between(
     column_def = next((col for col in table.columns if col.name == column.name), None)
     if column_def is None:
         return None
-    if not (
-        _literal_matches_column_type(low, column_def.type_name)
-        and _literal_matches_column_type(high, column_def.type_name)
-    ):
-        return None
-    candidates = _indexed_candidates(db, table_name, column.name)
+    if path is None:
+        if not (
+            _literal_matches_column_type(low, column_def.type_name)
+            and _literal_matches_column_type(high, column_def.type_name)
+        ):
+            return None
+    else:
+        if column_def.type_name.upper() not in ("JSON", "DOCUMENT"):
+            return None
+        if not (
+            isinstance(low, (int, float, str, bool))
+            and isinstance(high, (int, float, str, bool))
+        ):
+            return None
+
+    candidates = _indexed_candidates(db, table_name, column.name, path=path)
     if not candidates:
         return None
     return IndexMatch(
@@ -657,6 +732,7 @@ def _match_between(
         predicate=predicate,
         start=low,
         end=high,
+        path=path,
     )
 
 
@@ -666,6 +742,18 @@ def _estimate_index_candidates(
     match: IndexMatch,
 ) -> float:
     """Estimate how many rows the index range returns, in rows (not exact)."""
+    if match.path is not None:
+        p_stat = stats.path(index_column, match.path)
+        if p_stat is not None:
+            non_null = p_stat.present_count
+            distinct = max(p_stat.distinct, 1)
+        else:
+            non_null = max(1, stats.row_count // 3)
+            distinct = max(1, non_null // 2)
+        if match.start is not None and match.end is not None and match.start == match.end:
+            return max(1.0, non_null / distinct)
+        return max(1.0, non_null / 3.0)
+
     column_stats = stats.column(index_column)
     non_null = stats.row_count - getattr(column_stats, "null_count", 0)
     if non_null <= 0:
@@ -896,6 +984,7 @@ def _build_scan(
         ref=source.ref,
         index_name=match.index_name if use_index and match is not None else None,
         index_column=match.column if use_index and match is not None else None,
+        index_path=match.path if use_index and match is not None else None,
         condition=format_expr(match.predicate) if use_index and match is not None else None,
         start=match.start if use_index and match is not None else None,
         end=match.end if use_index and match is not None else None,
@@ -912,6 +1001,31 @@ def _build_scan(
     return node
 
 
+def _resolve_join_side(expr: Any, sources: list[SourceBinding]) -> tuple[str, str] | None:
+    if isinstance(expr, Identifier) and expr.name != "*":
+        try:
+            ref, col = resolve_identifier(expr, sources)
+            return ref, col.name
+        except ExecutionError:
+            if expr.qualifier is not None:
+                matches = [(s.ref, s.column_map[expr.qualifier]) for s in sources if expr.qualifier in s.column_map]
+                if len(matches) == 1:
+                    ref, col_def = matches[0]
+                    return ref, f"{col_def.name}.{expr.name}"
+            return None
+    if isinstance(expr, PathAccess):
+        try:
+            ref, col_def, remaining = resolve_path_access(expr, sources)
+            if remaining and all(isinstance(seg, str) for seg in remaining):
+                path_str = ".".join(remaining)
+                return ref, f"{col_def.name}.{path_str}"
+            elif not remaining:
+                return ref, col_def.name
+        except ExecutionError:
+            return None
+    return None
+
+
 def _equality_pairs(
     condition: Any,
     left_refs: list[str],
@@ -924,20 +1038,16 @@ def _equality_pairs(
     for conjunct in _conjuncts(condition):
         if not isinstance(conjunct, BinaryExpr) or conjunct.op.upper() != "=":
             continue
-        left, right = conjunct.left, conjunct.right
-        if not isinstance(left, Identifier) or not isinstance(right, Identifier):
+        left_side = _resolve_join_side(conjunct.left, sources)
+        right_side = _resolve_join_side(conjunct.right, sources)
+        if left_side is None or right_side is None:
             continue
-        if left.name == "*" or right.name == "*":
-            continue
-        try:
-            left_ref, left_col = resolve_identifier(left, sources)
-            right_ref_of, right_col = resolve_identifier(right, sources)
-        except ExecutionError:
-            continue
+        left_ref, left_col = left_side
+        right_ref_of, right_col = right_side
         if left_ref in left_refs and right_ref_of == right_ref:
-            pair = (left_ref, left_col.name, right_ref, right_col.name)
+            pair = (left_ref, left_col, right_ref, right_col)
         elif right_ref_of in left_refs and left_ref == right_ref:
-            pair = (right_ref_of, right_col.name, right_ref, left_col.name)
+            pair = (right_ref_of, right_col, right_ref, left_col)
         else:
             continue
         if pair not in seen:
@@ -961,10 +1071,21 @@ def _estimate_join_rows(
         table_stats = left_stats.get(left_ref)
         left_distinct = 1
         if table_stats is not None:
-            column_stats = table_stats.column(left_column)
-            left_distinct = max(getattr(column_stats, "distinct", 0), 1)
-        column_stats = right_stats.column(right_column)
-        right_distinct = max(getattr(column_stats, "distinct", 0), 1)
+            if "." in left_column:
+                base_c, _, p = left_column.partition(".")
+                ps = table_stats.path(base_c, tuple(p.split(".")))
+                left_distinct = max(getattr(ps, "distinct", 0), 1)
+            else:
+                column_stats = table_stats.column(left_column)
+                left_distinct = max(getattr(column_stats, "distinct", 0), 1)
+        right_distinct = 1
+        if "." in right_column:
+            base_c, _, p = right_column.partition(".")
+            ps = right_stats.path(base_c, tuple(p.split(".")))
+            right_distinct = max(getattr(ps, "distinct", 0), 1)
+        else:
+            column_stats = right_stats.column(right_column)
+            right_distinct = max(getattr(column_stats, "distinct", 0), 1)
         denominator *= max(left_distinct, right_distinct)
     return max(0.0, (left_rows * right_rows) / denominator)
 
@@ -1193,6 +1314,7 @@ def plan_select(
         table=stmt.table,
         index_name=scan.index_name if scan is not None else None,
         index_column=scan.index_column if scan is not None else None,
+        index_path=scan.index_path if scan is not None else None,
         condition=scan.condition if scan is not None else None,
         filter=filter_text,
         start=scan.start if scan is not None else None,
@@ -1252,6 +1374,9 @@ def _render_node(node: PlanNode, depth: int) -> list[str]:
     if node.op == "INDEX SCAN":
         lines.append(f"{indent}INDEX SCAN: {node.index_name}")
         lines.append(f"{indent}  TABLE: {node.table}")
+        if node.index_path:
+            path_str = ".".join(node.index_path)
+            lines.append(f"{indent}  PATH: {node.index_column}.{path_str}")
         if node.condition:
             lines.append(f"{indent}  CONDITION: {node.condition}")
         if node.predicate_text:

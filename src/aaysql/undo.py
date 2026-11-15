@@ -182,6 +182,24 @@ class DropIndexUndo:
         db.indexes[self.name] = self.index_object
 
 
+@dataclass(slots=True)
+class AlterCollectionUndo:
+    """Restore previous validation settings and schema for an altered collection."""
+
+    table: str
+    validation_mode: str
+    schema: Any
+    schema_version: int
+
+    def apply(self, db: Any) -> None:
+        if self.table not in db.tables:
+            raise UndoError(f"undo ALTER COLLECTION: table '{self.table}' is missing")
+        tbl = db.tables[self.table]
+        tbl.validation_mode = self.validation_mode
+        tbl.schema = self.schema
+        tbl.schema_version = self.schema_version
+
+
 UndoEntry = (
     InsertUndo
     | UpdateUndo
@@ -190,6 +208,7 @@ UndoEntry = (
     | DropTableUndo
     | CreateIndexUndo
     | DropIndexUndo
+    | AlterCollectionUndo
 )
 
 

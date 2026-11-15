@@ -370,3 +370,53 @@ from rows on open. The on-disk difference is therefore 83 bytes, not a serialize
   clone the database and write the full JSON file per mutating statement, which is the
   dominant cost in that mode and is not an indexing regression.
 - Wide range scans include materializing every matching row and restoring table order.
+
+---
+
+# Phase 6: Scalar JSON Path Indexes & Cross-Model Join Benchmarks
+
+Reproducible benchmark: `python benchmarks/benchmark_path_indexes.py`  
+Environment: Windows 11, Python 3.11.15 (CPython)  
+Dataset: 10,000 synthetic JSON documents (seed=20261115).
+
+### 1. Ingestion Throughput & Maintenance Overhead
+
+| Metric | Without Index | With 2 Path Indexes | Overhead |
+|---|---:|---:|---:|
+| 10,000 Document Ingestion | 1,961.73 ms (5,098 docs/s) | 1,973.61 ms (5,067 docs/s) | +0.6% |
+
+Index maintenance across 2 scalar B+ tree path indexes (`body.account.id` and `body.score`) introduces negligible mutation overhead (+0.6%), preserving ingestion throughput.
+
+### 2. Point Equality Lookup (Performance Gate G7)
+
+Query: `AAYUSH SELECT * FROM customers WHERE body.account.id = 7342;`
+
+| Access Method | Plan Operator | Median Latency | Speedup | Gate G7 Status |
+|---|---|---:|---:|---|
+| Table Scan (sequential) | `TABLE SCAN` | 21.734 ms | 1.0x | - |
+| Path Index Scan (B+ tree) | `INDEX SCAN` (path `account.id`) | 0.126 ms | **172.4x** | **PASSED** (Target $\ge 20\times$) |
+
+### 3. Range Scan Lookup
+
+Query: `AAYUSH SELECT * FROM customers WHERE body.score BETWEEN 500 AND 510;`
+
+| Access Method | Plan Operator | Median Latency | Speedup |
+|---|---|---:|---:|
+| Table Scan (sequential) | `TABLE SCAN` | 29.509 ms | 1.0x |
+| Path Index Range Scan | `INDEX SCAN` (path `score`) | 0.852 ms | **34.6x** |
+
+### 4. Index Build Latency
+
+| Target Dataset | Index Target | Build Time (median) |
+|---|---|---:|
+| 10,000 Documents | `body.address.zip` | 43.17 ms |
+
+### 5. Cross-Model Relational / Document Join
+
+Workload: 1,000 relational `accounts` joined with 2,000 document collection `audits` (`ON a.id = au.body.acc_id`).
+
+| Join Algorithm | Execution Plan | Median Latency | Speedup |
+|---|---|---:|---:|
+| Nested-Loop Join | `JOIN (algorithm=NESTED LOOP)` | 5,495.34 ms | 1.0x |
+| Hash Join with Path Extraction | `JOIN (algorithm=HASH)` | 14.52 ms | **378.6x** |
+

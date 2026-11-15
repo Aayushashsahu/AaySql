@@ -37,6 +37,7 @@ CHANGE_TYPES = frozenset(
         "drop_table",
         "create_index",
         "drop_index",
+        "alter_collection",
     }
 )
 CHANGE_KEYS: dict[str, frozenset[str]] = {
@@ -47,6 +48,7 @@ CHANGE_KEYS: dict[str, frozenset[str]] = {
     "drop_table": frozenset({"t", "table"}),
     "create_index": frozenset({"t", "index", "table", "column"}),
     "drop_index": frozenset({"t", "index"}),
+    "alter_collection": frozenset({"t", "table", "action", "value"}),
 }
 _SCALAR_TYPES = (str, int, float, bool, type(None))
 
@@ -145,32 +147,65 @@ class MutationRecorder:
     def record_create_table(self, table: Table) -> None:
         if not self._recording:
             return
-        self._changes.append(
-            {
-                "t": "create_table",
-                "table": table.name,
-                "columns": [_column_dict(column) for column in table.columns],
-            }
-        )
+        entry: dict[str, Any] = {
+            "t": "create_table",
+            "table": table.name,
+            "columns": [_column_dict(column) for column in table.columns],
+        }
+        if table.is_collection:
+            entry["is_collection"] = True
+            entry["validation_mode"] = table.validation_mode
+            if table.schema is not None:
+                entry["schema"] = table.schema
+            entry["schema_version"] = table.schema_version
+            entry["warn_count"] = table.warn_count
+            if table.last_warn is not None:
+                entry["last_warn"] = table.last_warn
+        self._changes.append(entry)
 
     def record_drop_table(self, table_name: str) -> None:
         if self._recording:
             self._changes.append({"t": "drop_table", "table": table_name})
 
-    def record_create_index(self, name: str, table_name: str, column: str) -> None:
+    def record_create_index(
+        self,
+        name: str,
+        table_name: str,
+        column: str,
+        path: tuple[str, ...] | list[str] | None = None,
+    ) -> None:
         if self._recording:
-            self._changes.append(
-                {
-                    "t": "create_index",
-                    "index": name,
-                    "table": table_name,
-                    "column": column,
-                }
-            )
+            entry: dict[str, Any] = {
+                "t": "create_index",
+                "index": name,
+                "table": table_name,
+                "column": column,
+            }
+            if path:
+                entry["path"] = list(path)
+            self._changes.append(entry)
 
     def record_drop_index(self, name: str) -> None:
         if self._recording:
             self._changes.append({"t": "drop_index", "index": name})
+
+    def record_alter_collection(
+        self,
+        table_name: str,
+        action: str,
+        value: Any,
+        schema_version: int | None = None,
+    ) -> None:
+        if self._recording:
+            entry: dict[str, Any] = {
+                "t": "alter_collection",
+                "table": table_name,
+                "action": action,
+                "value": value,
+            }
+            if schema_version is not None:
+                entry["schema_version"] = schema_version
+            self._changes.append(entry)
 
 
 def _column_dict(column: ColumnDef) -> dict[str, Any]:
@@ -225,8 +260,32 @@ def validate_change(op: Any) -> dict[str, Any]:
     kind = op.get("t")
     if kind not in CHANGE_TYPES:
         raise StorageError(f"Invalid WAL change type: {kind!r}")
-    if set(op.keys()) != CHANGE_KEYS[kind]:
+    keys = set(op.keys())
+    if kind == "create_index":
+        if not (keys == CHANGE_KEYS["create_index"] or keys == (CHANGE_KEYS["create_index"] | {"path"})):
+            raise StorageError("Invalid field set for 'create_index' WAL change")
+        if "path" in op:
+            path = op["path"]
+            if not isinstance(path, list) or not path or not all(isinstance(p, str) for p in path):
+                raise StorageError("Invalid path in 'create_index' WAL change")
+    elif kind == "create_table":
+        allowed = CHANGE_KEYS["create_table"] | {
+            "is_collection",
+            "validation_mode",
+            "schema",
+            "schema_version",
+            "warn_count",
+            "last_warn",
+        }
+        if not (CHANGE_KEYS["create_table"].issubset(keys) and keys.issubset(allowed)):
+            raise StorageError("Invalid field set for 'create_table' WAL change")
+    elif kind == "alter_collection":
+        allowed = CHANGE_KEYS["alter_collection"] | {"schema_version"}
+        if not (CHANGE_KEYS["alter_collection"].issubset(keys) and keys.issubset(allowed)):
+            raise StorageError("Invalid field set for 'alter_collection' WAL change")
+    elif keys != CHANGE_KEYS[kind]:
         raise StorageError(f"Invalid field set for '{kind}' WAL change")
+
     if kind in ("create_index", "drop_index"):
         name = op.get("index")
         if not isinstance(name, str) or not name:
@@ -265,6 +324,12 @@ def validate_change(op: Any) -> dict[str, Any]:
             raise StorageError("Invalid table name in 'create_index' WAL change")
         if not isinstance(op["column"], str) or not op["column"]:
             raise StorageError("Invalid column name in 'create_index' WAL change")
+    elif kind == "alter_collection":
+        action = op.get("action")
+        if not isinstance(action, str) or action not in ("SET_VALIDATION", "SET_SCHEMA"):
+            raise StorageError("Invalid action in 'alter_collection' WAL change")
+        if "schema_version" in op and not isinstance(op["schema_version"], int):
+            raise StorageError("Invalid schema_version in 'alter_collection' WAL change")
     return op
 
 
@@ -357,9 +422,11 @@ def apply_changes(db: Database, changes: Any) -> Database:
             if name in db.tables:
                 raise StorageError(f"Replayed 'create_table' for existing table '{name}'")
             try:
-                db.tables[name] = Table.from_dict(
-                    name, {"name": name, "columns": op["columns"], "rows": []}
-                )
+                table_dict = {"name": name, "columns": op["columns"], "rows": []}
+                for k in ("is_collection", "validation_mode", "schema", "schema_version", "warn_count", "last_warn"):
+                    if k in op:
+                        table_dict[k] = op[k]
+                db.tables[name] = Table.from_dict(name, table_dict)
             except StorageError:
                 raise
             except (ExecutionError, ValueError) as exc:
@@ -373,7 +440,8 @@ def apply_changes(db: Database, changes: Any) -> Database:
             db.drop_table(name)
         elif kind == "create_index":
             try:
-                db.create_index(op["index"], op["table"], op["column"])
+                path = op.get("path")
+                db.create_index(op["index"], op["table"], op["column"], path=path)
             except ExecutionError as exc:
                 raise StorageError(
                     f"Invalid replayed 'create_index' for '{op['index']}': {exc}"
@@ -384,6 +452,14 @@ def apply_changes(db: Database, changes: Any) -> Database:
                     f"Replayed 'drop_index' for unknown index '{op['index']}'"
                 )
             db.drop_index(op["index"])
+        elif kind == "alter_collection":
+            table = _table_for(db, op["table"], "alter_collection")
+            action = op["action"]
+            if action == "SET_VALIDATION":
+                table.validation_mode = str(op["value"]).upper()
+            elif action == "SET_SCHEMA":
+                table.schema = op["value"]
+                table.schema_version = op.get("schema_version", table.schema_version + 1)
 
     for name in touched:
         table = db.tables.get(name)
